@@ -117,10 +117,13 @@ pub fn track_coords(tech: &Tech, tracks: &[TrackPattern]) -> Vec<BTreeMap<i32, A
     coords
 }
 
+/// The priority tuple, compared ascending.
+type ViaPriority = (bool, i32, i32, bool, i64, i64, bool);
+
 /// Per cut layer, the single-cut vias ordered by the priority tuple (not default; narrower
 /// shapes; aligned; smaller areas). ⛔ Two vias with the same tuple keep the LATER one.
 pub fn via_priority(tech: &Tech) -> BTreeMap<usize, Vec<usize>> {
-    let mut by_layer: BTreeMap<usize, BTreeMap<(bool, i32, i32, bool, i64, i64, bool), usize>> = BTreeMap::new();
+    let mut by_layer: BTreeMap<usize, BTreeMap<ViaPriority, usize>> = BTreeMap::new();
     for (k, v) in tech.via_defs.iter().enumerate() {
         if v.cut_figs.len() != 1 {
             continue;
@@ -164,12 +167,12 @@ pub fn merge_pin_shapes(tech: &Tech, shapes: &[(usize, Rect)]) -> Vec<Polygon90S
 /// (across rounds).
 pub fn round_candidates(cx: &Context<'_>, pin: &mut [Polygon90Set], kind: TermKind, lower: ApType, upper: ApType, apset: &mut BTreeSet<((i32, i32), usize)>) -> Vec<Candidate> {
     let mut out = Vec::new();
-    for layer in 0..pin.len() {
-        if pin[layer].is_empty() || cx.tech.layers[layer].kind != LayerKind::Routing {
+    for (layer, set) in pin.iter_mut().enumerate() {
+        if set.is_empty() || cx.tech.layers[layer].kind != LayerKind::Routing {
             continue;
         }
         let is_macro = kind != TermKind::StdCell;
-        for rect in pin[layer].max_rectangles() {
+        for rect in set.max_rectangles() {
             let (xs, ys) = coords_from_rect(cx, rect, layer, lower, upper, is_macro);
             create_multiple(cx, &mut out, apset, rect, layer, &xs, &ys, lower, upper);
         }
@@ -333,7 +336,7 @@ mod tests {
 
     /// A small stack: li1 (vertical, width 170), mcon, met1 (horizontal, width 140), via, met2.
     fn tech(vias: Vec<ViaDef>) -> Tech {
-        let l = |name: &str, kind, dir, width| Layer { name: name.into(), kind, dir, width, min_width: width, pitch: 0 };
+        let l = |name: &str, kind, dir, width| Layer { name: name.into(), kind, dir, width, min_width: width, ..Layer::default() };
         Tech {
             layers: vec![
                 l("FR_MASTERSLICE", LayerKind::Placeholder, Dir::None, 0),

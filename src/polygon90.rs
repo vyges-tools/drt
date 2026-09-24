@@ -444,7 +444,7 @@ fn max_cover(rects: &[Rect]) -> Vec<Rect> {
 /// `computeDag`: leading (bottom) edges sorted, walked against trailing (top) edges in node order.
 fn compute_dag(nodes: &mut [Node]) {
     let mut leading: Vec<((i32, Ivl), usize)> = nodes.iter().enumerate().map(|(i, n)| ((n.rect.yl, (n.rect.xl, n.rect.xh)), i)).collect();
-    leading.sort_by(|a, b| a.0.cmp(&b.0));
+    leading.sort_by_key(|a| a.0);
     let (mut lb, mut tb) = (0usize, 0usize);
     while lb < leading.len() {
         let ((lead_y, lead_ivl), lead_node) = leading[lb];

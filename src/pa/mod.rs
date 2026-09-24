@@ -2,3 +2,4 @@
 //! Pin access: each pin's access points.
 
 pub mod candidates;
+pub mod verdict;

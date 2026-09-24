@@ -6,26 +6,31 @@
 //!   placeholder cut layer (1) below it; routing and cut layers then follow in technology order;
 //! - a routing layer's min width is `min(min width, width)`;
 //! - a via definition is a technology via: its shapes on the layer below, the cut and the layer
-//!   above, and whether it is a default via.
+//!   above, and whether it is a default via;
+//! - a routing layer's minimum spacing is its parallel-run spacing table; a plain SPACING value is
+//!   a table of one entry (width 0, run length 0);
+//! - a cut layer's spacing is its plain SPACING value, edge to edge.
 
-use crate::polygon90::Rect;
+use crate::polygon90::{Polygon90Set, Rect};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LayerKind {
     Routing,
     Cut,
     /// The placeholders below the first routing layer.
+    #[default]
     Placeholder,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Dir {
     Horizontal,
     Vertical,
+    #[default]
     None,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Layer {
     pub name: String,
     pub kind: LayerKind,
@@ -33,6 +38,38 @@ pub struct Layer {
     pub width: i32,
     pub min_width: i32,
     pub pitch: i32,
+    /// The width of a wire run across the layer's direction.
+    pub wrong_way_width: i32,
+    /// A routing layer's minimum spacing.
+    pub spacing: Option<SpacingTable>,
+    /// A cut layer's minimum spacing, edge to edge.
+    pub cut_spacing: Option<i32>,
+}
+
+/// A parallel-run spacing table: rows by width, columns by parallel run length.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpacingTable {
+    pub widths: Vec<i32>,
+    pub prls: Vec<i32>,
+    pub values: Vec<Vec<i32>>,
+}
+
+impl SpacingTable {
+    /// The spacing for a width and a run length: the row of the LAST width strictly below
+    /// `width` and the column of the last run length strictly below `prl` — the first row or
+    /// column when there is none. ⛔ Strictly below: a width equal to a row's is the row before.
+    pub fn find(&self, width: i32, prl: i32) -> i32 {
+        let idx = |axis: &[i32], v: i32| axis.iter().filter(|&&a| a < v).count().saturating_sub(1);
+        self.values[idx(&self.widths, width)][idx(&self.prls, prl)]
+    }
+    /// The first row's first value.
+    pub fn find_min(&self) -> i32 {
+        self.values[0][0]
+    }
+    /// The last row's last value.
+    pub fn find_max(&self) -> i32 {
+        *self.values.last().and_then(|r| r.last()).expect("a value")
+    }
 }
 
 impl Layer {
@@ -122,7 +159,58 @@ pub struct MasterPin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterTerm {
     pub name: String,
+    /// The signal type (`SIGNAL`, `POWER`, `GROUND`, …).
+    pub sig: String,
     pub pins: Vec<MasterPin>,
+}
+
+/// A master as the router imports it: its terminals, and its obstructions as blockages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Master {
+    pub terms: Vec<MasterTerm>,
+    /// Blockage rectangles by layer number (master coordinates).
+    pub blockages: Vec<(usize, Rect)>,
+}
+
+impl Master {
+    /// The import rules for obstructions:
+    /// - an obstruction on a CUT layer that touches the shapes of exactly ONE pin on the layer
+    ///   above becomes a shape of that pin (a contact drawn as an obstruction is the pin's own);
+    /// - every other obstruction merges with the rest on its layer, and the merged shapes'
+    ///   MAXIMAL rectangles are the blockages.
+    pub fn import(tech: &Tech, mut terms: Vec<MasterTerm>, obstructions: &[(usize, Rect)]) -> Master {
+        let touches = |a: &Rect, b: &Rect| a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh;
+        let mut merged: Vec<Polygon90Set> = vec![Polygon90Set::new(); tech.layers.len()];
+        for &(layer, r) in obstructions {
+            if tech.layers[layer].kind == LayerKind::Cut {
+                let mut owner: Option<(usize, usize)> = None;
+                let mut many = false;
+                for (t, term) in terms.iter().enumerate() {
+                    for (p, pin) in term.pins.iter().enumerate() {
+                        if pin.shapes.iter().any(|(l, s)| *l == layer + 1 && touches(s, &r)) {
+                            match owner {
+                                None => owner = Some((t, p)),
+                                Some(o) if o != (t, p) => many = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if let (Some((t, p)), false) = (owner, many) {
+                    terms[t].pins[p].shapes.push((layer, r));
+                    continue;
+                }
+            }
+            merged[layer].insert_rect(r);
+        }
+        let mut blockages = Vec::new();
+        for (layer, set) in merged.iter_mut().enumerate() {
+            for r in set.max_rectangles() {
+                blockages.push((layer, r));
+            }
+        }
+        Master { terms, blockages }
+    }
 }
 
 /// A placed instance's transform: an orientation, then the origin.
@@ -165,7 +253,7 @@ pub mod read {
 
     pub fn tech(db: &Db) -> Res<Tech> {
         let mut layers: Vec<Layer> = Vec::new();
-        let placeholder = |name: &str| Layer { name: name.into(), kind: LayerKind::Placeholder, dir: Dir::None, width: 0, min_width: 0, pitch: 0 };
+        let placeholder = |name: &str| Layer { name: name.into(), ..Layer::default() };
         for (name, dir) in db.layers_with_direction()? {
             let kind = db.layer_get_type(&name)?;
             match kind.as_str() {
@@ -182,11 +270,25 @@ pub mod read {
                         _ => Dir::None,
                     };
                     let pitch = db.layer_get_pitch(&name) as i32;
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch });
+                    let wrong_way_width = db.layer_get_wrong_way_width(&name) as i32;
+                    let v55 = db.layer_v55_spacing_table(&name)?;
+                    let spacing = match (v55.widths_and_lengths, v55.table) {
+                        (Some((w, l)), Some(t)) => Some(SpacingTable {
+                            widths: w.iter().map(|&v| v as i32).collect(),
+                            prls: l.iter().map(|&v| v as i32).collect(),
+                            values: t.iter().map(|r| r.iter().map(|&v| v as i32).collect()).collect(),
+                        }),
+                        _ => match db.layer_get_spacing(&name) {
+                            s if s > 0 => Some(SpacingTable { widths: vec![0], prls: vec![0], values: vec![vec![s]] }),
+                            _ => None,
+                        },
+                    };
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;
-                    layers.push(Layer { name, kind: LayerKind::Cut, dir: Dir::None, width, min_width: 0, pitch: 0 });
+                    let cut_spacing = Some(db.layer_get_spacing(&name)).filter(|&s| s > 0);
+                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, ..Layer::default() });
                 }
                 _ => {}
             }
@@ -229,7 +331,7 @@ pub mod read {
     /// A master's terminals and their pins, by layer number (routing and cut shapes only).
     pub fn master_terms(db: &Db, tech: &Tech, master: &str) -> Res<Vec<MasterTerm>> {
         let mut out = Vec::new();
-        for (term, _sig) in db.master_mterms(master)? {
+        for (term, sig) in db.master_mterms(master)? {
             let mut pins = Vec::new();
             for p in 0..db.num_mpins(master, &term) {
                 let shapes = db
@@ -239,12 +341,62 @@ pub mod read {
                     .collect();
                 pins.push(MasterPin { shapes });
             }
-            out.push(MasterTerm { name: term, pins });
+            out.push(MasterTerm { name: term, sig, pins });
         }
         Ok(out)
     }
 
+    /// A master's obstructions, by layer number (the technology's layers only).
+    pub fn master_obstructions(db: &Db, tech: &Tech, master: &str) -> Res<Vec<(usize, Rect)>> {
+        Ok(db
+            .master_obstruction_boxes(master)?
+            .into_iter()
+            .filter_map(|(n, x0, y0, x1, y1)| tech.layer_num(&db.layer_name_by_number(n)).map(|l| (l, Rect::new(x0, y0, x1, y1))))
+            .collect())
+    }
+
     pub fn transform(db: &Db, inst: &str) -> Transform {
         Transform { orient: db.inst_get_orient(inst), origin: (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn term(name: &str, pins: Vec<Vec<(usize, Rect)>>) -> MasterTerm {
+        MasterTerm { name: name.into(), sig: "SIGNAL".into(), pins: pins.into_iter().map(|shapes| MasterPin { shapes }).collect() }
+    }
+
+    /// A cut obstruction touching ONE pin's shapes on the layer above becomes that pin's shape.
+    #[test]
+    fn a_cut_obstruction_on_one_pin_joins_it() {
+        let t = crate::gc::tests::tech();
+        let cut = Rect::new(0, 0, 170, 170);
+        let m = Master::import(&t, vec![term("A", vec![vec![(4, Rect::new(-50, -50, 400, 220))]])], &[(3, cut)]);
+        assert!(m.blockages.is_empty());
+        assert!(m.terms[0].pins[0].shapes.contains(&(3, cut)));
+    }
+
+    /// Touching two pins it stays an obstruction.
+    #[test]
+    fn a_cut_obstruction_on_two_pins_stays_a_blockage() {
+        let t = crate::gc::tests::tech();
+        let cut = Rect::new(0, 0, 170, 170);
+        let terms = vec![term("A", vec![vec![(4, Rect::new(-50, -50, 100, 220))]]), term("B", vec![vec![(4, Rect::new(100, -50, 400, 220))]])];
+        let m = Master::import(&t, terms, &[(3, cut)]);
+        assert_eq!(m.blockages, vec![(3, cut)]);
+        assert!(m.terms.iter().all(|t| t.pins[0].shapes.len() == 1));
+    }
+
+    /// Obstructions on a layer merge; the blockages are the merge's MAXIMAL rectangles (an L gives
+    /// both arms through the corner).
+    #[test]
+    fn obstructions_merge_into_maximal_rectangles() {
+        let t = crate::gc::tests::tech();
+        let m = Master::import(&t, Vec::new(), &[(4, Rect::new(0, 0, 300, 100)), (4, Rect::new(0, 0, 100, 300))]);
+        let mut b = m.blockages;
+        b.sort();
+        assert_eq!(b, vec![(4, Rect::new(0, 0, 100, 300)), (4, Rect::new(0, 0, 300, 100))]);
     }
 }

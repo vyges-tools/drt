@@ -4,8 +4,10 @@
 //!
 //! - [`polygon90`]: Manhattan polygon sets — union, slicing, maximal rectangles.
 //! - [`tech`]: the technology and design as the router reads them.
-//! - [`pa`]: pin access — candidates first.
+//! - [`gc`]: design-rule checks over a small window.
+//! - [`pa`]: pin access — candidates, then each trial's design-rule verdict.
 
+pub mod gc;
 pub mod pa;
 pub mod polygon90;
 pub mod tech;
