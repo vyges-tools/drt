@@ -85,7 +85,7 @@ pub fn init_queue<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], abs: &dyn Fn(&
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::dr::cost::{mod_eol_costs_poly, mod_term_cost, Dir6};
+use crate::dr::cost::{mod_term_cost, Dir6};
 use crate::dr::maze::{Idx, Maze, MazeCfg, MazeState, TaperBox};
 use crate::dr::ta::Fixed;
 use crate::dr::write::{patch_min_area, write_path, WriteCtx};
@@ -269,8 +269,23 @@ pub fn init_maze_cost_guide_helper(w: &CostWorker<'_, '_>, st: &mut MazeState, g
 /// time. The searches, in order.
 #[allow(clippy::too_many_arguments)]
 pub fn route_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>) -> (Vec<Search>, Vec<DrFig>) {
-    mod_eol_costs_poly(w, net.net, cx.ext_box, ModCost::SubRoute);
-    init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
+    reroute_net(w, st, mcfg, net, ndr, cx, 0, &[])
+}
+
+/// Route a net again (or the first time: `reroutes` 0, nothing written): lift what it wrote
+/// (route cost, cut spacing included), its end-of-line cost from its pins and that metal, and —
+/// the first time only — its via reservation; then as [`route_net`].
+#[allow(clippy::too_many_arguments)]
+pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>, reroutes: u32, old: &[DrFig]) -> (Vec<Search>, Vec<DrFig>) {
+    for f in old {
+        w.mod_path_cost(f, ModCost::SubRoute, false, true, ndr);
+    }
+    let tech = w.cx.tech;
+    let metal: Vec<(usize, Rect)> = old.iter().flat_map(|f| f.metal(tech)).collect();
+    crate::dr::cost::mod_eol_costs_poly_with(w, net.net, cx.ext_box, &metal, ModCost::SubRoute);
+    if reroutes == 0 {
+        init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
+    }
     maze_net_init(w, st, net, cx);
     let (searches, figs, ok) = route_net_search(w, st, mcfg, net, cx);
     if ok {

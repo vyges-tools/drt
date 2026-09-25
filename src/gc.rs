@@ -74,6 +74,9 @@ pub struct Marker {
     pub bbox: Rect,
     /// The owners involved, sorted, without repeats.
     pub owners: Vec<Owner>,
+    /// The checked shape's owner (layer, rectangle, fixed) and the other's.
+    pub victim: (Owner, usize, Rect, bool),
+    pub aggressor: (Owner, usize, Rect, bool),
 }
 
 /// A maximal rectangle of one owner on one layer.
@@ -534,11 +537,19 @@ impl<'a> Worker<'a> {
     }
 
     fn add_marker(&mut self, rule: Rule, layer: usize, bbox: Rect, a: usize, b: usize) {
-        let mut owners = vec![self.owner(a).clone(), self.owner(b).clone()];
+        self.add_marker_of(rule, layer, bbox, (a, bbox, false), (b, bbox, false));
+    }
+
+    /// A marker between the checked shape `v` and the other `g` (owner index, rectangle, fixed);
+    /// kept once per (box, layer, rule, owners) — the first found keeps its victim and aggressor.
+    fn add_marker_of(&mut self, rule: Rule, layer: usize, bbox: Rect, v: (usize, Rect, bool), g: (usize, Rect, bool)) {
+        let mut owners = vec![self.owner(v.0).clone(), self.owner(g.0).clone()];
         owners.sort();
         owners.dedup();
         if self.seen.insert((bbox, layer, rule, owners.clone())) {
-            self.markers.push(Marker { rule, layer, bbox, owners });
+            let victim = (self.owner(v.0).clone(), layer, v.1, v.2);
+            let aggressor = (self.owner(g.0).clone(), layer, g.1, g.2);
+            self.markers.push(Marker { rule, layer, bbox, owners, victim, aggressor });
         }
     }
 
@@ -889,7 +900,7 @@ impl<'a> Worker<'a> {
         } else if !self.spc_marker_outside_net(layer, r1.net, &marker) {
             return;
         }
-        self.add_marker(Rule::MetalSpacing, layer, marker, r1.net, r2.net);
+        self.add_marker_of(Rule::MetalSpacing, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
     }
 
     /// Whether the marker's sides lie on boundary edges of either owner.
@@ -990,7 +1001,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let rule = if r1.net == r2.net { Rule::NonSufficientMetal } else { Rule::Short };
-        self.add_marker(rule, layer, marker, r1.net, r2.net);
+        self.add_marker_of(rule, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
     }
 
     /// Neither owner's trial shapes cover any area of the marker (widened by 1 where it has no
@@ -1112,14 +1123,14 @@ impl<'a> Worker<'a> {
             if r1.fixed && r2.fixed {
                 return;
             }
-            self.add_marker(Rule::Short, layer, marker, r1.net, r2.net);
+            self.add_marker_of(Rule::Short, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
             return;
         }
         let d2 = i64::from(dist_x).pow(2) + i64::from(dist_y).pow(2);
         if d2 >= i64::from(spc).pow(2) || (r1.fixed && r2.fixed) {
             return;
         }
-        self.add_marker(Rule::CutSpacing, layer, marker, r1.net, r2.net);
+        self.add_marker_of(Rule::CutSpacing, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
     }
 }
 
