@@ -10,3 +10,4 @@ pub mod maze;
 pub mod route;
 pub mod rules;
 pub mod ta;
+pub mod write;

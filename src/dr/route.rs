@@ -88,6 +88,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::dr::cost::{mod_eol_costs_poly, mod_term_cost, Dir6};
 use crate::dr::maze::{Idx, Maze, MazeCfg, MazeState, TaperBox};
 use crate::dr::ta::Fixed;
+use crate::dr::write::{patch_min_area, write_path, WriteCtx};
 use crate::polygon90::Rect;
 
 /// What routing one net reads beyond the costs.
@@ -104,6 +105,11 @@ pub struct NetCtx<'a> {
     pub ndr: Option<(&'a crate::dr::rules::NdrTables, &'a [i32])>,
     pub auto_taper: bool,
     pub is_port_term: &'a dyn Fn(usize) -> bool,
+    /// Whether a terminal of this net has an access point at the point on the layer.
+    pub has_access_point: &'a dyn Fn((i32, i32), usize) -> bool,
+    /// The net's non-default rule itself (widths, preferred vias).
+    pub ndr_rule: Option<&'a crate::dr::rules::NdrRule>,
+    pub route_box: Rect,
 }
 
 /// One search's record: the destination pin, the path (dst first).
@@ -262,11 +268,18 @@ pub fn init_maze_cost_guide_helper(w: &CostWorker<'_, '_>, st: &mut MazeState, g
 /// reservations and its pins' costs, mark its guides, then connect its pins one search at a
 /// time. The searches, in order.
 #[allow(clippy::too_many_arguments)]
-pub fn route_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>) -> Vec<Search> {
+pub fn route_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>) -> (Vec<Search>, Vec<DrFig>) {
     mod_eol_costs_poly(w, net.net, cx.ext_box, ModCost::SubRoute);
     init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
     maze_net_init(w, st, net, cx);
-    route_net_search(w, st, mcfg, net, cx)
+    let (searches, figs, ok) = route_net_search(w, st, mcfg, net, cx);
+    if ok {
+        // What the net wrote, costed for the nets after it (no end of line or cut spacing here).
+        for f in &figs {
+            w.mod_path_cost(f, ModCost::AddRoute, false, false, ndr);
+        }
+    }
+    (searches, figs)
 }
 
 fn maze_net_init(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet, cx: &NetCtx<'_>) {
@@ -279,10 +292,11 @@ fn maze_net_init(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet, cx
     init_maze_cost_ap_helper(w, st, net, false, cx.is_macro_term, cx.is_port_term);
 }
 
-fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, cx: &NetCtx<'_>) -> Vec<Search> {
+fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, cx: &NetCtx<'_>) -> (Vec<Search>, Vec<DrFig>, bool) {
     let mut out = Vec::new();
+    let mut figs = Vec::new();
     if net.pins.len() <= 1 {
-        return out;
+        return (out, figs, true);
     }
     // Prep: every access point a destination; pins by id.
     let mut unconn: BTreeSet<usize> = BTreeSet::new();
@@ -348,6 +362,20 @@ fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeC
         }
     }
     let mut dst_taper: Option<usize> = None;
+    // Real pins' access points, all access points, and each point's access area (the largest).
+    let mut real_ap: BTreeSet<Idx> = BTreeSet::new();
+    let mut any_ap: BTreeSet<Idx> = BTreeSet::new();
+    let mut area_at: std::collections::HashMap<Idx, i64> = std::collections::HashMap::new();
+    for (k, p) in net.pins.iter().enumerate() {
+        for (a, &mi) in p.patterns.iter().zip(&all_aps[k]) {
+            any_ap.insert(mi);
+            if p.term.is_some() {
+                real_ap.insert(mi);
+            }
+            let e = area_at.entry(mi).or_insert(a.begin_area);
+            *e = (*e).max(a.begin_area);
+        }
+    }
     let mut src_pin = None;
     let mut best = 0;
     for id in &unconn {
@@ -410,13 +438,16 @@ fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeC
         };
         if !found {
             out.push(Search { dst: (cx.pin_name)(&net.pins[dk]), path: Vec::new() });
-            break;
+            return (out, figs, false);
         }
         out.push(Search { dst: (cx.pin_name)(&net.pins[dk]), path: path.clone() });
         post_astar_update(w, st, &path, &mut conn, &mut unconn, &mut at);
+        let wcx = WriteCtx { route_box: cx.route_box, real_ap: &real_ap, ap: &any_ap, has_access_point: cx.has_access_point, ndr: cx.ndr_rule, auto_taper: cx.auto_taper, tapers: &tapers, taper_at: &taper_at, area_at: &area_at };
+        figs.extend(write_path(w, &wcx, &path));
+        figs.extend(patch_min_area(w, st, &wcx, &path, mcfg.drc_cost, mcfg.fixed_cost, mcfg.marker_cost));
         add_cut_spc_cost(w, &path);
     }
-    out
+    (out, figs, true)
 }
 
 /// After a search: the destination's pins are connected (their access points become sources),

@@ -126,6 +126,19 @@ impl GridGraph {
         (x1, y1, x2, y2)
     }
 
+    /// The index range ENCLOSING a box: as [`GridGraph::idx_box`], the low end stepped back one
+    /// when its coordinate lies past the box's low side.
+    pub fn idx_box_enclose(&self, b: &Rect) -> (usize, usize, usize, usize) {
+        let (mut x1, mut y1, x2, y2) = self.idx_box(b);
+        if self.xs.get(x1).is_some_and(|&c| c > b.xl) {
+            x1 = x1.saturating_sub(1);
+        }
+        if self.ys.get(y1).is_some_and(|&c| c > b.yl) {
+            y1 = y1.saturating_sub(1);
+        }
+        (x1, y1, x2, y2)
+    }
+
     fn corrected(&self, x: i64, y: i64, z: i64, d: Dir6) -> (i64, i64, i64, Dir6) {
         match d {
             Dir6::W => (x - 1, y, z, Dir6::E),
