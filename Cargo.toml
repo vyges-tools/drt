@@ -14,11 +14,16 @@ repository = "https://github.com/vyges-tools/drt"
 odb = ["dep:vyges-opendb"]
 
 [dependencies]
-vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true, features = ["gen-write"] }
 
 [lib]
 name = "vyges_drt"
 path = "src/lib.rs"
+
+[[bin]]
+name = "vyges-drt"
+path = "src/bin/vyges-drt.rs"
+required-features = ["odb"]
 
 # Local development against the sibling checkouts.
 [patch."https://github.com/vyges-tools/opendb.git"]

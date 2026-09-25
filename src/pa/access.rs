@@ -96,6 +96,10 @@ impl AccessPoint {
     pub fn has_planar(&self) -> bool {
         PLANAR.iter().any(|&d| self.has(d))
     }
+    /// The accesses as the design database stores them: bits N 1, S 2, E 4, W 8, U 16, D 32.
+    pub fn db_access_bits(&self) -> u8 {
+        [Access::N, Access::S, Access::E, Access::W, Access::U, Access::D].iter().enumerate().filter(|(_, &d)| self.has(d)).map(|(k, _)| 1u8 << k).sum()
+    }
     /// The cost the pattern search reads: lower class plus four times the upper.
     pub fn cost(&self) -> i32 {
         self.lower as i32 + 4 * self.upper as i32
@@ -575,6 +579,20 @@ mod tests {
         let mut a = AccessPoint { vias: vec![w, 0], ..ap((0, 0), 2) };
         let exts = sort_via_defs(&pin, &mut a, &[Rect::new(-150, -1000, 150, 1000)]);
         assert_eq!((a.vias.clone(), exts), (vec![0, w], vec![0, 50]));
+    }
+
+    /// The database's access bits run N, S, E, W, U, D — not the point's own E, W, S, N order.
+    #[test]
+    fn database_access_bits() {
+        let mut a = ap((0, 0), 2);
+        a.set(Access::N, true);
+        a.set(Access::W, true);
+        a.set(Access::U, true);
+        assert_eq!(a.db_access_bits(), 1 | 8 | 16);
+        let mut b = ap((0, 0), 2);
+        b.set(Access::E, true);
+        b.set(Access::D, true);
+        assert_eq!(b.db_access_bits(), 4 | 32);
     }
 
     /// A top-level port also tries the vias of the cut layer BELOW; a via whose lower layer is not

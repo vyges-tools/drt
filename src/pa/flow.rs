@@ -211,6 +211,101 @@ pub fn pin_access(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, masters: &
     Ok(PinAccess { classes, class_aps, patterns, picks, port_aps })
 }
 
+/// A class point, as `(class, terminal, pin, index among the pin's points)`.
+pub type ClassApKey = (usize, usize, usize, usize);
+
+/// One write into the design database, in the order the reference's writer makes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteOp {
+    /// Clear a master's points at a class index.
+    ClearMaster { master: String, idx: u32 },
+    /// A class point on its master pin: relative to the representative.
+    AddMasterPoint { master: String, term: String, pin: usize, idx: u32, key: ClassApKey, point: (i32, i32), ap: AccessPoint },
+    SetInstIdx { inst: String, idx: u32 },
+    ClearPref { inst: String, term: String },
+    /// A terminal pin's preferred point (a class point), or none.
+    SetPref { inst: String, term: String, pin: usize, idx: u32, key: Option<ClassApKey> },
+    /// A point on a block pin (absolute).
+    AddPortPoint { port: String, pin: usize, ap: AccessPoint },
+}
+
+/// What pin access writes, in order:
+/// - per master and class index (the number of EARLIER classes of the same master): the index
+///   cleared (all classes first), then every point of every pin of every terminal, relative to
+///   the class representative's placement location;
+/// - per instance — EVERY one (the update flag starts set; only the row stage sets it again): its
+///   class index, and per terminal the preferred points cleared, then — when the terminal is on a
+///   net — per pin the chosen pattern's point, or none (always none outside the rows);
+/// - per routed port with exactly ONE pin: every point of that pin.
+pub fn write_plan(masters: &HashMap<String, Master>, insts: &[DesignInst], ports: &[DesignPort], pa: &PinAccess) -> Vec<WriteOp> {
+    let mut ops = Vec::new();
+    let mut per_master: HashMap<&str, u32> = HashMap::new();
+    let idx: Vec<u32> = pa
+        .classes
+        .iter()
+        .map(|c| {
+            let n = per_master.entry(c.key.master.as_str()).or_insert(0);
+            *n += 1;
+            *n - 1
+        })
+        .collect();
+    for (c, class) in pa.classes.iter().enumerate() {
+        ops.push(WriteOp::ClearMaster { master: class.key.master.clone(), idx: idx[c] });
+    }
+    for (c, class) in pa.classes.iter().enumerate() {
+        let rep = &insts[class.insts[0]];
+        let master = &masters[&class.key.master];
+        for (t, term) in master.terms.iter().enumerate() {
+            for p in 0..term.pins.len() {
+                for (a, ap) in pa.class_aps[c][t][p].iter().enumerate() {
+                    let point = (ap.point.0 - rep.unique.location.0, ap.point.1 - rep.unique.location.1);
+                    ops.push(WriteOp::AddMasterPoint { master: class.key.master.clone(), term: term.name.clone(), pin: p, idx: idx[c], key: (c, t, p, a), point, ap: ap.clone() });
+                }
+            }
+        }
+    }
+    let mut class_of = vec![0usize; insts.len()];
+    for (c, class) in pa.classes.iter().enumerate() {
+        for &i in &class.insts {
+            class_of[i] = c;
+        }
+    }
+    for (i, inst) in insts.iter().enumerate() {
+        let pick = pa.picks[i];
+        let c = class_of[i];
+        let class = &pa.classes[c];
+        let master = &masters[&class.key.master];
+        ops.push(WriteOp::SetInstIdx { inst: inst.name.clone(), idx: idx[c] });
+        let mut k = 0; // the pattern's entry: routed terminals' pins in order
+        for (t, term) in master.terms.iter().enumerate() {
+            ops.push(WriteOp::ClearPref { inst: inst.name.clone(), term: term.name.clone() });
+            let first = k;
+            if class.routes[t] {
+                k += term.pins.len();
+            }
+            if inst.nets[t].is_none() {
+                continue;
+            }
+            for p in 0..term.pins.len() {
+                let key = match (pick, class.routes[t]) {
+                    (Some(pick), true) => pa.patterns[c][pick].aps[first + p].map(|(_, a)| (c, t, p, a)),
+                    _ => None,
+                };
+                ops.push(WriteOp::SetPref { inst: inst.name.clone(), term: term.name.clone(), pin: p, idx: idx[c], key });
+            }
+        }
+    }
+    for (k, port) in ports.iter().enumerate() {
+        if !port.routed || port.pins.len() != 1 {
+            continue;
+        }
+        for ap in &pa.port_aps[k][0] {
+            ops.push(WriteOp::AddPortPoint { port: port.name.clone(), pin: 0, ap: ap.clone() });
+        }
+    }
+    ops
+}
+
 impl PinAccess {
     /// An instance terminal's preferred points, per pin, relative to the instance's location, as
     /// `(point, layer)` — none unless it is on a net and its class routes the terminal.
@@ -298,6 +393,33 @@ mod tests {
         let (masters, insts, pa) = fixture();
         assert_eq!(pa.pref_access_points(&insts, &masters, 0, 1), vec![Some(((50, 40), 2))]);
         assert!(pa.pref_access_points(&insts, &masters, 0, 0).is_empty());
+    }
+
+    /// The plan: a terminal pin on a net gets its pattern's point — keyed past the unrouted supply
+    /// before it — an unconnected one nothing; EVERY instance gets its class index, even outside
+    /// the rows (none of its pins then get a point).
+    #[test]
+    fn the_plan_writes_every_instance_and_only_connected_pins() {
+        let (masters, insts, mut pa) = fixture();
+        pa.picks[1] = None;
+        let ops = write_plan(&masters, &insts, &[], &pa);
+        let prefs: Vec<(&str, &str, Option<ClassApKey>)> = ops.iter().filter_map(|o| if let WriteOp::SetPref { inst, term, key, .. } = o { Some((inst.as_str(), term.as_str(), *key)) } else { None }).collect();
+        assert_eq!(prefs, vec![("u0", "A", Some((0, 1, 0, 0)))]);
+        let idx: Vec<&str> = ops.iter().filter_map(|o| if let WriteOp::SetInstIdx { inst, .. } = o { Some(inst.as_str()) } else { None }).collect();
+        assert_eq!(idx, vec!["u0", "u1"]);
+    }
+
+    /// Only a routed port with exactly ONE pin gets its points written.
+    #[test]
+    fn the_plan_writes_single_pin_ports_only() {
+        let (masters, insts, mut pa) = fixture();
+        let ap = pa.class_aps[0][1][0][0].clone();
+        let port = |name: &str, pins: usize| DesignPort { name: name.into(), routed: true, owner: Owner::Net(name.into()), pins: vec![vec![]; pins], target: vec![] };
+        let ports = vec![port("one", 1), port("two", 2)];
+        pa.port_aps = vec![vec![vec![ap.clone()]], vec![vec![ap.clone()], vec![ap]]];
+        let ops = write_plan(&masters, &insts, &ports, &pa);
+        let written: Vec<&str> = ops.iter().filter_map(|o| if let WriteOp::AddPortPoint { port, .. } = o { Some(port.as_str()) } else { None }).collect();
+        assert_eq!(written, vec!["one"]);
     }
 
     /// A terminal without a net gets no preferred point, though its class routes it.
