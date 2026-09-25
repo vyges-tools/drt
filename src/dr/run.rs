@@ -421,6 +421,10 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut) -> Res<(DesignRoutes,
         if iter > crate::dr::flow::END_ITERATION {
             break;
         }
+        // From iteration 7 a congested worker widens the clip of later rows: not modelled.
+        if iter >= 7 {
+            return Err(format!("iteration {iter} reached with markers standing: congestion-driven clip growth not modelled"));
+        }
         let mut args = row;
         args.size = clip.size(&row, false);
         search_repair(&cx, &mut routes, &mut flow, iter, &args)?;
@@ -530,7 +534,10 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
             let bloat = |r: &Rect, k: i32| Rect { xl: r.xl - k, yl: r.yl - k, xh: r.xh + k, yh: r.yh + k };
             tile_batches(&boxes, mt).into_iter().map(|b| b.into_iter().map(|i| WorkerBoxes { start: (0, 0), route: boxes[i], ext: bloat(&boxes[i], mt), drc: bloat(&boxes[i], 500) }).collect()).collect()
         }
-        Flow::Stubborn => return Err("the stubborn-tiles flow is not modelled".into()),
+        Flow::Stubborn => {
+            stubborn_tiles_flow(cx, routes, flow_state, iter, args, ripup_all, mt)?;
+            return check(cx, routes);
+        }
         Flow::Skip => Vec::new(),
     };
     let mut changed = false;
@@ -553,6 +560,50 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         flow_state.last_effective = changed;
     }
     check(cx, routes)
+}
+
+/// The stubborn-tiles flow: route boxes grown around the markers, and per box nine workers (the
+/// DRC and marker costs each as given, halved and doubled), all of a batch on the same design; per
+/// worker id the first with the fewest markers is written back, in id order.
+fn stubborn_tiles_flow(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut FlowState, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, mt: i32) -> Res<()> {
+    let markers: Vec<Marker> = routes.markers().cloned().collect();
+    let (boxes, batches) = crate::dr::flow::stubborn_boxes(&markers, &cx.g.grid, mt);
+    let bloat = |r: &Rect, k: i32| Rect { xl: r.xl - k, yl: r.yl - k, xh: r.xh + k, yh: r.yh + k };
+    let drc_costs = [args.drc_cost, args.drc_cost / 2, args.drc_cost * 2];
+    let marker_costs = [args.marker_cost, args.marker_cost / 2, args.marker_cost * 2];
+    let mut changed = false;
+    for batch in batches {
+        let mut results: Vec<(usize, WorkerResult)> = Vec::new();
+        for &id in &batch {
+            for route in &boxes[id] {
+                for &drc_cost in &drc_costs {
+                    for &marker_cost in &marker_costs {
+                        let wargs = crate::dr::flow::IterArgs { drc_cost, marker_cost, ..*args };
+                        let w = WorkerBoxes { start: (0, 0), route: *route, ext: bloat(route, mt), drc: bloat(route, 500) };
+                        results.push((id, route_worker(cx, routes, iter, &wargs, ripup_all, &w)?));
+                    }
+                }
+            }
+        }
+        // Per worker id, the first with the fewest markers in its check box.
+        let mut best: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+        for (k, (id, (w, _, markers, _))) in results.iter().enumerate() {
+            let n = in_check_box(markers, &w.drc).len();
+            if best.get(id).is_none_or(|&(_, b)| n < b) {
+                best.insert(*id, (k, n));
+            }
+        }
+        for (_, (k, n)) in best {
+            let (_, (w, routed, markers, wm)) = &results[k];
+            if !written_back(iter, args.ripup, wm, n) {
+                continue;
+            }
+            changed |= n != wm.init_num;
+            end_worker(cx, routes, w, routed, markers, iter);
+        }
+    }
+    flow_state.last_effective = changed;
+    Ok(())
 }
 
 type WorkerResult = (WorkerBoxes, Vec<(usize, Vec<DrFig>)>, Vec<Marker>, crate::dr::flow::WorkerMarkers);

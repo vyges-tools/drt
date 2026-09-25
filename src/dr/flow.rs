@@ -20,6 +20,8 @@
 //!   queue, it ended with more than it started, or, everything ripped up after the first
 //!   iteration, with more than five times as many.
 
+use std::collections::BTreeSet;
+
 use crate::gc::{Marker, Rule};
 use crate::polygon90::Rect;
 
@@ -305,10 +307,228 @@ pub fn tile_batches(boxes: &[Rect], bloat: i32) -> Vec<Vec<usize>> {
     batches
 }
 
+/// Stubborn tiles: the markers' gcell boxes merged, each grown to 7×7-gcell route boxes (a
+/// centred one first, then four off-centre variants, the boxes with the fewest variants grown
+/// first), in design coordinates; and the worker ids in batches whose route boxes, widened by
+/// `bloat`, do not touch. Per worker id its distinct route boxes in coordinate order.
+pub fn stubborn_boxes(markers: &[Marker], grid: &crate::dr::guides::GCellGrid, bloat: i32) -> (Vec<Vec<Rect>>, Vec<Vec<usize>>) {
+    let mut drv: Vec<Rect> = Vec::new();
+    for m in markers {
+        let (a, b) = (grid.idx((m.bbox.xl, m.bbox.yl)), grid.idx((m.bbox.xh, m.bbox.yh)));
+        drv.push(Rect { xl: a.0, yl: a.1, xh: b.0, yh: b.1 });
+    }
+    let merged = merge_drv_boxes(&drv);
+    let expanded = expand_drv_boxes(&merged);
+    let coords: Vec<Vec<Rect>> = expanded
+        .iter()
+        .map(|set| {
+            let mut v: Vec<Rect> = set
+                .iter()
+                .map(|&(xl, yl, xh, yh)| {
+                    let (lo, hi) = (grid.gcell_box((xl, yl)), grid.gcell_box((xh, yh)));
+                    Rect { xl: lo.xl, yl: lo.yl, xh: hi.xh, yh: hi.yh }
+                })
+                .collect();
+            v.sort_by_key(|r| (r.xl, r.yl, r.xh, r.yh));
+            v.dedup();
+            v
+        })
+        .collect();
+    let batches = stubborn_batches(&coords, bloat);
+    (coords, batches)
+}
+
+/// Greedy: the first pair (in order) whose merged box spans at most 4 gcells each way is merged
+/// into the first and the second dropped, from the start again, until no pair merges.
+pub fn merge_drv_boxes(drv: &[Rect]) -> Vec<Rect> {
+    let mut boxes = drv.to_vec();
+    'again: loop {
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (a, b) = (boxes[i], boxes[j]);
+                let m = Rect { xl: a.xl.min(b.xl), yl: a.yl.min(b.yl), xh: a.xh.max(b.xh), yh: a.yh.max(b.yh) };
+                if m.xh - m.xl > 4 || m.yh - m.yl > 4 {
+                    continue;
+                }
+                boxes[i] = m;
+                boxes.remove(j);
+                continue 'again;
+            }
+        }
+        return boxes;
+    }
+}
+
+/// The occupancy grid of the growth: per gcell column and row, the box id holding it (-1 none).
+struct DrvGrid(Vec<Vec<i32>>);
+
+impl DrvGrid {
+    fn has_other(&self, r: &Rect, id: i32) -> bool {
+        (r.xl..=r.xh).any(|x| (r.yl..=r.yh).any(|y| {
+            let v = self.0[x as usize][y as usize];
+            v != -1 && v != id
+        }))
+    }
+
+    fn fill(&mut self, r: &Rect, id: i32) {
+        for x in r.xl..=r.xh {
+            for y in r.yl..=r.yh {
+                self.0[x as usize][y as usize] = id;
+            }
+        }
+    }
+
+    /// Grow `b` one gcell at a time toward `dir` (0 E, 1 W, 2 N, 3 S), at most `max` times,
+    /// stopping at the grid's low edge or where it would take another box's gcell; how far.
+    fn expand(&self, b: &mut Rect, id: i32, dir: u8, max: i32) -> i32 {
+        let mut r = *b;
+        for i in 1..=max {
+            match dir {
+                0 => r.xh += 1,
+                1 => {
+                    if r.xl == 0 {
+                        return i - 1;
+                    }
+                    r.xl -= 1;
+                }
+                2 => r.yh += 1,
+                _ => {
+                    if r.yl == 0 {
+                        return i - 1;
+                    }
+                    r.yl -= 1;
+                }
+            }
+            if self.has_other(&r, id) {
+                return i - 1;
+            }
+            *b = r;
+        }
+        max
+    }
+}
+
+/// Each merged box grown to its route boxes (gcell indices): a centred 7×7 first, then variants
+/// with the box at the west, east, south and north (each wave taken fewest-variants first, then
+/// by box id, then by its expansions), each variant grown from the merged box. Distinct boxes
+/// per merged box, in `(xl, yl, xh, yh)` order.
+pub fn expand_drv_boxes(merged: &[Rect]) -> Vec<BTreeSet<(i32, i32, i32, i32)>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let max_x = merged.iter().map(|b| b.xh).max().unwrap_or(0) + 7;
+    let max_y = merged.iter().map(|b| b.yh).max().unwrap_or(0) + 7;
+    let mut grid = DrvGrid(vec![vec![-1; max_y.max(0) as usize]; max_x.max(0) as usize]);
+    for (id, b) in merged.iter().enumerate() {
+        grid.fill(b, id as i32);
+    }
+    let key = |r: &Rect| (r.xl, r.yl, r.xh, r.yh);
+    let mut expanded: Vec<BTreeSet<(i32, i32, i32, i32)>> = Vec::new();
+    // (expansions done, id, east, west, north, south), smallest first.
+    type Wave = (usize, usize, i32, i32, i32, i32);
+    let mut waves: BinaryHeap<Reverse<Wave>> = BinaryHeap::new();
+    for (id, m) in merged.iter().enumerate() {
+        let mut b = *m;
+        let h = 6 - (b.xh - b.xl);
+        let v = 6 - (b.yh - b.yl);
+        let e = grid.expand(&mut b, id as i32, 0, h / 2);
+        let w = grid.expand(&mut b, id as i32, 1, h - e);
+        let n = grid.expand(&mut b, id as i32, 2, v / 2);
+        let s = grid.expand(&mut b, id as i32, 3, v - n);
+        waves.push(Reverse((1, id, 0, h, n, s)));
+        waves.push(Reverse((1, id, h, 0, n, s)));
+        waves.push(Reverse((1, id, e, w, 0, v)));
+        waves.push(Reverse((1, id, e, w, v, 0)));
+        expanded.push(BTreeSet::from([key(&b)]));
+        grid.fill(&b, id as i32);
+    }
+    while let Some(Reverse(mut wf)) = waves.pop() {
+        let id = wf.1;
+        if expanded[id].len() != wf.0 {
+            wf.0 = expanded[id].len();
+            waves.push(Reverse(wf));
+            continue;
+        }
+        let mut b = merged[id];
+        grid.expand(&mut b, id as i32, 0, wf.2);
+        grid.expand(&mut b, id as i32, 1, wf.3);
+        grid.expand(&mut b, id as i32, 2, wf.4);
+        grid.expand(&mut b, id as i32, 3, wf.5);
+        expanded[id].insert(key(&b));
+        grid.fill(&b, id as i32);
+    }
+    expanded
+}
+
+/// Worker ids in batches: each id's boxes widened by `bloat` and merged; first fit into the
+/// first batch none of whose members' boxes it touches.
+pub fn stubborn_batches(boxes: &[Vec<Rect>], bloat: i32) -> Vec<Vec<usize>> {
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    let max: Vec<Rect> = boxes
+        .iter()
+        .map(|set| set.iter().map(|r| Rect { xl: r.xl - bloat, yl: r.yl - bloat, xh: r.xh + bloat, yh: r.yh + bloat }).reduce(|a, r| Rect { xl: a.xl.min(r.xl), yl: a.yl.min(r.yl), xh: a.xh.max(r.xh), yh: a.yh.max(r.yh) }).unwrap_or(Rect { xl: i32::MAX, yl: i32::MAX, xh: i32::MIN, yh: i32::MIN }))
+        .collect();
+    let mut batches: Vec<Vec<usize>> = vec![vec![0]];
+    for i in 1..max.len() {
+        match batches.iter_mut().find(|b| b.iter().all(|&k| !touch(&max[i], &max[k]))) {
+            Some(b) => b.push(i),
+            None => batches.push(vec![i]),
+        }
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gc::Owner;
+
+    fn r(xl: i32, yl: i32, xh: i32, yh: i32) -> Rect {
+        Rect { xl, yl, xh, yh }
+    }
+
+    /// Rule: stubborn tiles merge marker boxes greedily — the first pair (in order) whose union
+    /// spans at most 4 gcells each way, into the first — until no pair merges.
+    #[test]
+    fn stubborn_marker_boxes_merge_up_to_four_gcells() {
+        let m = merge_drv_boxes(&[r(0, 0, 0, 0), r(10, 10, 10, 10), r(4, 4, 4, 4), r(5, 0, 5, 0)]);
+        assert_eq!(m, vec![r(0, 0, 4, 4), r(10, 10, 10, 10), r(5, 0, 5, 0)]);
+        // 0..=5 spans 5: never merged.
+        assert_eq!(merge_drv_boxes(&[r(0, 0, 0, 0), r(5, 0, 5, 0)]).len(), 2);
+    }
+
+    /// Rule: a lone box grows to a centred 7×7 (east first, half the growth; west the rest; then
+    /// north half, south the rest), then four variants — the box at the west, east, south and north
+    /// edge; at the grid's low edge the growth stops, so fewer distinct boxes remain.
+    #[test]
+    fn stubborn_boxes_grow_to_seven_gcells_centred_then_off_centre() {
+        let e = expand_drv_boxes(&[r(10, 10, 10, 10)]);
+        let got: Vec<(i32, i32, i32, i32)> = e[0].iter().copied().collect();
+        assert_eq!(got, vec![(4, 7, 10, 13), (7, 4, 13, 10), (7, 7, 13, 13), (7, 10, 13, 16), (10, 7, 16, 13)]);
+        let low = expand_drv_boxes(&[r(0, 0, 0, 0)]);
+        let got: Vec<(i32, i32, i32, i32)> = low[0].iter().copied().collect();
+        // Centred: east 3, west stops at 0, north 3, south stops at 0. Variants from the merged
+        // box: west 6 and south 6 stop at once, leaving a box only 3 wide (or high).
+        assert_eq!(got, vec![(0, 0, 0, 3), (0, 0, 3, 0), (0, 0, 3, 3), (0, 0, 3, 6), (0, 0, 6, 3)]);
+    }
+
+    /// Rule: a box does not grow into another box's gcells.
+    #[test]
+    fn stubborn_boxes_do_not_grow_into_each_other() {
+        let e = expand_drv_boxes(&[r(10, 10, 10, 10), r(12, 10, 12, 10)]);
+        for (xl, _, xh, _) in &e[0] {
+            assert!(*xh < 12 || *xl > 12, "box 0 took box 1's gcell: {xl}..{xh}");
+        }
+    }
+
+    /// Rule: worker ids go first-fit into the first batch none of whose members' widened boxes
+    /// they touch.
+    #[test]
+    fn stubborn_batches_first_fit() {
+        let b = stubborn_batches(&[vec![r(0, 0, 10, 10)], vec![r(15, 0, 20, 10)], vec![r(100, 0, 110, 10)]], 3);
+        assert_eq!(b, vec![vec![0, 2], vec![1]]);
+    }
 
     fn marker(rule: Rule, x: i32) -> Marker {
         let o = Owner::Net("a".into());
