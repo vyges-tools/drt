@@ -48,6 +48,8 @@ pub struct Layer {
     pub cut_spacing: Option<i32>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
+    /// A routing layer's own minimum AREA (square database units; 0 without one).
+    pub min_area: i64,
 }
 
 /// An end-of-line spacing rule: a line end narrower than `width` needs `space` to a facing edge
@@ -317,7 +319,8 @@ pub mod read {
                         .into_iter()
                         .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }) })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol });
+                    let min_area = db.layer_get_area(&name).unwrap_or(0);
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, min_area });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;
