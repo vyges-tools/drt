@@ -421,14 +421,55 @@ pub fn non_pref_layer(tech: &crate::tech::Tech, cfg: &GridConfig, l: usize) -> O
     None
 }
 
-/// A worker's grid: the x and y coordinates (sorted, distinct) and the routing layers (up to the
-/// top routing layer). Coordinates: every routing layer's PREFERRED-direction tracks inside the
-/// extended box (low side included, high side not), the route and extended boxes' sides, and each
+/// Per layer, per coordinate: whether it is a real track (`true`) or added for an access point, a
+/// route or a box side (`false`). Layer `None` holds the route and extended boxes' sides.
+pub type CoordMaps = BTreeMap<Option<usize>, BTreeMap<i32, bool>>;
+
+/// A worker's grid coordinates: the x and y maps (see [`CoordMaps`]), and the routing layers (up
+/// to the top routing layer). Added in order — a later add of a real track overrides: each
 /// access point's coordinate across its layer on every layer from it to the next one routed
-/// across (clamped into the routing layers).
-pub fn grid_coords(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern], cfg: &GridConfig, route_box: &Rect, ext_box: &Rect, nets: &[DrNet]) -> (Vec<i32>, Vec<i32>, Vec<usize>) {
-    let mut xs: BTreeSet<i32> = BTreeSet::new();
-    let mut ys: BTreeSet<i32> = BTreeSet::new();
+/// across (clamped into the routing layers), the route and extended boxes' sides, then every
+/// routing layer's PREFERRED-direction tracks inside the extended box (low side included, high
+/// side not).
+pub fn grid_maps(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern], cfg: &GridConfig, route_box: &Rect, ext_box: &Rect, nets: &[DrNet]) -> (CoordMaps, CoordMaps, Vec<usize>) {
+    let mut xm: CoordMaps = BTreeMap::new();
+    let mut ym: CoordMaps = BTreeMap::new();
+    for b in [route_box, ext_box] {
+        for c in [b.xl, b.xh] {
+            xm.entry(None).or_default().insert(c, false);
+        }
+        for c in [b.yl, b.yh] {
+            ym.entry(None).or_default().insert(c, false);
+        }
+    }
+    for net in nets {
+        for pin in &net.pins {
+            for ap in &pin.patterns {
+                let mut l = ap.layer;
+                let end = if l < cfg.bottom_routing_layer {
+                    cfg.bottom_routing_layer
+                } else if l > cfg.top_routing_layer {
+                    cfg.top_routing_layer
+                } else {
+                    non_pref_layer(tech, cfg, l).unwrap_or(l)
+                };
+                loop {
+                    if tech.layers[l].is_horizontal() {
+                        ym.entry(Some(l)).or_default().insert(ap.point.1, false);
+                    } else {
+                        xm.entry(Some(l)).or_default().insert(ap.point.0, false);
+                    }
+                    if end > l {
+                        l += 2;
+                    } else if end < l {
+                        l -= 2;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
     let mut zs: Vec<usize> = Vec::new();
     for (l, layer) in tech.layers.iter().enumerate() {
         if layer.kind != crate::tech::LayerKind::Routing || l > cfg.top_routing_layer {
@@ -448,50 +489,145 @@ pub fn grid_coords(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern
             while k < tp.num && k * tp.spacing + tp.start < hi {
                 let c = k * tp.spacing + tp.start;
                 if tp.vertical_tracks {
-                    xs.insert(c);
+                    xm.entry(Some(l)).or_default().insert(c, true);
                 } else {
-                    ys.insert(c);
+                    ym.entry(Some(l)).or_default().insert(c, true);
                 }
                 k += 1;
             }
         }
         zs.push(l);
     }
-    for b in [route_box, ext_box] {
-        xs.insert(b.xl);
-        xs.insert(b.xh);
-        ys.insert(b.yl);
-        ys.insert(b.yh);
+    (xm, ym, zs)
+}
+
+/// The sorted, distinct coordinates of all layers' maps.
+pub fn coords(m: &CoordMaps) -> Vec<i32> {
+    let s: BTreeSet<i32> = m.values().flat_map(|v| v.keys().copied()).collect();
+    s.into_iter().collect()
+}
+
+/// [`grid_maps`], flattened: the x and y coordinates and the layers.
+pub fn grid_coords(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern], cfg: &GridConfig, route_box: &Rect, ext_box: &Rect, nets: &[DrNet]) -> (Vec<i32>, Vec<i32>, Vec<usize>) {
+    let (xm, ym, zs) = grid_maps(tech, tracks, cfg, route_box, ext_box, nets);
+    (coords(&xm), coords(&ym), zs)
+}
+
+/// A grid node's topology: its edges east, north and up, and whether each is off-track (a
+/// "grid cost").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Node {
+    pub east: bool,
+    pub north: bool,
+    pub up: bool,
+    pub grid_cost_e: bool,
+    pub grid_cost_n: bool,
+    pub grid_cost_u: bool,
+}
+
+/// A worker's grid graph.
+#[derive(Debug, Clone)]
+pub struct GridGraph {
+    pub xs: Vec<i32>,
+    pub ys: Vec<i32>,
+    /// The routing layer of each z.
+    pub zs: Vec<usize>,
+    pub nodes: Vec<Node>,
+}
+
+impl GridGraph {
+    pub fn idx(&self, x: usize, y: usize, z: usize) -> usize {
+        (z * self.ys.len() + y) * self.xs.len() + x
     }
-    for net in nets {
-        for pin in &net.pins {
-            for ap in &pin.patterns {
-                let mut l = ap.layer;
-                let end = if l < cfg.bottom_routing_layer {
-                    cfg.bottom_routing_layer
-                } else if l > cfg.top_routing_layer {
-                    cfg.top_routing_layer
-                } else {
-                    non_pref_layer(tech, cfg, l).unwrap_or(l)
-                };
-                loop {
-                    if tech.layers[l].is_horizontal() {
-                        ys.insert(ap.point.1);
+}
+
+/// The edges: per layer (z), its preferred-direction edges along each of its own tracks (off-track
+/// coordinates and the route box's sides costed), up-vias where the layer two above has a
+/// coordinate (costed when either is off-track) unless the default via there would leave the
+/// die, and non-preferred edges along the coordinates of the layer routed across it (all
+/// costed). An edge exists only with both ends inside the ROUTE box.
+/// ⚠️ An off-track cost bit is set whether or not its edge was added (outside the route box it
+/// was not).
+#[allow(clippy::too_many_arguments)]
+pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &GridConfig, xm: &CoordMaps, ym: &CoordMaps, zs: &[usize], route_box: &Rect, die: &Rect) -> GridGraph {
+    let (xs, ys) = (coords(xm), coords(ym));
+    let mut g = GridGraph { nodes: vec![Node::default(); xs.len() * ys.len() * zs.len()], xs, ys, zs: zs.to_vec() };
+    let empty: BTreeMap<i32, bool> = BTreeMap::new();
+    let map = |m: &'_ CoordMaps, l: usize| -> BTreeMap<i32, bool> { m.get(&Some(l)).cloned().unwrap_or_else(|| empty.clone()) };
+    let in_box = |p: P| route_box.xl <= p.0 && p.0 <= route_box.xh && route_box.yl <= p.1 && p.1 <= route_box.yh;
+    let out_of_die_via = |g: &GridGraph, x: usize, y: usize, l: usize| -> bool {
+        if l + 1 >= tech.layers.len() {
+            return false;
+        }
+        let Some(v) = defaults.get(l + 1).copied().flatten() else { return true };
+        let vd = &tech.via_defs[v];
+        let (b1, b2) = (vd.layer1_bbox(), vd.layer2_bbox());
+        let (px, py) = (g.xs[x], g.ys[y]);
+        let b = Rect { xl: b1.xl.min(b2.xl) + px, yl: b1.yl.min(b2.yl) + py, xh: b1.xh.max(b2.xh) + px, yh: b1.yh.max(b2.yh) + py };
+        !(die.xl <= b.xl && die.yl <= b.yl && b.xh <= die.xh && b.yh <= die.yh)
+    };
+    let (nx, ny) = (g.xs.len(), g.ys.len());
+    for (z, &l) in zs.iter().enumerate() {
+        let non_pref = if l + 2 <= cfg.top_routing_layer { l + 2 } else if l >= 2 { l - 2 } else { l };
+        let in_range = l >= cfg.bottom_routing_layer && l <= cfg.top_routing_layer;
+        let horizontal = tech.layers[l].is_horizontal();
+        let (own, up2, np) = if horizontal { (map(ym, l), map(xm, l + 2), map(xm, non_pref)) } else { (map(xm, l), map(ym, l + 2), map(ym, non_pref)) };
+        // Preferred edges and up-vias.
+        let (outer, inner) = if horizontal { (ny, nx) } else { (nx, ny) };
+        for o in 0..outer {
+            let oc = if horizontal { g.ys[o] } else { g.xs[o] };
+            let Some(&track) = own.get(&oc) else { continue };
+            for i in 0..inner {
+                let (x, y) = if horizontal { (i, o) } else { (o, i) };
+                let ood = out_of_die_via(&g, x, y, l);
+                if in_range {
+                    // (Leaving the die only matters on a unidirectional layer, which is refused.)
+                    let (x2, y2) = if horizontal { (x + 1, y) } else { (x, y + 1) };
+                    let added = x2 < nx && y2 < ny && in_box((g.xs[x], g.ys[y])) && in_box((g.xs[x2], g.ys[y2]));
+                    let border = if horizontal { oc == route_box.yl || oc == route_box.yh } else { oc == route_box.xl || oc == route_box.xh };
+                    let k = g.idx(x, y, z);
+                    if horizontal {
+                        g.nodes[k].east |= added;
+                        g.nodes[k].grid_cost_e |= !track || border;
                     } else {
-                        xs.insert(ap.point.0);
+                        g.nodes[k].north |= added;
+                        g.nodes[k].grid_cost_n |= !track || border;
                     }
-                    if end > l {
-                        l += 2;
-                    } else if end < l {
-                        l -= 2;
+                }
+                if ood {
+                    continue;
+                }
+                let ic = if horizontal { g.xs[x] } else { g.ys[y] };
+                let Some(&track2) = up2.get(&ic) else { continue };
+                let k = g.idx(x, y, z);
+                g.nodes[k].up |= z + 1 < zs.len() && in_box((g.xs[x], g.ys[y]));
+                g.nodes[k].grid_cost_u |= !(track && track2);
+            }
+        }
+        // Non-preferred edges along the coordinates of the layer routed across.
+        if in_range {
+            for i in 0..inner {
+                let ic = if horizontal { g.xs[i] } else { g.ys[i] };
+                if !np.contains_key(&ic) {
+                    continue;
+                }
+                for o in 0..outer {
+                    let (x, y) = if horizontal { (i, o) } else { (o, i) };
+                    let (x2, y2) = if horizontal { (x, y + 1) } else { (x + 1, y) };
+                    let added = x2 < nx && y2 < ny && in_box((g.xs[x], g.ys[y])) && in_box((g.xs[x2], g.ys[y2]));
+                    let k = g.idx(x, y, z);
+                    if horizontal {
+                        g.nodes[k].north |= added;
+                        g.nodes[k].grid_cost_n = true;
                     } else {
-                        break;
+                        g.nodes[k].east |= added;
+                        g.nodes[k].grid_cost_e = true;
                     }
                 }
             }
         }
     }
-    (xs.into_iter().collect(), ys.into_iter().collect(), zs)
+    g
 }
 
 /// The margin around a worker's route box: 2000, or the largest spacing any non-default rule
