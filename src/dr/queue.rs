@@ -54,6 +54,8 @@ pub enum Event {
     Check { owner: Owner, markers: Vec<Marker> },
     /// After the queue, the check over every owner: the worker's markers.
     Final { markers: Vec<Marker> },
+    /// An entry pushed onto the queue (after its batch was sorted).
+    Push { block: Block, num_reroute: i32, do_route: bool, checking: Option<Owner> },
 }
 
 /// What the queue reads beyond the costs.
@@ -191,7 +193,11 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 (m, owner)
             }
         };
+        let before = queue.len();
         update_queue(q, nets, &mut state, &by_name, &markers, &mut queue, Some(checking_obj));
+        for e in queue.iter().skip(before) {
+            events.push(Event::Push { block: e.block.clone(), num_reroute: e.num_reroute, do_route: e.do_route, checking: e.checking.clone() });
+        }
         if did_route {
             marker_cost_decay(w, q.marker_decay, &mut planar_hist, &mut via_hist);
         }
