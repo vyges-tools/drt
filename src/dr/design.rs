@@ -7,18 +7,31 @@
 //!   best shapes added; a wire crossing the route box keeps its parts outside (the crossing end
 //!   now extends), and the points where it crossed are BOUNDARY POINTS; a wire along the route
 //!   box's own side (x on its left or right for a vertical wire, y on its bottom or top for a
-//!   horizontal one) is kept whole; a via or patch is removed when its origin lies in the route
-//!   box;
+//!   horizontal one) is kept whole; a via or patch is removed when its origin lies STRICTLY inside
+//!   the route box in the first iteration (on its edge it stays, as the worker counted it ext),
+//!   inside or on it afterwards;
 //! - at each boundary point not on a pin of the net (or off the manufacturing grid), exactly two
 //!   of the net's wires of one direction through it (none of the other, no patch there, both
 //!   tapered or neither) merge into one, each outer end keeping its style;
 //! - the markers in the worker's check box are replaced by its best markers that touch it.
+//!
+//! The design keeps its committed shapes and its markers each in a region query (per layer; a
+//! via on its cut layer), updated insert by insert and removal by removal in the order the
+//! write-back makes them: a query's ORDER is what later readers see (a worker's objects and
+//! markers, which of two wires a merge keeps).
+//! - removal: the shapes of the modified nets in the extended box, in query order (a crossing
+//!   wire's outside parts added before the wire is removed);
+//! - addition: the routed nets' best shapes, in worker net order;
+//! - merges: per net (by index), per boundary point (by point, then layer): the two wires in
+//!   query order — the merged wire is a copy of the FIRST — removed, the merged one added;
+//! - markers: those in the check box removed in query order, the new ones added in order.
 
 use std::collections::BTreeSet;
 
 use crate::dr::cost::DrFig;
 use crate::gc::Marker;
 use crate::polygon90::Rect;
+use crate::rtree::DynRTree;
 use crate::tech::Tech;
 
 type P = (i32, i32);
@@ -30,11 +43,18 @@ pub struct Shape {
     pub fig: DrFig,
 }
 
-/// The committed routes (in the order they were written; removed slots empty) and markers.
-#[derive(Debug, Clone, Default)]
+/// The committed routes (slots in the order they were written, removed ones empty) and markers,
+/// each with its region query.
+#[derive(Default)]
 pub struct DesignRoutes {
     pub shapes: Vec<Option<Shape>>,
-    pub markers: Vec<Marker>,
+    /// Each live shape's (layer, id) in its layer's query.
+    rq: Vec<Option<(usize, usize)>>,
+    trees: Vec<DynRTree<usize>>,
+    /// The markers in the order they were added (removed ones empty).
+    marker_slots: Vec<Option<Marker>>,
+    marker_rq: Vec<Option<(usize, usize)>>,
+    marker_trees: Vec<DynRTree<usize>>,
 }
 
 /// A shape's box as the region query stores it: a wire's (ends extended), a via's over its three
@@ -60,19 +80,70 @@ fn in_box(r: &Rect, p: P) -> bool {
     p.0 >= r.xl && p.0 <= r.xh && p.1 >= r.yl && p.1 <= r.yh
 }
 
+fn tree_at<T>(trees: &mut Vec<DynRTree<T>>, l: usize) -> &mut DynRTree<T> {
+    while trees.len() <= l {
+        trees.push(DynRTree::new(Vec::new()));
+    }
+    &mut trees[l]
+}
+
 impl DesignRoutes {
-    /// The shapes whose stored box touches `b` (any layer), in writing order.
-    pub fn query(&self, tech: &Tech, b: &Rect) -> Vec<usize> {
-        (0..self.shapes.len()).filter(|&k| self.shapes[k].as_ref().is_some_and(|s| touches(&stored_box(tech, &s.fig).1, b))).collect()
+    /// The shapes whose stored box touches `b`: layer by layer (ascending), each in its query's
+    /// order.
+    pub fn query(&self, _tech: &Tech, b: &Rect) -> Vec<usize> {
+        self.trees.iter().flat_map(|t| t.query(b).into_iter().map(|(_, v)| v.1)).collect()
     }
 
-    fn add(&mut self, net: usize, fig: DrFig) {
+    /// The shapes stored on layer `l` whose box touches `b`, in query order.
+    pub fn query_layer(&self, b: &Rect, l: usize) -> Vec<usize> {
+        self.trees.get(l).map_or(Vec::new(), |t| t.query(b).into_iter().map(|(_, v)| v.1).collect())
+    }
+
+    /// Commit a shape (the end of the net's list and of the writing order); its slot.
+    pub fn add(&mut self, tech: &Tech, net: usize, fig: DrFig) -> usize {
+        let k = self.shapes.len();
+        let (l, b) = stored_box(tech, &fig);
+        let id = tree_at(&mut self.trees, l).insert(b, k);
         self.shapes.push(Some(Shape { net, fig }));
+        self.rq.push(Some((l, id)));
+        k
     }
 
-    /// The markers whose box touches `b`.
+    /// Remove a committed shape.
+    pub fn remove(&mut self, k: usize) {
+        if let Some((l, id)) = self.rq[k].take() {
+            self.trees[l].remove(id);
+        }
+        self.shapes[k] = None;
+    }
+
+    /// The markers whose box touches `b`: layer by layer, each in its query's order.
     pub fn markers_in(&self, b: &Rect) -> Vec<Marker> {
-        self.markers.iter().filter(|m| touches(&m.bbox, b)).cloned().collect()
+        self.marker_ids_in(b).into_iter().map(|k| self.marker_slots[k].clone().expect("a live marker")).collect()
+    }
+
+    fn marker_ids_in(&self, b: &Rect) -> Vec<usize> {
+        self.marker_trees.iter().flat_map(|t| t.query(b).into_iter().map(|(_, v)| v.1)).collect()
+    }
+
+    /// Every standing marker, in the order added.
+    pub fn markers(&self) -> impl Iterator<Item = &Marker> {
+        self.marker_slots.iter().flatten()
+    }
+
+    /// Add a marker (the end of the design's list).
+    pub fn add_marker(&mut self, m: Marker) {
+        let (k, l) = (self.marker_slots.len(), m.layer);
+        let id = tree_at(&mut self.marker_trees, l).insert(m.bbox, k);
+        self.marker_slots.push(Some(m));
+        self.marker_rq.push(Some((l, id)));
+    }
+
+    fn remove_marker(&mut self, k: usize) {
+        if let Some((l, id)) = self.marker_rq[k].take() {
+            self.marker_trees[l].remove(id);
+        }
+        self.marker_slots[k] = None;
     }
 }
 
@@ -87,6 +158,18 @@ pub struct WriteBack<'a> {
     /// Whether a pin shape of `net` lies at the point on the layer.
     pub on_pin: &'a dyn Fn(P, usize, usize) -> bool,
     pub manufacturing_grid: i32,
+    /// The first iteration (a via or patch is a route part only strictly inside the box).
+    pub init_dr: bool,
+}
+
+/// Whether a via or patch at `origin` is the worker's to remove: strictly inside the route box in
+/// the first iteration, inside or on it afterwards.
+fn is_route_origin(rb: &Rect, origin: P, init_dr: bool) -> bool {
+    if init_dr {
+        origin.0 > rb.xl && origin.0 < rb.xh && origin.1 > rb.yl && origin.1 < rb.yh
+    } else {
+        in_box(rb, origin)
+    }
 }
 
 /// A worker's write-back into the design.
@@ -100,10 +183,10 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
             continue;
         }
         match s.fig {
-            DrFig::Seg { .. } => remove_seg(d, k, &wb.route_box, bound.entry(s.net).or_default()),
+            DrFig::Seg { .. } => remove_seg(d, tech, k, &wb.route_box, bound.entry(s.net).or_default()),
             DrFig::Via { origin, .. } | DrFig::Patch { origin, .. } => {
-                if in_box(&wb.route_box, origin) {
-                    d.shapes[k] = None;
+                if is_route_origin(&wb.route_box, origin, wb.init_dr) {
+                    d.remove(k);
                 }
             }
         }
@@ -111,7 +194,7 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
     // Add the best shapes.
     for (net, figs) in wb.routed {
         for f in figs {
-            d.add(*net, f.clone());
+            d.add(tech, *net, f.clone());
         }
     }
     for (net, pts) in &bound {
@@ -120,10 +203,12 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
         }
     }
     // Markers.
-    d.markers.retain(|m| !touches(&m.bbox, &wb.drc_box));
+    for k in d.marker_ids_in(&wb.drc_box) {
+        d.remove_marker(k);
+    }
     for m in wb.markers {
         if touches(&m.bbox, &wb.drc_box) {
-            d.markers.push(m.clone());
+            d.add_marker(m.clone());
         }
     }
 }
@@ -131,7 +216,7 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
 /// A committed wire of a net the worker rerouted: kept whole along the route box's sides; else
 /// the parts outside the route box kept (the crossing end now extending), the crossing points
 /// recorded.
-fn remove_seg(d: &mut DesignRoutes, k: usize, rb: &Rect, bound: &mut BTreeSet<(P, usize)>) {
+fn remove_seg(d: &mut DesignRoutes, tech: &Tech, k: usize, rb: &Rect, bound: &mut BTreeSet<(P, usize)>) {
     let Some(Shape { net, fig }) = d.shapes[k].clone() else { return };
     let DrFig::Seg { layer, begin, end, .. } = fig else { return };
     let vertical = begin.0 == end.0;
@@ -158,7 +243,7 @@ fn remove_seg(d: &mut DesignRoutes, k: usize, rb: &Rect, bound: &mut BTreeSet<(P
                 *end_trunc = false;
             }
         }
-        d.add(net, f);
+        d.add(tech, net, f);
         if hi >= blo {
             bound.insert((ne, layer));
         }
@@ -175,12 +260,12 @@ fn remove_seg(d: &mut DesignRoutes, k: usize, rb: &Rect, bound: &mut BTreeSet<(P
                 *begin_trunc = false;
             }
         }
-        d.add(net, f);
+        d.add(tech, net, f);
         if lo <= bhi {
             bound.insert((nb, layer));
         }
     }
-    d.shapes[k] = None;
+    d.remove(k);
 }
 
 /// At a boundary point: two of the net's wires of one direction through it (and none of the
@@ -193,13 +278,9 @@ fn merge_at(d: &mut DesignRoutes, tech: &Tech, net: usize, pt: P, layer: usize, 
     }
     let q = Rect { xl: pt.0, yl: pt.1, xh: pt.0, yh: pt.1 };
     let (mut horz, mut vert): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
-    for k in 0..d.shapes.len() {
+    for k in d.query_layer(&q, layer) {
         let Some(s) = &d.shapes[k] else { continue };
         if s.net != net {
-            continue;
-        }
-        let (sl, b) = stored_box(tech, &s.fig);
-        if sl != layer || !touches(&b, &q) {
             continue;
         }
         match s.fig {
@@ -254,8 +335,25 @@ fn merge_at(d: &mut DesignRoutes, tech: &Tech, net: usize, pt: P, layer: usize, 
                 }
             }
         }
-        d.shapes[group[0]] = None;
-        d.shapes[group[1]] = None;
-        d.add(net, f);
+        d.remove(group[0]);
+        d.remove(group[1]);
+        d.add(tech, net, f);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rule: in the first iteration a via whose origin lies ON the route box's edge is not the
+    /// worker's (it read it as ext), so its write-back keeps it; from the second iteration on the
+    /// edge counts as inside.
+    #[test]
+    fn a_via_on_the_route_box_edge_is_removed_only_after_the_first_iteration() {
+        let rb = Rect { xl: 0, yl: 0, xh: 100, yh: 100 };
+        for (p, first, later) in [((50, 100), false, true), ((0, 50), false, true), ((50, 50), true, true), ((50, 101), false, false)] {
+            assert_eq!(is_route_origin(&rb, p, true), first, "{p:?} first iteration");
+            assert_eq!(is_route_origin(&rb, p, false), later, "{p:?} later");
+        }
     }
 }

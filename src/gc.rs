@@ -27,6 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
+use crate::rtree::DynRTree;
 use crate::tech::{EolRule, LayerKind, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
@@ -88,6 +89,8 @@ struct Shape {
     /// A route rectangle touching one of its net's tapered shapes (a non-default-rule net inside
     /// a pin's taper box): the rule's spacing does not apply to it.
     tapered: bool,
+    /// Its pin (piece) on the layer, in the reference's order.
+    pin: u32,
 }
 
 /// A boundary edge, from `from` to `to`.
@@ -253,6 +256,11 @@ pub struct Worker<'a> {
     pub max_ndr_spacing: Vec<i32>,
     /// Per layer, the special spacing rectangles (after `init`).
     spc: Vec<Vec<Shape>>,
+    /// Per layer: whether each shape (by its index, never reused) still stands, its id in the
+    /// layer's tree, and the tree — packed at `init`, then updated as the reference's is.
+    alive: Vec<Vec<bool>>,
+    rq_id: Vec<Vec<usize>>,
+    rq: Vec<DynRTree<usize>>,
     markers: Vec<Marker>,
     seen: BTreeSet<(Rect, usize, Rule, Vec<Owner>)>,
 }
@@ -412,7 +420,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, max_ndr_spacing: Vec::new(), spc: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, max_ndr_spacing: Vec::new(), spc: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -453,6 +461,36 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Every owner, in creation order.
+    pub fn owners(&self) -> Vec<Owner> {
+        self.nets.iter().filter_map(|n| n.owner.clone()).collect()
+    }
+
+    /// An owner's maximal rectangles per layer and pin: `|<layer>:<pin>:<xl,yl,xh,yh;>...`.
+    pub fn dump(&self, owner: &Owner) -> String {
+        let Some(&i) = self.index.get(owner) else { return String::new() };
+        let mut out = String::new();
+        for layer in 0..self.shapes.len() {
+            let mut cur: Option<u32> = None;
+            for (k, sh) in self.shapes[layer].iter().enumerate() {
+                if !self.alive[layer][k] || sh.net != i {
+                    continue;
+                }
+                if cur != Some(sh.pin) {
+                    out += &format!("|{layer}:{}:", sh.pin);
+                    cur = Some(sh.pin);
+                }
+                out += &format!("{},{},{},{};", sh.rect.xl, sh.rect.yl, sh.rect.xh, sh.rect.yh);
+            }
+        }
+        out
+    }
+
+    /// Create an owner (in order) if it is not there yet.
+    pub fn ensure_owner(&mut self, owner: &Owner) {
+        self.net(owner);
+    }
+
     /// A non-default-rule owner: its spacing per z.
     pub fn set_ndr_spacing(&mut self, owner: &Owner, spacing: Vec<i32>) {
         let i = self.net(owner);
@@ -469,51 +507,116 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Per owner and layer: the merged shapes' maximal rectangles (fixed or not) and boundary
-    /// edges; cut rectangles as they are.
+    /// Per owner and layer: the merged shapes' pieces (pins) and each pin's maximal rectangles
+    /// (fixed or not), boundary edges; cut rectangles as they are (route ones first). The shapes
+    /// of every layer packed into its tree in owner, pin, rectangle order.
     pub fn init(&mut self) {
         let n = self.tech.layers.len();
         self.shapes = vec![Vec::new(); n];
+        self.alive = vec![Vec::new(); n];
+        self.rq_id = vec![Vec::new(); n];
         self.edges = vec![Vec::new(); n];
         self.segs = vec![Vec::new(); n];
         self.spc = vec![Vec::new(); n];
-        for (i, net) in self.nets.iter_mut().enumerate() {
-            net.fixed_slices = net.fixed.iter_mut().map(|s| s.rectangles()).collect();
-            net.route_slices = net.route.iter_mut().map(|s| s.rectangles()).collect();
-            net.fixed_max = net.fixed.iter_mut().map(|s| s.max_rectangles()).collect();
-            for layer in 0..n {
-                let mut all = Polygon90Set::new();
-                for s in net.fixed_slices[layer].iter().chain(&net.route_slices[layer]) {
-                    all.insert_rect(*s);
+        for i in 0..self.nets.len() {
+            self.build_net(i);
+        }
+        self.rq = (0..n).map(|l| DynRTree::new(self.shapes[l].iter().enumerate().map(|(k, s)| (s.rect, k)).collect())).collect();
+        self.rq_id = (0..n).map(|l| (0..self.shapes[l].len()).collect()).collect();
+    }
+
+    /// One owner's pins, maximal rectangles, edges and special spacing rectangles, appended.
+    fn build_net(&mut self, i: usize) {
+        let n = self.tech.layers.len();
+        let net = &mut self.nets[i];
+        net.fixed_slices = net.fixed.iter_mut().map(|s| s.rectangles()).collect();
+        net.route_slices = net.route.iter_mut().map(|s| s.rectangles()).collect();
+        net.fixed_max = net.fixed.iter_mut().map(|s| s.max_rectangles()).collect();
+        for layer in 0..n {
+            let net = &self.nets[i];
+            let mut all = Polygon90Set::new();
+            for s in net.fixed_slices[layer].iter().chain(&net.route_slices[layer]) {
+                all.insert_rect(*s);
+            }
+            let slices = all.rectangles();
+            for (from, to) in boundary(&slices) {
+                self.edges[layer].push(Edge { from, to, net: i });
+            }
+            if self.tech.layers[layer].kind == LayerKind::Routing && !slices.is_empty() {
+                let mut fixed_edges: BTreeSet<EdgePoints> = boundary(&net.fixed_slices[layer]).into_iter().collect();
+                for r in &net.fixed_rects[layer] {
+                    fixed_edges.extend([((r.xl, r.yl), (r.xh, r.yl)), ((r.xh, r.yl), (r.xh, r.yh)), ((r.xh, r.yh), (r.xl, r.yh)), ((r.xl, r.yh), (r.xl, r.yl))]);
                 }
-                let slices = all.rectangles();
-                for (from, to) in boundary(&slices) {
-                    self.edges[layer].push(Edge { from, to, net: i });
-                }
-                if self.tech.layers[layer].kind == LayerKind::Routing && !slices.is_empty() {
-                    let mut fixed_edges: BTreeSet<EdgePoints> = boundary(&net.fixed_slices[layer]).into_iter().collect();
-                    for r in &net.fixed_rects[layer] {
-                        fixed_edges.extend([((r.xl, r.yl), (r.xh, r.yl)), ((r.xh, r.yl), (r.xh, r.yh)), ((r.xh, r.yh), (r.xl, r.yh)), ((r.xl, r.yh), (r.xl, r.yl))]);
-                    }
-                    polygon_segs(&mut self.segs[layer], &slices, &fixed_edges, i);
-                }
-                for r in all.max_rectangles() {
+                polygon_segs(&mut self.segs[layer], &slices, &fixed_edges, i);
+            }
+            let mut new_shapes: Vec<Shape> = Vec::new();
+            let mut pin_k: u32 = 0;
+            for mut pin in all.polygons() {
+                let k = pin_k;
+                pin_k += 1;
+                for r in pin.max_rectangles() {
                     let fixed = net.fixed_max[layer].contains(&r);
                     let mut tapered = false;
                     if !fixed && net.tapered[layer].iter().any(|t| touches(&r, t)) {
                         tapered = true;
                         for nt in &net.non_tapered[layer] {
                             if touches(&r, nt) {
-                                self.spc[layer].push(Shape { rect: *nt, net: i, fixed: false, tapered: false });
+                                self.spc[layer].push(Shape { rect: *nt, net: i, fixed: false, tapered: false, pin: 0 });
                             }
                         }
                     }
-                    self.shapes[layer].push(Shape { rect: r, net: i, fixed, tapered });
+                    new_shapes.push(Shape { rect: r, net: i, fixed, tapered, pin: k });
                 }
-                for &r in net.route_cuts[layer].iter().chain(&net.fixed_cuts[layer]) {
-                    let fixed = net.fixed_cuts[layer].contains(&r);
-                    self.shapes[layer].push(Shape { rect: r, net: i, fixed, tapered: false });
+            }
+            for &r in net.route_cuts[layer].iter().chain(&net.fixed_cuts[layer]) {
+                let fixed = net.fixed_cuts[layer].contains(&r);
+                new_shapes.push(Shape { rect: r, net: i, fixed, tapered: false, pin: pin_k });
+                pin_k += 1;
+            }
+            for sh in new_shapes {
+                self.shapes[layer].push(sh);
+                self.alive[layer].push(true);
+                self.rq_id[layer].push(usize::MAX);
+            }
+        }
+    }
+
+    /// Replace an owner's route shapes (after `init`): its rectangles out of the trees (layer,
+    /// pin, rectangle order), its pins rebuilt from its fixed shapes and these, the new
+    /// rectangles in — as the reference's check updates a net it rerouted.
+    pub fn replace_route(&mut self, owner: &Owner, route: &[(usize, Rect)], taper: &[(usize, Rect, bool)]) {
+        let i = self.net(owner);
+        let n = self.tech.layers.len();
+        let old: Vec<usize> = self.shapes.iter().map(|v| v.len()).collect();
+        for layer in 0..n {
+            for k in 0..self.shapes[layer].len() {
+                if self.alive[layer][k] && self.shapes[layer][k].net == i {
+                    self.rq[layer].remove(self.rq_id[layer][k]);
+                    self.alive[layer][k] = false;
                 }
+            }
+            self.edges[layer].retain(|e| e.net != i);
+            self.segs[layer].retain(|e| e.net != i);
+            self.spc[layer].retain(|e| e.net != i);
+        }
+        {
+            let net = &mut self.nets[i];
+            net.route = vec![Polygon90Set::new(); n];
+            net.route_cuts = vec![Vec::new(); n];
+            net.tapered = vec![Vec::new(); n];
+            net.non_tapered = vec![Vec::new(); n];
+        }
+        for &(l, r) in route {
+            self.add(owner, l, r, false);
+        }
+        for &(l, r, t) in taper {
+            self.add_taper(owner, l, r, t);
+        }
+        self.build_net(i);
+        for (layer, &from) in old.iter().enumerate() {
+            for k in from..self.shapes[layer].len() {
+                let r = self.shapes[layer][k].rect;
+                self.rq_id[layer][k] = self.rq[layer].insert(r, k);
             }
         }
     }
@@ -521,6 +624,8 @@ impl<'a> Worker<'a> {
     /// Metal spacing, then end-of-line spacing, then cut spacing, over every owner's shapes; the
     /// markers made.
     pub fn run(&mut self) -> &[Marker] {
+        self.markers.clear();
+        self.seen.clear();
         self.check_metal_spacing();
         self.check_metal_end_of_line();
         self.check_cut_spacing();
@@ -553,9 +658,9 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Every shape on `layer` touching `r`.
+    /// Every standing shape on `layer` touching `r`, in the tree's order.
     fn query(&self, layer: usize, r: &Rect) -> Vec<usize> {
-        (0..self.shapes[layer].len()).filter(|&k| touches(&self.shapes[layer][k].rect, r)).collect()
+        self.rq[layer].query(r).into_iter().map(|(_, v)| v.1).collect()
     }
 
     // ---- end-of-line spacing ----
@@ -772,7 +877,7 @@ impl<'a> Worker<'a> {
                 if !self.checks_from(net) {
                     continue;
                 }
-                let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.shapes[layer][k].net == net).collect();
+                let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).collect();
                 for k in mine {
                     let s = self.shapes[layer][k];
                     self.metal_spacing_of(layer, s, false);
@@ -1098,7 +1203,7 @@ impl<'a> Worker<'a> {
                 if !self.checks_from(net) {
                     continue;
                 }
-                let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.shapes[layer][k].net == net).collect();
+                let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).collect();
                 for k in mine {
                     let q = bloat(&self.shapes[layer][k].rect, spc);
                     for o in self.query(layer, &q) {

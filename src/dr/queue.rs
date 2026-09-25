@@ -54,6 +54,8 @@ pub enum Event {
     Check { owner: Owner, markers: Vec<Marker> },
     /// After the queue, the check over every owner: the worker's markers.
     Final { markers: Vec<Marker> },
+    /// The check's view of an owner (`VYGD_GC`): `gcinit` / `gcupd` and its maximal rectangles.
+    Gc(String),
     /// An entry pushed onto the queue (after its batch was sorted).
     Push { block: Block, num_reroute: i32, do_route: bool, checking: Option<Owner> },
 }
@@ -146,6 +148,8 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
         m
     };
     let mut queue: VecDeque<Entry> = order.iter().map(|&i| Entry { block: Block::Net(i), num_reroute: 0, do_route: true, checking: None }).collect();
+    let gc_dump = std::env::var("VYGD_GC").is_ok();
+    let mut gw = check_init(q, nets, &state, if gc_dump { Some(&mut events) } else { None });
     let mut gc_version = 1i64;
     let mut checked: HashMap<Block, i64> = HashMap::new();
     let History { planar: mut planar_hist, via: mut via_hist } = hist;
@@ -168,7 +172,12 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 state[i].figs = figs.clone();
                 did_route = true;
                 let owner = Owner::Net((q.name)(i));
-                let m = check(q, nets, &state, &owner);
+                let (route, taper) = owner_route(q, nets, &state, &owner);
+                gw.replace_route(&owner, &route, &taper);
+                if gc_dump {
+                    events.push(Event::Gc(format!("gcupd|{}", owner_tag(&owner)) + &gw.dump(&owner)));
+                }
+                let m = check(&mut gw, &owner);
                 after_check(w, &nets[i], &figs, cx.ext_box);
                 checked.insert(Block::Owner(owner.clone()), gc_version);
                 events.push(Event::Route { net: i, reroutes, searches, figs, markers: m.clone() });
@@ -187,7 +196,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                     }
                     Block::Owner(o) => o.clone(),
                 };
-                let m = check(q, nets, &state, &owner);
+                let m = check(&mut gw, &owner);
                 checked.insert(b.clone(), gc_version);
                 events.push(Event::Check { owner: owner.clone(), markers: m.clone() });
                 (m, owner)
@@ -205,52 +214,39 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
             add_marker_cost(w, q, nets, &state, mk, &mut planar_hist, &mut via_hist);
         }
     }
-    events.push(Event::Final { markers: check_all(q, &state) });
+    gw.target = None;
+    events.push(Event::Final { markers: gw.run().to_vec() });
     events
 }
 
-/// The check over every owner (no target).
-fn check_all(q: &QueueCtx<'_>, state: &[NetState]) -> Vec<Marker> {
-    let mut gw = worker_for(q, state);
-    gw.init();
-    gw.run().to_vec()
-}
-
-/// The check on one owner: the design's shapes and every net's current shapes.
-fn check(q: &QueueCtx<'_>, _nets: &[DrNet], state: &[NetState], target: &Owner) -> Vec<Marker> {
-    let mut gw = worker_for(q, state);
+/// The check on one owner, against everything the check holds.
+fn check(gw: &mut Worker<'_>, target: &Owner) -> Vec<Marker> {
     gw.target = Some(target.clone());
-    gw.init();
     gw.run().to_vec()
 }
 
-/// The check's shapes: the design's in the extended box (fixed) and every net's (not).
-fn worker_for<'t>(q: &QueueCtx<'t>, state: &[NetState]) -> Worker<'t> {
+/// An owner's route shapes as the check holds them: every worker net of it, its committed
+/// shapes and what it wrote (metal and cuts); for a rule net, which are tapered (a patch counts
+/// untapered where it touches an untapered shape).
+#[allow(clippy::type_complexity)]
+fn owner_route(q: &QueueCtx<'_>, _nets: &[DrNet], state: &[NetState], owner: &Owner) -> (Vec<(usize, Rect)>, Vec<(usize, Rect, bool)>) {
     let tech = q.mcfg.tech;
-    let mut gw = Worker::new(tech);
-    for (o, l, b) in q.fixed {
-        gw.add(o, *l, *b, true);
-    }
-    gw.check_ndrs = true;
-    gw.max_ndr_spacing = q.max_ndr_spacing.to_vec();
+    let (mut route, mut taper) = (Vec::new(), Vec::new());
+    let Owner::Net(name) = owner else { return (route, taper) };
     for (i, s) in state.iter().enumerate() {
-        if s.figs.is_empty() && s.ext.is_empty() {
+        if (q.name)(i) != *name {
             continue;
         }
-        let owner = Owner::Net((q.name)(i));
-        let ndr = (q.ndr_spacing)(i);
-        if let Some(sp) = &ndr {
-            gw.set_ndr_spacing(&owner, sp.clone());
-        }
+        let ndr = (q.ndr_spacing)(i).is_some();
         let mut non_tapered: Vec<(usize, Rect)> = Vec::new();
         let mut patches: Vec<(usize, Rect)> = Vec::new();
         for f in s.ext.iter().chain(&s.figs) {
             for (l, b) in f.metal(tech) {
-                gw.add(&owner, l, b, false);
-                if ndr.is_some() {
+                route.push((l, b));
+                if ndr {
                     match f {
                         DrFig::Seg { tapered, .. } | DrFig::Via { tapered, .. } => {
-                            gw.add_taper(&owner, l, b, *tapered);
+                            taper.push((l, b, *tapered));
                             if !tapered {
                                 non_tapered.push((l, b));
                             }
@@ -262,13 +258,81 @@ fn worker_for<'t>(q: &QueueCtx<'t>, state: &[NetState]) -> Worker<'t> {
             if let DrFig::Via { via, origin, .. } = f {
                 let vd = &tech.via_defs[*via];
                 for c in &vd.cut_figs {
-                    gw.add(&owner, vd.cut, Rect { xl: c.xl + origin.0, yl: c.yl + origin.1, xh: c.xh + origin.0, yh: c.yh + origin.1 }, false);
+                    route.push((vd.cut, Rect { xl: c.xl + origin.0, yl: c.yl + origin.1, xh: c.xh + origin.0, yh: c.yh + origin.1 }));
                 }
             }
         }
         for (l, b) in patches {
             if non_tapered.iter().any(|(l2, b2)| *l2 == l && touches(b2, &b)) {
-                gw.add_taper(&owner, l, b, false);
+                taper.push((l, b, false));
+            }
+        }
+    }
+    (route, taper)
+}
+
+/// The worker's check as the reference builds it: the design's shapes in the extended box
+/// (their owners created in the query's order), every worker net's committed shapes, packed;
+/// then each owner (by net) updated once — the maze-cost pass's check update.
+fn owner_tag(o: &Owner) -> String {
+    match o {
+        Owner::Net(n) => format!("0:{n}"),
+        Owner::FloatingGround => "0:frFakeVSS".into(),
+        Owner::FloatingPower => "0:frFakeVDD".into(),
+        Owner::BlockTerm(n) => format!("1:{n}"),
+        Owner::Inst(n) => format!("3:{n}"),
+        Owner::InstTerm(i, t) => format!("7:{i}/{t}"),
+        Owner::Blockage(b) => format!("14:#{b}"),
+    }
+}
+
+fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], mut dump: Option<&mut Vec<Event>>) -> Worker<'t> {
+    let tech = q.mcfg.tech;
+    let mut gw = Worker::new(tech);
+    for (o, l, b) in q.fixed {
+        gw.add(o, *l, *b, true);
+    }
+    gw.check_ndrs = true;
+    gw.max_ndr_spacing = q.max_ndr_spacing.to_vec();
+    let mut owners: Vec<(usize, Owner)> = Vec::new();
+    for (i, n) in nets.iter().enumerate() {
+        let owner = Owner::Net((q.name)(i));
+        if !owners.iter().any(|(_, o)| *o == owner) {
+            owners.push((n.net, owner.clone()));
+        }
+    }
+    // Worker nets' shapes in worker order (their owners created after the design's).
+    for (_, owner) in &owners {
+        gw.ensure_owner(owner);
+        let (route, taper) = owner_route(q, nets, state, owner);
+        for (l, b) in route {
+            gw.add(owner, l, b, false);
+        }
+        for (l, b, t) in taper {
+            gw.add_taper(owner, l, b, t);
+        }
+    }
+    for i in 0..nets.len() {
+        if let Some(sp) = (q.ndr_spacing)(i) {
+            gw.set_ndr_spacing(&Owner::Net((q.name)(i)), sp);
+        }
+    }
+    gw.init();
+    if let Some(ev) = dump.as_deref_mut() {
+        for o in gw.owners() {
+            ev.push(Event::Gc(format!("gcinit|{}", owner_tag(&o)) + &gw.dump(&o)));
+        }
+    }
+    // Per net (by id), ONE update per worker net of it: a net split into k worker nets is removed
+    // from the check's region query and re-inserted k times, and every re-insert reshapes the
+    // tree — which decides the order a later query finds its rectangles in.
+    owners.sort_by_key(|(id, _)| *id);
+    for (net, owner) in &owners {
+        let (route, taper) = owner_route(q, nets, state, owner);
+        for _ in nets.iter().filter(|n| n.net == *net) {
+            gw.replace_route(owner, &route, &taper);
+            if let Some(ev) = dump.as_deref_mut() {
+                ev.push(Event::Gc(format!("gcupd|{}", owner_tag(owner)) + &gw.dump(owner)));
             }
         }
     }

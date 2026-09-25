@@ -228,9 +228,13 @@ impl Master {
             merged[layer].insert_rect(r);
         }
         let mut blockages = Vec::new();
+        // Per layer, per connected polygon (the reference's `get` order), that polygon's maximal
+        // rectangles — NOT the layer's as one set: the order differs when a layer has two pieces.
         for (layer, set) in merged.iter_mut().enumerate() {
-            for r in set.max_rectangles() {
-                blockages.push((layer, r));
+            for mut poly in set.polygons() {
+                for r in poly.max_rectangles() {
+                    blockages.push((layer, r));
+                }
             }
         }
         Master { terms, blockages }
@@ -441,5 +445,20 @@ mod tests {
         let mut b = m.blockages;
         b.sort();
         assert_eq!(b, vec![(4, Rect::new(0, 0, 100, 300)), (4, Rect::new(0, 0, 300, 100))]);
+    }
+
+    /// Rule: the merged obstructions are taken apart into connected polygons first (by top y,
+    /// then the leftmost x on that top edge) and each polygon's maximal rectangles follow in
+    /// turn — so the lower-topped piece on the right comes BEFORE the taller one on the left (the whole set's
+    /// maximal rectangles would put it last). The
+    /// blockage order is the region query's input order, which decides owner order in the checks.
+    #[test]
+    fn obstruction_blockages_follow_polygon_order() {
+        let t = crate::gc::tests::tech();
+        // Left: an L-shaped piece topped at 900; right: a bar topped at 600, which comes first.
+        let (a, b, bar) = (Rect::new(0, 300, 200, 600), Rect::new(200, 400, 500, 900), Rect::new(600, 400, 900, 600));
+        let m = Master::import(&t, Vec::new(), &[(4, a), (4, b), (4, bar)]);
+        let want = vec![(4, bar), (4, a), (4, b), (4, Rect::new(0, 400, 500, 600))];
+        assert_eq!(m.blockages, want);
     }
 }

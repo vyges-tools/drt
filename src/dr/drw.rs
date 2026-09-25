@@ -141,6 +141,16 @@ pub fn worker_groups(grid: &GCellGrid, size: i32, offset: i32, mt_safe: i32, drc
     groups
 }
 
+/// The workers a batch holds at most.
+pub const BATCH_SIZE: usize = 1024;
+
+/// The workers of one iteration as the batches they run in: each checkerboard group cut, in
+/// creation order, into runs of at most `batch_size`. A batch initialises from the design as the
+/// batches before it (in its group too) left it — all its workers route, then all write back.
+pub fn worker_batches(groups: Vec<Vec<WorkerBoxes>>, batch_size: usize) -> Vec<Vec<WorkerBoxes>> {
+    groups.into_iter().flat_map(|g| g.chunks(batch_size).map(<[WorkerBoxes]>::to_vec).collect::<Vec<_>>()).collect()
+}
+
 /// An access point as a worker reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrAp {
@@ -943,3 +953,22 @@ pub fn localize_ext(tech: &crate::tech::Tech, g: &GridGraph, ext_box: &Rect, net
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wb(i: i32) -> WorkerBoxes {
+        let r = Rect { xl: i, yl: 0, xh: i + 1, yh: 1 };
+        WorkerBoxes { start: (i, 0), route: r, ext: r, drc: r }
+    }
+
+    /// Rule: a checkerboard group larger than the batch size runs as several batches, cut in
+    /// creation order; groups never share a batch.
+    #[test]
+    fn a_group_runs_in_batches_of_at_most_the_batch_size() {
+        let groups = vec![(0..5).map(wb).collect::<Vec<_>>(), vec![wb(9)]];
+        let starts: Vec<Vec<i32>> = worker_batches(groups, 2).iter().map(|b| b.iter().map(|w| w.start.0).collect()).collect();
+        assert_eq!(starts, vec![vec![0, 1], vec![2, 3], vec![4], vec![9]]);
+    }
+}
