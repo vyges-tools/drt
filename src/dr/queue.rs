@@ -28,6 +28,7 @@ use crate::dr::maze::{Idx, MazeCfg, MazeState};
 use crate::dr::route::{after_check, maze_net_end, reroute_net, NetCtx, Search};
 use crate::gc::{Marker, Owner, Rule, Worker};
 use crate::polygon90::Rect;
+use crate::rtree::DynRTree;
 
 /// What a queue entry names: a worker net (to route, or check), or another owner (to check).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -119,19 +120,96 @@ fn touches(a: &Rect, b: &Rect) -> bool {
     a.xh >= b.xl && a.xl <= b.xh && a.yh >= b.yl && a.yl <= b.yh
 }
 
-/// The marker costs added so far (planar, via nodes), which decay after each route.
-#[derive(Debug, Clone, Default)]
+/// The worker's region query of its nets' shapes, which a marker's cost reads: bulk-loaded at the
+/// start from every net (in order) — its route shapes (none when everything is ripped up), then
+/// its committed shapes around the box — then each route's shapes inserted as it writes them and
+/// removed, in the same order, when the net is ripped up. A via has an entry per rectangle of
+/// each of its layers (below, above, cut). An entry names (net, committed?, index).
+/// A region-query entry: (net, committed?, index in its list).
+type RqRef = (usize, bool, usize);
+
+#[derive(Default)]
+struct RouteRq {
+    trees: Vec<DynRTree<RqRef>>,
+    ids: HashMap<usize, Vec<(usize, usize)>>,
+}
+
+impl RouteRq {
+    /// A route shape's entries: a wire's box, a via's rectangles per layer, a patch's box.
+    fn rects(tech: &crate::tech::Tech, f: &DrFig) -> Vec<(usize, Rect)> {
+        let sh = |r: &Rect, o: (i32, i32)| Rect { xl: r.xl + o.0, yl: r.yl + o.1, xh: r.xh + o.0, yh: r.yh + o.1 };
+        match *f {
+            DrFig::Seg { layer, begin, end, width, begin_ext, end_ext, .. } => vec![(layer, DrFig::seg_box(begin, end, width, begin_ext, end_ext))],
+            DrFig::Via { via, origin, .. } => {
+                let vd = &tech.via_defs[via];
+                let mut v: Vec<(usize, Rect)> = vd.layer1_figs.iter().map(|r| (vd.layer1, sh(r, origin))).collect();
+                v.extend(vd.layer2_figs.iter().map(|r| (vd.layer2, sh(r, origin))));
+                v.extend(vd.cut_figs.iter().map(|r| (vd.cut, sh(r, origin))));
+                v
+            }
+            DrFig::Patch { layer, origin, offset } => vec![(layer, sh(&offset, origin))],
+        }
+    }
+
+    /// The bulk load: per net, its route shapes, then its committed ones.
+    fn new(tech: &crate::tech::Tech, state: &[NetState]) -> RouteRq {
+        let mut per: Vec<Vec<(Rect, RqRef)>> = Vec::new();
+        for (ni, s) in state.iter().enumerate() {
+            for (ext, figs) in [(false, &s.figs), (true, &s.ext)] {
+                for (k, f) in figs.iter().enumerate() {
+                    for (l, r) in Self::rects(tech, f) {
+                        while per.len() <= l {
+                            per.push(Vec::new());
+                        }
+                        per[l].push((r, (ni, ext, k)));
+                    }
+                }
+            }
+        }
+        let n = tech.layers.len().max(per.len());
+        per.resize(n, Vec::new());
+        RouteRq { trees: per.into_iter().map(DynRTree::new).collect(), ids: HashMap::new() }
+    }
+
+    fn add_net(&mut self, tech: &crate::tech::Tech, net: usize, figs: &[DrFig]) {
+        for (k, f) in figs.iter().enumerate() {
+            for (l, r) in Self::rects(tech, f) {
+                while self.trees.len() <= l {
+                    self.trees.push(DynRTree::new(Vec::new()));
+                }
+                let id = self.trees[l].insert(r, (net, false, k));
+                self.ids.entry(net).or_default().push((l, id));
+            }
+        }
+    }
+
+    fn remove_net(&mut self, net: usize) {
+        for (l, id) in self.ids.remove(&net).unwrap_or_default() {
+            self.trees[l].remove(id);
+        }
+    }
+
+    /// The route shapes on layer `l` touching `b`, in query order (a via as often as its
+    /// rectangles touch).
+    fn query(&self, l: usize, b: &Rect) -> Vec<RqRef> {
+        self.trees.get(l).map_or(Vec::new(), |t| t.query(b).into_iter().map(|(_, v)| v.1).collect())
+    }
+}
+
+/// The marker costs added so far (planar, via nodes), which decay after each route; and the
+/// worker's region query the queue goes on with.
 pub struct History {
     planar: BTreeSet<Idx>,
     via: BTreeSet<Idx>,
+    rq: RouteRq,
 }
 
 /// Before the queue: the markers standing in the worker's check box cost the grid.
 pub fn initial_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, nets: &[DrNet], markers: &[Marker]) -> History {
-    let mut h = History::default();
     let state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: Vec::new(), ext: n.ext.clone() }).collect();
+    let mut h = History { planar: BTreeSet::new(), via: BTreeSet::new(), rq: RouteRq::new(q.mcfg.tech, &state) };
     for m in markers {
-        add_marker_cost(w, q, nets, &state, m, &mut h.planar, &mut h.via);
+        add_marker_cost(w, q, &state, &h.rq, m, &mut h.planar, &mut h.via);
     }
     h
 }
@@ -152,7 +230,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
     let mut gw = check_init(q, nets, &state, if gc_dump { Some(&mut events) } else { None });
     let mut gc_version = 1i64;
     let mut checked: HashMap<Block, i64> = HashMap::new();
-    let History { planar: mut planar_hist, via: mut via_hist } = hist;
+    let History { planar: mut planar_hist, via: mut via_hist, mut rq } = hist;
     while let Some(e) = queue.pop_front() {
         let mut did_route = false;
         let (markers, checking_obj): (Vec<Marker>, Owner) = match (&e.block, e.do_route) {
@@ -164,7 +242,9 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let cx = (q.net_ctx)(i);
                 let ndr = (q.ndr)(i);
                 let old = std::mem::take(&mut state[i].figs);
+                rq.remove_net(i);
                 let (searches, figs) = reroute_net(w, st, q.mcfg, &nets[i], ndr, &cx, state[i].reroutes, &old);
+                rq.add_net(q.mcfg.tech, i, &figs);
                 maze_net_end(w, st, &nets[i], &cx);
                 gc_version += 1;
                 let reroutes = state[i].reroutes;
@@ -211,7 +291,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
             marker_cost_decay(w, q.marker_decay, &mut planar_hist, &mut via_hist);
         }
         for mk in &markers {
-            add_marker_cost(w, q, nets, &state, mk, &mut planar_hist, &mut via_hist);
+            add_marker_cost(w, q, &state, &rq, mk, &mut planar_hist, &mut via_hist);
         }
     }
     gw.target = None;
@@ -482,33 +562,14 @@ fn add10(v: &mut u8) {
 
 /// A marker's history cost on the route shapes under it (its box on its layer).
 #[allow(clippy::too_many_arguments)]
-fn add_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, _nets: &[DrNet], state: &[NetState], m: &Marker, planar: &mut BTreeSet<Idx>, via: &mut BTreeSet<Idx>) {
-    let tech = q.mcfg.tech;
+fn add_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, m: &Marker, planar: &mut BTreeSet<Idx>, via: &mut BTreeSet<Idx>) {
     let rb = q.route_box;
     let in_rb = |p: (i32, i32)| p.0 >= rb.xl && p.0 <= rb.xh && p.1 >= rb.yl && p.1 <= rb.yh;
     let mut vio_nets: BTreeSet<usize> = BTreeSet::new();
-    // The route shapes on the marker's layer touching its box, net by net.
-    for (ni, s) in state.iter().enumerate() {
-        for f in s.ext.iter().chain(&s.figs) {
-            let on_layer: Vec<Rect> = match f {
-                DrFig::Via { via: v, origin, .. } => {
-                    let vd = &tech.via_defs[*v];
-                    let sh = |r: &Rect| Rect { xl: r.xl + origin.0, yl: r.yl + origin.1, xh: r.xh + origin.0, yh: r.yh + origin.1 };
-                    if m.layer == vd.layer1 {
-                        vd.layer1_figs.iter().map(sh).collect()
-                    } else if m.layer == vd.layer2 {
-                        vd.layer2_figs.iter().map(sh).collect()
-                    } else if m.layer == vd.cut {
-                        vd.cut_figs.iter().map(sh).collect()
-                    } else {
-                        Vec::new()
-                    }
-                }
-                _ => f.metal(tech).into_iter().filter(|(l, _)| *l == m.layer).map(|(_, b)| b).collect(),
-            };
-            if !on_layer.iter().any(|b| touches(b, &m.bbox)) {
-                continue;
-            }
+    // The route shapes on the marker's layer touching its box, in the region query's order.
+    for (ni, ext, k) in rq.query(m.layer, &m.bbox) {
+        let f = if ext { &state[ni].ext[k] } else { &state[ni].figs[k] };
+        {
             match *f {
                 DrFig::Seg { begin, end, width, bi, ei, .. } => {
                     if !(in_rb(begin) && in_rb(end)) {

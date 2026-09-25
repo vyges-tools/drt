@@ -7,7 +7,7 @@
 //!   best shapes added; a wire crossing the route box keeps its parts outside (the crossing end
 //!   now extends), and the points where it crossed are BOUNDARY POINTS; a wire along the route
 //!   box's own side (x on its left or right for a vertical wire, y on its bottom or top for a
-//!   horizontal one) is kept whole; a via or patch is removed when its origin lies STRICTLY inside
+//!   horizontal one) is kept whole in the first iteration (cut like the others afterwards); a via or patch is removed when its origin lies STRICTLY inside
 //!   the route box in the first iteration (on its edge it stays, as the worker counted it ext),
 //!   inside or on it afterwards;
 //! - at each boundary point not on a pin of the net (or off the manufacturing grid), exactly two
@@ -211,7 +211,7 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
             continue;
         }
         match s.fig {
-            DrFig::Seg { .. } => remove_seg(d, tech, k, &wb.route_box, bound.entry(s.net).or_default()),
+            DrFig::Seg { .. } => remove_seg(d, tech, k, &wb.route_box, wb.init_dr, bound.entry(s.net).or_default()),
             DrFig::Via { origin, .. } | DrFig::Patch { origin, .. } => {
                 if is_route_origin(&wb.route_box, origin, wb.init_dr) {
                     d.remove(k);
@@ -244,12 +244,13 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
 /// A committed wire of a net the worker rerouted: kept whole along the route box's sides; else
 /// the parts outside the route box kept (the crossing end now extending), the crossing points
 /// recorded.
-fn remove_seg(d: &mut DesignRoutes, tech: &Tech, k: usize, rb: &Rect, bound: &mut BTreeSet<(P, usize)>) {
+fn remove_seg(d: &mut DesignRoutes, tech: &Tech, k: usize, rb: &Rect, init_dr: bool, bound: &mut BTreeSet<(P, usize)>) {
     let Some(Shape { net, fig }) = d.shapes[k].clone() else { return };
     let DrFig::Seg { layer, begin, end, .. } = fig else { return };
     let vertical = begin.0 == end.0;
-    // Along the box's own sides: kept (the first iteration merges on those boundaries).
-    if vertical && (begin.0 == rb.xl || begin.0 == rb.xh) || !vertical && (begin.1 == rb.yl || begin.1 == rb.yh) {
+    // Along the box's own sides: kept in the first iteration (it merges on those boundaries);
+    // afterwards cut like any other.
+    if init_dr && (vertical && (begin.0 == rb.xl || begin.0 == rb.xh) || !vertical && (begin.1 == rb.yl || begin.1 == rb.yh)) {
         return;
     }
     let (along, cross, lo, hi, blo, bhi) = if vertical { (begin.0, 0, begin.1, end.1, rb.yl, rb.yh) } else { (begin.1, 1, begin.0, end.0, rb.xl, rb.xh) };
@@ -372,6 +373,27 @@ fn merge_at(d: &mut DesignRoutes, tech: &Tech, net: usize, pt: P, layer: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tech0() -> Tech {
+        crate::gc::tests::tech()
+    }
+
+    /// Rule: a committed wire of a rerouted net lying ALONG a side of the route box stays whole in
+    /// the first iteration; afterwards it is removed (its parts outside the box kept).
+    #[test]
+    fn a_wire_along_the_box_side_goes_only_after_the_first_iteration() {
+        let t = tech0();
+        let rb = Rect { xl: 0, yl: 0, xh: 1000, yh: 1000 };
+        let seg = DrFig::Seg { layer: 4, begin: (100, 1000), end: (400, 1000), width: 140, begin_ext: 70, end_ext: 70, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false };
+        let big = Rect { xl: -500, yl: -500, xh: 1500, yh: 1500 };
+        for (init_dr, kept) in [(true, true), (false, false)] {
+            let mut d = DesignRoutes::default();
+            d.add(&t, 0, seg.clone());
+            let on_pin = |_: P, _: usize, _: usize| false;
+            end(&mut d, &t, &WriteBack { route_box: rb, ext_box: big, drc_box: big, routed: &[(0, Vec::new())], markers: &[], on_pin: &on_pin, manufacturing_grid: 5, init_dr });
+            assert_eq!(d.shapes.iter().flatten().count() == 1, kept, "init_dr {init_dr}");
+        }
+    }
 
     /// Rule: in the first iteration a via whose origin lies ON the route box's edge is not the
     /// worker's (it read it as ext), so its write-back keeps it; from the second iteration on the

@@ -318,6 +318,292 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
     out
 }
 
+/// A committed shape against the route box after the first iteration: a wire across the box's
+/// line (the orthogonal coordinate inside or ON the box) is cut at its sides — the part below
+/// the box, a route part when it reaches the box (its end extending unless it ends exactly
+/// there), else ext; the part inside (ends extending where the wire went on); the part above,
+/// likewise — and one beside the box is ext; a via or patch is a route part when its origin is
+/// inside or on the box.
+fn split_obj_search_repair(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate::dr::cost::DrFig>, Vec<crate::dr::cost::DrFig>) {
+    use crate::dr::cost::DrFig;
+    let (mut route, mut ext) = (Vec::new(), Vec::new());
+    match *f {
+        DrFig::Seg { begin, end, .. } => {
+            let vertical = begin.0 == end.0;
+            let (c, clo, chi) = if vertical { (begin.0, rb.xl, rb.xh) } else { (begin.1, rb.yl, rb.yh) };
+            if c < clo || chi < c {
+                ext.push(f.clone());
+                return (route, ext);
+            }
+            let (bc, ec, bmin, bmax) = if vertical { (begin.1, end.1, rb.yl, rb.yh) } else { (begin.0, end.0, rb.xl, rb.xh) };
+            // A piece from lo to hi; `ext_begin` / `ext_end`: that end now extends (its extension
+            // kept).
+            let part = |lo: i32, hi: i32, ext_begin: bool, ext_end: bool| -> DrFig {
+                let mut g = f.clone();
+                if let DrFig::Seg { begin: b, end: e, begin_trunc, end_trunc, .. } = &mut g {
+                    *b = if vertical { (c, lo) } else { (lo, c) };
+                    *e = if vertical { (c, hi) } else { (hi, c) };
+                    if ext_begin {
+                        *begin_trunc = false;
+                    }
+                    if ext_end {
+                        *end_trunc = false;
+                    }
+                }
+                g
+            };
+            if bc < bmin {
+                let ne = ec.min(bmin);
+                if ec < bmin {
+                    ext.push(part(bc, ne, false, false));
+                } else {
+                    route.push(part(bc, ne, false, ec != bmin));
+                }
+            }
+            if bc < bmax && ec > bmin {
+                route.push(part(bc.max(bmin), ec.min(bmax), bc < bmin, ec > bmax));
+            }
+            if ec > bmax {
+                let nb = bc.max(bmax);
+                if bc > bmax {
+                    ext.push(part(nb, ec, false, false));
+                } else {
+                    route.push(part(nb, ec, bc != bmax, false));
+                }
+            }
+        }
+        DrFig::Via { origin, .. } | DrFig::Patch { origin, .. } => {
+            if in_box(rb, origin) {
+                route.push(f.clone());
+            } else {
+                ext.push(f.clone());
+            }
+        }
+    }
+    (route, ext)
+}
+
+/// A worker's nets after the first iteration (ripping everything up), from the committed shapes
+/// in the extended box (region-query order): per net (by index), its route parts' connected
+/// components — wire ends, via layers, patch origins, T-crossings, and the terms a truncated
+/// wire end or pin-connected via layer INSIDE the route box lands on (terms by kind, then order)
+/// — each becoming a worker net: its terms, and as ext shapes the net's ext parts (all on the
+/// first component) plus its route wires not wholly inside the route box; its boundary points
+/// where an ext wire leaves the route box from a side; route parts dropped.
+pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect) -> Vec<DrNet> {
+    use crate::dr::cost::DrFig;
+    let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
+    let mut nets: BTreeSet<usize> = BTreeSet::new();
+    let mut net_route: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
+    let mut net_ext: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
+    let Some((tech, d)) = inp.routes else { return Vec::new() };
+    for k in d.query(tech, ext_box) {
+        let sh = d.shapes[k].as_ref().expect("a shape");
+        nets.insert(sh.net);
+        let (r, e) = split_obj_search_repair(route_box, &sh.fig);
+        net_route.entry(sh.net).or_default().extend(r);
+        net_ext.entry(sh.net).or_default().extend(e);
+    }
+    let mut out: Vec<DrNet> = Vec::new();
+    let mut pin_cnt = 0usize;
+    for &net in &nets {
+        let objs = net_route.remove(&net).unwrap_or_default();
+        // The terms at the route parts' pin-facing ends inside the route box.
+        let mut pin2ep: BTreeMap<TermKey, BTreeSet<(P, usize)>> = BTreeMap::new();
+        let mut helper = |pt: P, l: usize| {
+            if let Some(term_at) = inp.term_at {
+                for t in term_at(pt, l, net) {
+                    pin2ep.entry((term_key(t), t)).or_default().insert((pt, l));
+                }
+            }
+        };
+        for f in &objs {
+            match *f {
+                DrFig::Seg { layer, begin, end, begin_trunc, end_trunc, .. } => {
+                    if in_box(route_box, begin) && begin_trunc {
+                        helper(begin, layer);
+                    }
+                    if in_box(route_box, end) && end_trunc {
+                        helper(end, layer);
+                    }
+                }
+                DrFig::Via { via, origin, bottom_connected, top_connected, .. } => {
+                    if in_box(route_box, origin) {
+                        let vd = &tech.via_defs[via];
+                        if bottom_connected {
+                            helper(origin, vd.layer1);
+                        }
+                        if top_connected {
+                            helper(origin, vd.layer2);
+                        }
+                    }
+                }
+                DrFig::Patch { .. } => {}
+            }
+        }
+        let comp = search_repair_components(tech, &objs, &pin2ep);
+        let subnets = comp.iter().copied().max().map_or(1, |m| m + 1);
+        let mut v_ext: Vec<Vec<DrFig>> = vec![Vec::new(); subnets];
+        let mut v_pins: Vec<Vec<usize>> = vec![Vec::new(); subnets];
+        v_ext[0] = net_ext.remove(&net).unwrap_or_default();
+        let terms: Vec<usize> = pin2ep.keys().map(|&(_, t)| t).collect();
+        for (i, &c) in comp.iter().enumerate() {
+            if i < objs.len() {
+                if let DrFig::Seg { begin, end, .. } = objs[i] {
+                    if !(in_box(route_box, begin) && in_box(route_box, end)) {
+                        v_ext[c].push(objs[i].clone());
+                    }
+                }
+            } else {
+                v_pins[c].push(terms[i - objs.len()]);
+            }
+        }
+        for (ext, pins) in v_ext.into_iter().zip(v_pins) {
+            let id = out.len();
+            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext };
+            init_net_term(inp, route_box, &mut dnet, &pins, &mut pin_cnt);
+            for (pt, l) in ext_boundary_points(route_box, &dnet.ext) {
+                dnet.pins.push(DrPin { term: None, id: pin_cnt, patterns: vec![DrAccessPattern { point: pt, layer: l, begin_area: 0, pin_cost: 0, ap: None }] });
+                pin_cnt += 1;
+            }
+            out.push(dnet);
+        }
+    }
+    init_nets_num_pins_in(&mut out, ext_box);
+    init_nets_boundary_area(tech, route_box, &mut out);
+    out
+}
+
+/// The route parts' connected components (the terms numbered after them): nodes at every wire
+/// end, via layer and patch origin, a wire end or via layer on another wire's interior (the
+/// first wire of its track ending at or after it), and each term at its points; components by a
+/// best-first flood from the lowest unreached index, (cost, index) smallest first.
+fn search_repair_components(tech: &crate::tech::Tech, objs: &[crate::dr::cost::DrFig], pin2ep: &BTreeMap<TermKey, BTreeSet<(P, usize)>>) -> Vec<usize> {
+    use crate::dr::cost::DrFig;
+    let mut node_map: BTreeMap<(P, usize), BTreeSet<usize>> = BTreeMap::new();
+    for (i, f) in objs.iter().enumerate() {
+        match *f {
+            DrFig::Seg { layer, begin, end, .. } => {
+                node_map.entry((begin, layer)).or_default().insert(i);
+                node_map.entry((end, layer)).or_default().insert(i);
+            }
+            DrFig::Via { via, origin, .. } => {
+                let vd = &tech.via_defs[via];
+                node_map.entry((origin, vd.layer1)).or_default().insert(i);
+                node_map.entry((origin, vd.layer2)).or_default().insert(i);
+            }
+            DrFig::Patch { layer, origin, .. } => {
+                node_map.entry((origin, layer)).or_default().insert(i);
+            }
+        }
+    }
+    // Layer → track → end coordinate → (begin coordinate, object).
+    type Helper = BTreeMap<(usize, i32), BTreeMap<i32, (i32, usize)>>;
+    let (mut horz, mut vert): (Helper, Helper) = (BTreeMap::new(), BTreeMap::new());
+    for (i, f) in objs.iter().enumerate() {
+        if let DrFig::Seg { layer, begin, end, .. } = *f {
+            if begin.0 == end.0 {
+                vert.entry((layer, begin.0)).or_default().insert(end.1, (begin.1, i));
+            } else {
+                horz.entry((layer, begin.1)).or_default().insert(end.0, (begin.0, i));
+            }
+        }
+    }
+    let cross = |cross_pt: P, track: i32, split: i32, l: usize, h: &Helper, node_map: &mut BTreeMap<(P, usize), BTreeSet<usize>>| {
+        let Some(mp) = h.get(&(l, track)) else { return };
+        let Some((&end, &(begin, idx))) = mp.range(split..).next() else { return };
+        if end > split && begin < split {
+            node_map.entry((cross_pt, l)).or_default().insert(idx);
+        }
+    };
+    for f in objs {
+        match *f {
+            DrFig::Seg { layer, begin, end, .. } => {
+                if begin.0 == end.0 {
+                    cross(begin, begin.1, begin.0, layer, &horz, &mut node_map);
+                    cross(end, end.1, end.0, layer, &horz, &mut node_map);
+                } else {
+                    cross(begin, begin.0, begin.1, layer, &vert, &mut node_map);
+                    cross(end, end.0, end.1, layer, &vert, &mut node_map);
+                }
+            }
+            DrFig::Via { via, origin, .. } => {
+                let vd = &tech.via_defs[via];
+                for l in [vd.layer1, vd.layer2] {
+                    cross(origin, origin.1, origin.0, l, &horz, &mut node_map);
+                    cross(origin, origin.0, origin.1, l, &vert, &mut node_map);
+                }
+            }
+            DrFig::Patch { .. } => {}
+        }
+    }
+    for (k, locs) in pin2ep.values().enumerate() {
+        for &pr in locs {
+            node_map.entry(pr).or_default().insert(objs.len() + k);
+        }
+    }
+    let n = objs.len() + pin2ep.len();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for idxs in node_map.values() {
+        let v: Vec<usize> = idxs.iter().copied().collect();
+        for a in 0..v.len() {
+            for &b in &v[a + 1..] {
+                adj[v[a]].push(b);
+                adj[b].push(v[a]);
+            }
+        }
+    }
+    let mut comp = vec![0usize; n];
+    let mut visited = vec![false; n];
+    let mut cur = 0usize;
+    while let Some(src) = visited.iter().position(|&v| !v) {
+        let mut pq: std::collections::BinaryHeap<std::cmp::Reverse<(u32, usize)>> = std::collections::BinaryHeap::new();
+        pq.push(std::cmp::Reverse((0, src)));
+        while let Some(std::cmp::Reverse((cost, i))) = pq.pop() {
+            if visited[i] {
+                continue;
+            }
+            visited[i] = true;
+            comp[i] = cur;
+            for &nb in &adj[i] {
+                if !visited[nb] {
+                    pq.push(std::cmp::Reverse((cost + 1, nb)));
+                }
+            }
+        }
+        cur += 1;
+    }
+    comp
+}
+
+/// Where a worker net's ext wires leave the route box from a side: a vertical wire within the
+/// box's x span starting on its top edge going up, or ending on its bottom edge coming from
+/// below; a horizontal one likewise on the right and left edges. Ordered by point, then layer.
+fn ext_boundary_points(rb: &Rect, ext: &[crate::dr::cost::DrFig]) -> BTreeSet<(P, usize)> {
+    use crate::dr::cost::DrFig;
+    let mut out = BTreeSet::new();
+    for f in ext {
+        if let DrFig::Seg { layer, begin, end, .. } = *f {
+            if begin.0 == end.0 && begin.0 >= rb.xl && end.0 <= rb.xh {
+                if begin.1 == rb.yh && end.1 > rb.yh {
+                    out.insert((begin, layer));
+                }
+                if end.1 == rb.yl && begin.1 < rb.yl {
+                    out.insert((end, layer));
+                }
+            } else if begin.1 == end.1 && begin.1 >= rb.yl && end.1 <= rb.yh {
+                if begin.0 == rb.xh && end.0 > rb.xh {
+                    out.insert((begin, layer));
+                }
+                if end.0 == rb.xl && begin.0 < rb.xl {
+                    out.insert((end, layer));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Each boundary point's access area: the net's committed wires that start (or end) there and
 /// leave the route box, length × width; plus half the box of a via of the net (a patch's whole
 /// box) found AT THE POINT whose origin is the wire's far end (⛔ the reference searches the
