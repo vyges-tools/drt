@@ -980,7 +980,8 @@ pub fn grid_maps(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern],
     }
     for net in nets {
         // The net's committed shapes: a wire's ends and line, each via's point on its layers.
-        for f in &net.ext {
+        // Its committed shapes: ext, then route.
+        for f in net.ext.iter().chain(&net.route) {
             match *f {
                 crate::dr::cost::DrFig::Seg { layer: l, begin, end, .. } => {
                     let l2 = non_pref_layer(tech, cfg, l).unwrap_or(l);

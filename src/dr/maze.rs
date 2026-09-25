@@ -188,6 +188,12 @@ impl MazeState {
             .collect();
         MazeState { src: vec![false; n], dst: vec![false; n], prev_dir: vec![0; n], guide: vec![false; n], z_heights, die }
     }
+
+    /// Not following guides: every node counts as inside a guide (the per-net guide marking
+    /// then does nothing).
+    pub fn all_guided(&mut self) {
+        self.guide.iter_mut().for_each(|g| *g = true);
+    }
     pub fn reset_status(&mut self) {
         self.src.iter_mut().for_each(|v| *v = false);
         self.dst.iter_mut().for_each(|v| *v = false);
