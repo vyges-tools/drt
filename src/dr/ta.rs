@@ -1475,10 +1475,11 @@ mod tests {
     fn tech() -> Tech {
         let table = SpacingTable { widths: vec![0], prls: vec![0, 200], values: vec![vec![100, 150]] };
         let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone()), ..Default::default() };
-        let mut t = Tech::default();
-        t.layers = vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing: Some(100), ..Default::default() }, routing(Dir::Vertical)];
-        t.via_defs = vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-150, -50, 150, 50)], cut_figs: vec![r(-50, -50, 50, 50)], layer2_figs: vec![r(-50, -150, 50, 150)] }];
-        t
+        Tech {
+            layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing: Some(100), ..Default::default() }, routing(Dir::Vertical)],
+            via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-150, -50, 150, 50)], cut_figs: vec![r(-50, -50, 50, 50)], layer2_figs: vec![r(-50, -150, 50, 150)] }],
+            ..Default::default()
+        }
     }
 
     struct Fixture {
