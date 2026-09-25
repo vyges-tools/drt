@@ -206,7 +206,7 @@ pub struct History {
 
 /// Before the queue: the markers standing in the worker's check box cost the grid.
 pub fn initial_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, nets: &[DrNet], markers: &[Marker]) -> History {
-    let state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: Vec::new(), ext: n.ext.clone() }).collect();
+    let state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: n.route.clone(), ext: n.ext.clone() }).collect();
     let mut h = History { planar: BTreeSet::new(), via: BTreeSet::new(), rq: RouteRq::new(q.mcfg.tech, &state) };
     for m in markers {
         add_marker_cost(w, q, &state, &h.rq, m, &mut h.planar, &mut h.via);
@@ -214,10 +214,26 @@ pub fn initial_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, nets: &
     h
 }
 
-/// Run the first iteration's queue on a worker: `order` the routing order.
-pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<'_>, nets: &[DrNet], order: &[usize], hist: History) -> Vec<Event> {
+/// How a worker's queue starts: every net in a routing order (everything ripped up), or the
+/// worker's markers (their victims and aggressors, as a check's markers requeue them).
+pub enum Start<'a> {
+    Nets(&'a [usize]),
+    Markers(&'a [Marker]),
+}
+
+/// A worker whose check box holds a re-check marker: a check over everything it holds, before
+/// the queue — its markers replace the worker's.
+pub fn recheck_markers(q: &QueueCtx<'_>, nets: &[DrNet]) -> Vec<Marker> {
+    let state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: n.route.clone(), ext: n.ext.clone() }).collect();
+    let mut gw = check_init(q, nets, &state, None);
+    gw.target = None;
+    gw.run().to_vec()
+}
+
+/// Run a worker's queue.
+pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<'_>, nets: &[DrNet], start: Start<'_>, hist: History) -> Vec<Event> {
     let mut events = Vec::new();
-    let mut state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: Vec::new(), ext: n.ext.clone() }).collect();
+    let mut state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: n.route.clone(), ext: n.ext.clone() }).collect();
     let by_name: HashMap<String, Vec<usize>> = {
         let mut m: HashMap<String, Vec<usize>> = HashMap::new();
         for i in 0..nets.len() {
@@ -225,7 +241,16 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
         }
         m
     };
-    let mut queue: VecDeque<Entry> = order.iter().map(|&i| Entry { block: Block::Net(i), num_reroute: 0, do_route: true, checking: None }).collect();
+    let mut queue: VecDeque<Entry> = VecDeque::new();
+    match start {
+        Start::Nets(order) => queue.extend(order.iter().map(|&i| Entry { block: Block::Net(i), num_reroute: 0, do_route: true, checking: None })),
+        Start::Markers(markers) => {
+            update_queue(q, nets, &mut state, &by_name, markers, &mut queue, None);
+            for e in &queue {
+                events.push(Event::Push { block: e.block.clone(), num_reroute: e.num_reroute, do_route: e.do_route, checking: e.checking.clone() });
+            }
+        }
+    }
     let gc_dump = std::env::var("VYGD_GC").is_ok();
     let mut gw = check_init(q, nets, &state, if gc_dump { Some(&mut events) } else { None });
     let mut gc_version = 1i64;

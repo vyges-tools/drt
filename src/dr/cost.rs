@@ -856,7 +856,7 @@ fn init_maze_cost_conn_fig<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_b
         // Its committed shapes around the route box: route cost (cut spacing, no end of line).
         let mut metal: Vec<(usize, Rect)> = Vec::new();
         for n in nets.iter().filter(|n| n.net == owner) {
-            for f in &n.ext {
+            for f in n.ext.iter().chain(&n.route) {
                 w.mod_path_cost(f, ModCost::AddRoute, false, true, ndr_of(n));
                 metal.extend(f.metal(tech));
             }
@@ -1295,7 +1295,7 @@ mod tests {
         // A boundary point (no access record): every direction open, even one blocked before.
         let edge = DrAccessPattern { point: (500, 500), layer: 2, begin_area: 0, pin_cost: 0, ap: None };
         g.set_blocked(5, 5, 0, Dir6::E, true);
-        let net = DrNet { id: 0, net: 0, pins: vec![DrPin { term: None, id: 0, patterns: vec![pat] }, DrPin { term: None, id: 1, patterns: vec![edge] }], num_pins_in: 2, pin_box: Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, ext: Vec::new() };
+        let net = DrNet { id: 0, net: 0, pins: vec![DrPin { term: None, id: 0, patterns: vec![pat] }, DrPin { term: None, id: 1, patterns: vec![edge] }], num_pins_in: 2, pin_box: Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, ext: Vec::new(), route: Vec::new() };
         let svia = with(&t, &mut g, |w| {
             init_maze_cost_ap(w, std::slice::from_ref(&net));
             w.ap_svia.clone()

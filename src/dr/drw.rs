@@ -204,6 +204,9 @@ pub struct DrNet {
     pub pin_box: Rect,
     /// Committed shapes of the net around the route box (kept as they are while it reroutes).
     pub ext: Vec<crate::dr::cost::DrFig>,
+    /// Its committed shapes inside the route box it starts from (none when everything is ripped
+    /// up); ripped up when the net reroutes.
+    pub route: Vec<crate::dr::cost::DrFig>,
 }
 
 /// What a worker reads of the design to build its nets.
@@ -301,7 +304,7 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
         let ext = net_ext.remove(&net).unwrap_or_default();
         for (part_terms, part_bounds, part_ext) in init_nets_init_dr_helper(inp, &terms, &g, &bounds, ext) {
             let id = out.len();
-            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext: part_ext };
+            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext: part_ext, route: Vec::new() };
             init_net_term(inp, route_box, &mut dnet, &part_terms, &mut pin_cnt)?;
             // Boundary points, ordered (a map by point then layer), area 0 in the first iteration.
             let set: BTreeSet<(P, usize)> = part_bounds.into_iter().collect();
@@ -392,7 +395,8 @@ fn split_obj_search_repair(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate:
 /// first component) plus its route wires not wholly inside the route box; its boundary points
 /// where an ext wire leaves the route box from a side; route parts dropped.
 /// Errors as [`init_net_term`].
-pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect) -> Result<Vec<DrNet>, String> {
+/// `keep_routes`: the route parts stay on their worker nets (not everything is ripped up).
+pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect, keep_routes: bool) -> Result<Vec<DrNet>, String> {
     use crate::dr::cost::DrFig;
     let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
     let mut nets: BTreeSet<usize> = BTreeSet::new();
@@ -446,23 +450,24 @@ pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: 
         let comp = search_repair_components(tech, &objs, &pin2ep);
         let subnets = comp.iter().copied().max().map_or(1, |m| m + 1);
         let mut v_ext: Vec<Vec<DrFig>> = vec![Vec::new(); subnets];
+        let mut v_route: Vec<Vec<DrFig>> = vec![Vec::new(); subnets];
         let mut v_pins: Vec<Vec<usize>> = vec![Vec::new(); subnets];
         v_ext[0] = net_ext.remove(&net).unwrap_or_default();
         let terms: Vec<usize> = pin2ep.keys().map(|&(_, t)| t).collect();
         for (i, &c) in comp.iter().enumerate() {
             if i < objs.len() {
-                if let DrFig::Seg { begin, end, .. } = objs[i] {
-                    if !(in_box(route_box, begin) && in_box(route_box, end)) {
-                        v_ext[c].push(objs[i].clone());
-                    }
+                match objs[i] {
+                    DrFig::Seg { begin, end, .. } if !(in_box(route_box, begin) && in_box(route_box, end)) => v_ext[c].push(objs[i].clone()),
+                    _ => v_route[c].push(objs[i].clone()),
                 }
             } else {
                 v_pins[c].push(terms[i - objs.len()]);
             }
         }
-        for (ext, pins) in v_ext.into_iter().zip(v_pins) {
+        for ((ext, route), pins) in v_ext.into_iter().zip(v_route).zip(v_pins) {
             let id = out.len();
-            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext };
+            let route = if keep_routes { route } else { Vec::new() };
+            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext, route };
             init_net_term(inp, route_box, &mut dnet, &pins, &mut pin_cnt)?;
             for (pt, l) in ext_boundary_points(route_box, &dnet.ext) {
                 dnet.pins.push(DrPin { term: None, id: pin_cnt, patterns: vec![DrAccessPattern { point: pt, layer: l, begin_area: 0, pin_cost: 0, ap: None }] });

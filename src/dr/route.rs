@@ -285,7 +285,7 @@ pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCf
     let tech = w.cx.tech;
     let metal: Vec<(usize, Rect)> = net.ext.iter().chain(old).flat_map(|f| f.metal(tech)).collect();
     crate::dr::cost::mod_eol_costs_poly_with(w, net.net, cx.ext_box, &metal, ModCost::SubRoute);
-    if reroutes == 0 {
+    if reroutes == 0 && mcfg.ripup_all {
         init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
     }
     maze_net_init(w, st, net, cx);

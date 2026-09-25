@@ -153,6 +153,9 @@ pub struct MazeCfg<'a> {
     pub marker_cost: u32,
     pub fixed_cost: u32,
     pub iter: i32,
+    /// Everything ripped up at the start (the first reroute of a net gives back its via
+    /// reservation).
+    pub ripup_all: bool,
 }
 
 const GRID_COST: u32 = 2;
