@@ -357,6 +357,392 @@ pub fn nth_element<E>(v: &mut [E], nth: usize, less: impl Fn(&E, &E) -> bool) {
     }
 }
 
+
+/// A packed R-tree that is then UPDATED: values inserted and removed one at a time, exactly as
+/// the reference's tree does it, so its query order stays the reference's.
+///
+/// Derived from Boost.Geometry's R-tree visitors (`index/detail/rtree/visitors/insert.hpp`,
+/// `remove.hpp`) and its quadratic split (`quadratic/redistribute_elements.hpp`; Boost Software
+/// License 1.0):
+///
+/// - insert: from the root, into the child whose box grows least in area (then the smaller
+///   area; the first on a tie), that child's box grown on the way down; a node over 16 entries
+///   splits — the two seeds are the pair wasting the most area together (the first such pair),
+///   then entries are taken from the BACK, each the one whose area increase differs most
+///   between the groups (the last scanned on a tie, scanning back to front), to the group it
+///   grows less (then the smaller group box, then the group with fewer entries), a group that
+///   needs every remaining entry to reach 4 taking them; the node keeps the first group, a new
+///   node takes the second — appended to the parent (a new root above a split root);
+/// - remove: down every child whose box covers the value's box, the first match removed by
+///   moving the node's LAST entry into its place; a node left under 4 entries is taken out of
+///   its parent the same way and its entries reinserted after the removal, highest level first,
+///   at their own level; every box on the path shrinks to its entries; a root left with one
+///   child is replaced by it.
+pub struct DynRTree<T> {
+    values: Vec<(Rect, T)>,
+    alive: Vec<bool>,
+    nodes: Vec<Node>,
+    root: Option<usize>,
+    /// The level of the leaves (the root is level 0).
+    leafs_level: usize,
+}
+
+/// An entry being inserted: a value, or a subtree (reinserted after a removal).
+#[derive(Clone, Copy)]
+enum Elem {
+    Value(usize),
+    Child(Rect, usize),
+}
+
+fn area(r: &Rect) -> i64 {
+    i64::from(r.xh - r.xl) * i64::from(r.yh - r.yl)
+}
+
+fn covered(a: &Rect, b: &Rect) -> bool {
+    b.xl <= a.xl && a.xh <= b.xh && b.yl <= a.yl && a.yh <= b.yh
+}
+
+impl<T> DynRTree<T> {
+    /// Bulk-loaded as [`PackedRTree::new`].
+    pub fn new(values: Vec<(Rect, T)>) -> DynRTree<T> {
+        let p = PackedRTree::new(values);
+        let mut depth = 0;
+        if let Some(mut n) = p.root {
+            while let Node::Internal(ch) = &p.nodes[n] {
+                n = ch[0].1;
+                depth += 1;
+            }
+        }
+        let alive = vec![true; p.values.len()];
+        DynRTree { values: p.values, alive, nodes: p.nodes, root: p.root, leafs_level: depth }
+    }
+
+    pub fn value(&self, id: usize) -> &(Rect, T) {
+        &self.values[id]
+    }
+
+    /// Insert a value; its id.
+    pub fn insert(&mut self, r: Rect, v: T) -> usize {
+        self.values.push((r, v));
+        self.alive.push(true);
+        let id = self.values.len() - 1;
+        if self.root.is_none() {
+            self.nodes.push(Node::Leaf(Vec::new()));
+            self.root = Some(self.nodes.len() - 1);
+            self.leafs_level = 0;
+        }
+        self.insert_elem(Elem::Value(id), 0);
+        id
+    }
+
+    fn elem_box(&self, e: &Elem) -> Rect {
+        match *e {
+            Elem::Value(i) => self.values[i].0,
+            Elem::Child(b, _) => b,
+        }
+    }
+
+    fn insert_elem(&mut self, e: Elem, relative_level: usize) {
+        let level = self.leafs_level - relative_level;
+        let bounds = self.elem_box(&e);
+        let root = self.root.expect("a root");
+        let mut path: Vec<(usize, usize)> = Vec::new();
+        self.insert_visit(root, 0, level, e, &bounds, &mut path);
+    }
+
+    fn insert_visit(&mut self, node: usize, current_level: usize, level: usize, e: Elem, bounds: &Rect, path: &mut Vec<(usize, usize)>) {
+        let internal = matches!(self.nodes[node], Node::Internal(_));
+        if internal {
+            let descend = match e {
+                Elem::Value(_) => true,
+                Elem::Child(..) => current_level < level,
+            };
+            if descend {
+                let idx = {
+                    let Node::Internal(ch) = &self.nodes[node] else { unreachable!() };
+                    let (mut best, mut best_diff, mut best_area) = (0usize, i64::MAX, i64::MAX);
+                    for (i, (b, _)) in ch.iter().enumerate() {
+                        let exp = expand(Some(*b), bounds);
+                        let (a, d) = (area(&exp), area(&exp) - area(b));
+                        if d < best_diff || (d == best_diff && a < best_area) {
+                            best_diff = d;
+                            best_area = a;
+                            best = i;
+                        }
+                    }
+                    best
+                };
+                let child = {
+                    let Node::Internal(ch) = &mut self.nodes[node] else { unreachable!() };
+                    ch[idx].0 = expand(Some(ch[idx].0), bounds);
+                    ch[idx].1
+                };
+                path.push((node, idx));
+                self.insert_visit(child, current_level + 1, level, e, bounds, path);
+                path.pop();
+            } else {
+                let Elem::Child(b, c) = e else { unreachable!() };
+                let Node::Internal(ch) = &mut self.nodes[node] else { unreachable!() };
+                ch.push((b, c));
+            }
+        } else {
+            let Elem::Value(i) = e else { unreachable!("a subtree reaches a leaf") };
+            let Node::Leaf(ids) = &mut self.nodes[node] else { unreachable!() };
+            ids.push(i);
+        }
+        self.post_traverse(node, path);
+    }
+
+    fn node_len(&self, node: usize) -> usize {
+        match &self.nodes[node] {
+            Node::Internal(c) => c.len(),
+            Node::Leaf(v) => v.len(),
+        }
+    }
+
+    fn post_traverse(&mut self, node: usize, path: &[(usize, usize)]) {
+        if self.node_len(node) <= MAX {
+            return;
+        }
+        let (b1, b2, n2) = self.split(node);
+        if let Some(&(parent, idx)) = path.last() {
+            let Node::Internal(ch) = &mut self.nodes[parent] else { unreachable!() };
+            ch[idx].0 = b1;
+            ch.push((b2, n2));
+        } else {
+            let root = self.root.expect("a root");
+            self.nodes.push(Node::Internal(vec![(b1, root), (b2, n2)]));
+            self.root = Some(self.nodes.len() - 1);
+            self.leafs_level += 1;
+        }
+    }
+
+    /// The quadratic split of an overfull node: its boxes after, and the new node.
+    fn split(&mut self, node: usize) -> (Rect, Rect, usize) {
+        let leaf = matches!(self.nodes[node], Node::Leaf(_));
+        let elems: Vec<(Rect, usize)> = match &self.nodes[node] {
+            Node::Internal(c) => c.clone(),
+            Node::Leaf(v) => v.iter().map(|&i| (self.values[i].0, i)).collect(),
+        };
+        let (g1, g2, b1, b2) = quadratic_split(elems);
+        let n2 = if leaf { Node::Leaf(g2.iter().map(|e| e.1).collect()) } else { Node::Internal(g2) };
+        self.nodes[node] = if leaf { Node::Leaf(g1.iter().map(|e| e.1).collect()) } else { Node::Internal(g1) };
+        self.nodes.push(n2);
+        (b1, b2, self.nodes.len() - 1)
+    }
+
+    /// Remove the value `id`; whether it was found.
+    pub fn remove(&mut self, id: usize) -> bool {
+        if !self.alive[id] {
+            return false;
+        }
+        let Some(root) = self.root else { return false };
+        let vbox = self.values[id].0;
+        let mut st = RemoveState { removed: false, underflow: false, underflowed: Vec::new() };
+        self.remove_visit(root, 0, None, id, &vbox, &mut st);
+        if st.removed {
+            self.alive[id] = false;
+        }
+        st.removed
+    }
+
+    fn remove_visit(&mut self, node: usize, current_level: usize, parent: Option<(usize, usize)>, id: usize, vbox: &Rect, st: &mut RemoveState) {
+        match &self.nodes[node] {
+            Node::Internal(_) => {
+                let mut idx = 0;
+                loop {
+                    let n = self.node_len(node);
+                    if idx >= n {
+                        break;
+                    }
+                    let (b, c) = {
+                        let Node::Internal(ch) = &self.nodes[node] else { unreachable!() };
+                        ch[idx]
+                    };
+                    if covered(vbox, &b) {
+                        self.remove_visit(c, current_level + 1, Some((node, idx)), id, vbox, st);
+                        if st.removed {
+                            break;
+                        }
+                    }
+                    idx += 1;
+                }
+                if !st.removed {
+                    return;
+                }
+                if st.underflow {
+                    let relative = self.leafs_level - current_level;
+                    let Node::Internal(ch) = &mut self.nodes[node] else { unreachable!() };
+                    st.underflowed.push((relative, ch[idx].1));
+                    let last = ch.len() - 1;
+                    ch.swap(idx, last);
+                    ch.pop();
+                    st.underflow = ch.len() < MIN;
+                }
+                if let Some((p, pi)) = parent {
+                    let b = self.node_box(node);
+                    let Node::Internal(pc) = &mut self.nodes[p] else { unreachable!() };
+                    pc[pi].0 = b;
+                } else {
+                    // The root: reinsert what underflowed, highest level first; then shorten.
+                    let under = std::mem::take(&mut st.underflowed);
+                    for &(relative, n) in under.iter().rev() {
+                        let elems: Vec<Elem> = match &self.nodes[n] {
+                            Node::Leaf(v) => v.iter().map(|&i| Elem::Value(i)).collect(),
+                            Node::Internal(c) => c.iter().map(|&(b, c)| Elem::Child(b, c)).collect(),
+                        };
+                        for e in elems {
+                            self.insert_elem(e, relative - 1);
+                        }
+                    }
+                    let root = self.root.expect("a root");
+                    if let Node::Internal(ch) = &self.nodes[root] {
+                        if ch.len() <= 1 {
+                            self.root = ch.first().map(|c| c.1);
+                            self.leafs_level = self.leafs_level.saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            Node::Leaf(v) => {
+                let Some(pos) = v.iter().position(|&i| i == id) else { return };
+                let Node::Leaf(v) = &mut self.nodes[node] else { unreachable!() };
+                let last = v.len() - 1;
+                v.swap(pos, last);
+                v.pop();
+                st.removed = true;
+                st.underflow = v.len() < MIN;
+                if let Some((p, pi)) = parent {
+                    let b = self.node_box(node);
+                    let Node::Internal(pc) = &mut self.nodes[p] else { unreachable!() };
+                    pc[pi].0 = b;
+                }
+            }
+        }
+    }
+
+    /// A node's box over its entries (an empty node keeps an inverted box).
+    fn node_box(&self, node: usize) -> Rect {
+        let b = match &self.nodes[node] {
+            Node::Internal(c) => c.iter().fold(None, |b, (r, _)| Some(expand(b, r))),
+            Node::Leaf(v) => v.iter().fold(None, |b, &i| Some(expand(b, &self.values[i].0))),
+        };
+        b.unwrap_or(Rect { xl: i32::MAX, yl: i32::MAX, xh: i32::MIN, yh: i32::MIN })
+    }
+
+    /// Every live value whose box touches `q`, in the tree's order, with its id.
+    pub fn query(&self, q: &Rect) -> Vec<(usize, &(Rect, T))> {
+        let mut out = Vec::new();
+        if let Some(r) = self.root {
+            self.walk(r, q, &mut out);
+        }
+        out
+    }
+
+    fn walk<'a>(&'a self, node: usize, q: &Rect, out: &mut Vec<(usize, &'a (Rect, T))>) {
+        match &self.nodes[node] {
+            Node::Internal(children) => {
+                for (b, c) in children {
+                    if touches(b, q) {
+                        self.walk(*c, q, out);
+                    }
+                }
+            }
+            Node::Leaf(ids) => {
+                for &i in ids {
+                    if touches(&self.values[i].0, q) {
+                        out.push((i, &self.values[i]));
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct RemoveState {
+    removed: bool,
+    underflow: bool,
+    underflowed: Vec<(usize, usize)>,
+}
+
+type Groups = (Vec<(Rect, usize)>, Vec<(Rect, usize)>, Rect, Rect);
+
+/// The quadratic redistribution of 17 entries into two groups (boxes after).
+fn quadratic_split(elems: Vec<(Rect, usize)>) -> Groups {
+    let n = elems.len();
+    let (mut seed1, mut seed2) = (0usize, 1usize);
+    let mut greatest: i64 = 0;
+    for i in 0..n - 1 {
+        for j in i + 1..n {
+            let e = expand(Some(elems[i].0), &elems[j].0);
+            let free = area(&e) - area(&elems[i].0) - area(&elems[j].0);
+            if greatest < free {
+                greatest = free;
+                seed1 = i;
+                seed2 = j;
+            }
+        }
+    }
+    let mut copy = elems.clone();
+    let mut g1 = vec![copy[seed1]];
+    let mut g2 = vec![copy[seed2]];
+    let mut b1 = copy[seed1].0;
+    let mut b2 = copy[seed2].0;
+    let take = |v: &mut Vec<(Rect, usize)>, k: usize| {
+        let last = v.len() - 1;
+        if k != last {
+            v[k] = v[last];
+        }
+        v.pop();
+    };
+    if seed1 < seed2 {
+        take(&mut copy, seed2);
+        take(&mut copy, seed1);
+    } else {
+        take(&mut copy, seed1);
+        take(&mut copy, seed2);
+    }
+    let (mut c1, mut c2) = (area(&b1), area(&b2));
+    let mut remaining = copy.len();
+    while !copy.is_empty() {
+        let mut pick = copy.len() - 1;
+        let group1 = if g1.len() + remaining <= MIN {
+            true
+        } else if g2.len() + remaining <= MIN {
+            false
+        } else {
+            // Scanning from the back: the entry whose two increases differ most.
+            let (mut greatest, mut inc1, mut inc2) = (0i64, 0i64, 0i64);
+            pick = copy.len() - 1;
+            for k in (0..copy.len()).rev() {
+                let i1 = area(&expand(Some(b1), &copy[k].0)) - c1;
+                let i2 = area(&expand(Some(b2), &copy[k].0)) - c2;
+                let d = (i1 - i2).abs();
+                if greatest < d {
+                    greatest = d;
+                    pick = k;
+                    inc1 = i1;
+                    inc2 = i2;
+                }
+            }
+            inc1 < inc2 || (inc1 == inc2 && (c1 < c2 || (c1 == c2 && g1.len() <= g2.len())))
+        };
+        let e = copy[pick];
+        if group1 {
+            g1.push(e);
+            b1 = expand(Some(b1), &e.0);
+            c1 = area(&b1);
+        } else {
+            g2.push(e);
+            b2 = expand(Some(b2), &e.0);
+            c2 = area(&b2);
+        }
+        take(&mut copy, pick);
+        remaining -= 1;
+    }
+    (g1, g2, b1, b2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -162,6 +162,65 @@ impl Polygon90Set {
         out
     }
 
+    /// `get` into polygons (with holes): the set's connected pieces — slices sharing an edge of
+    /// some length — each as its own set, in the order the reference emits them: by the top y,
+    /// then the x of the leftmost vertex on that top edge.
+    pub fn polygons(&mut self) -> Vec<Polygon90Set> {
+        let rects = self.rectangles();
+        let n = rects.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn find(p: &mut [usize], i: usize) -> usize {
+            let mut r = i;
+            while p[r] != r {
+                r = p[r];
+            }
+            let mut i = i;
+            while p[i] != r {
+                let next = p[i];
+                p[i] = r;
+                i = next;
+            }
+            r
+        }
+        for i in 0..n {
+            for j in i + 1..n {
+                let (a, b) = (rects[i], rects[j]);
+                let side = (a.xh == b.xl || b.xh == a.xl) && a.yl.max(b.yl) < a.yh.min(b.yh);
+                let top = (a.yh == b.yl || b.yh == a.yl) && a.xl.max(b.xl) < a.xh.min(b.xh);
+                if side || top {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+        let mut comps: std::collections::BTreeMap<usize, Vec<Rect>> = std::collections::BTreeMap::new();
+        for (i, r) in rects.iter().enumerate() {
+            let root = find(&mut parent, i);
+            comps.entry(root).or_default().push(*r);
+        }
+        let mut keyed: Vec<((i32, i32), Vec<Rect>)> = comps
+            .into_values()
+            .map(|rs| {
+                let top = rs.iter().map(|r| r.yh).max().expect("a slice");
+                let left = rs.iter().filter(|r| r.yh == top).map(|r| r.xl).min().expect("a slice");
+                ((top, left), rs)
+            })
+            .collect();
+        keyed.sort_by_key(|k| k.0);
+        keyed
+            .into_iter()
+            .map(|(_, rs)| {
+                let mut p = Polygon90Set::new();
+                for r in rs {
+                    p.insert_rect(r);
+                }
+                p
+            })
+            .collect()
+    }
+
     /// `get_max_rectangles`: every maximal rectangle inside the set, in `MaxCover`'s order.
     pub fn max_rectangles(&mut self) -> Vec<Rect> {
         let rects = self.rectangles();
