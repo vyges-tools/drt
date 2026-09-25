@@ -233,7 +233,8 @@ fn touches(a: &Rect, b: &Rect) -> bool {
 }
 
 /// The first iteration's nets of a worker (ripping everything up: no existing routes).
-pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect, boundary: &BoundaryPins) -> Vec<DrNet> {
+/// Errors as [`init_net_term`].
+pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect, boundary: &BoundaryPins) -> Result<Vec<DrNet>, String> {
     // Terminal order: block pins first, then instance terminals, each by database order.
     let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
     let mut nets: BTreeSet<usize> = BTreeSet::new();
@@ -301,7 +302,7 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
         for (part_terms, part_bounds, part_ext) in init_nets_init_dr_helper(inp, &terms, &g, &bounds, ext) {
             let id = out.len();
             let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext: part_ext };
-            init_net_term(inp, route_box, &mut dnet, &part_terms, &mut pin_cnt);
+            init_net_term(inp, route_box, &mut dnet, &part_terms, &mut pin_cnt)?;
             // Boundary points, ordered (a map by point then layer), area 0 in the first iteration.
             let set: BTreeSet<(P, usize)> = part_bounds.into_iter().collect();
             for (pt, l) in set {
@@ -315,7 +316,7 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
     if let Some((tech, _)) = inp.routes {
         init_nets_boundary_area(tech, route_box, &mut out);
     }
-    out
+    Ok(out)
 }
 
 /// A committed shape against the route box after the first iteration: a wire across the box's
@@ -390,13 +391,14 @@ fn split_obj_search_repair(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate:
 /// — each becoming a worker net: its terms, and as ext shapes the net's ext parts (all on the
 /// first component) plus its route wires not wholly inside the route box; its boundary points
 /// where an ext wire leaves the route box from a side; route parts dropped.
-pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect) -> Vec<DrNet> {
+/// Errors as [`init_net_term`].
+pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect) -> Result<Vec<DrNet>, String> {
     use crate::dr::cost::DrFig;
     let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
     let mut nets: BTreeSet<usize> = BTreeSet::new();
     let mut net_route: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
     let mut net_ext: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
-    let Some((tech, d)) = inp.routes else { return Vec::new() };
+    let Some((tech, d)) = inp.routes else { return Ok(Vec::new()) };
     for k in d.query(tech, ext_box) {
         let sh = d.shapes[k].as_ref().expect("a shape");
         nets.insert(sh.net);
@@ -461,7 +463,7 @@ pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: 
         for (ext, pins) in v_ext.into_iter().zip(v_pins) {
             let id = out.len();
             let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext };
-            init_net_term(inp, route_box, &mut dnet, &pins, &mut pin_cnt);
+            init_net_term(inp, route_box, &mut dnet, &pins, &mut pin_cnt)?;
             for (pt, l) in ext_boundary_points(route_box, &dnet.ext) {
                 dnet.pins.push(DrPin { term: None, id: pin_cnt, patterns: vec![DrAccessPattern { point: pt, layer: l, begin_area: 0, pin_cost: 0, ap: None }] });
                 pin_cnt += 1;
@@ -471,7 +473,7 @@ pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: 
     }
     init_nets_num_pins_in(&mut out, ext_box);
     init_nets_boundary_area(tech, route_box, &mut out);
-    out
+    Ok(out)
 }
 
 /// The route parts' connected components (the terms numbered after them): nodes at every wire
@@ -873,7 +875,8 @@ fn split_obj(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate::dr::cost::DrF
 
 /// Each terminal a pin: its pins' points (the instance's class) inside the route box, the chosen
 /// one costing 0 and the rest 1, each with its layer's minimum area.
-fn init_net_term(inp: &DrNetInput<'_>, route_box: &Rect, net: &mut DrNet, terms: &[usize], pin_cnt: &mut usize) {
+/// Errors when a terminal has no access point inside the route box (the reference stops there).
+fn init_net_term(inp: &DrNetInput<'_>, route_box: &Rect, net: &mut DrNet, terms: &[usize], pin_cnt: &mut usize) -> Result<(), String> {
     for &t in terms {
         let term = &inp.terms[t];
         let mut patterns = Vec::new();
@@ -894,9 +897,13 @@ fn init_net_term(inp: &DrNetInput<'_>, route_box: &Rect, net: &mut DrNet, terms:
             }
             pin_idx += 1;
         }
+        if patterns.is_empty() {
+            return Err(format!("terminal {} has no access point in the worker's route box", term.name));
+        }
         net.pins.push(DrPin { term: Some(t), id: *pin_cnt, patterns });
         *pin_cnt += 1;
     }
+    Ok(())
 }
 
 /// Per net, how many of the worker's pins lie in the box of its pins' (chosen, else first)
