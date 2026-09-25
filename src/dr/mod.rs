@@ -3,6 +3,7 @@
 
 #[cfg(feature = "odb")]
 pub mod db;
+pub mod conn;
 pub mod cost;
 pub mod design;
 pub mod drw;

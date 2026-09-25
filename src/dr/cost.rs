@@ -727,7 +727,9 @@ pub enum DrFig {
     /// `begin_trunc` / `end_trunc`: the end's style is TRUNCATE (at an access point), else extend.
     Seg { layer: usize, begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool, begin_trunc: bool, end_trunc: bool },
     /// `tapered`: a non-default-rule net's via inside a pin's taper box.
-    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool },
+    /// `bottom_connected` / `top_connected`: the via's end on the layer below / above lands on an
+    /// access point of the net's pin (under the rule that truncates a wire end there).
+    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool, bottom_connected: bool, top_connected: bool },
     Patch { layer: usize, origin: P, offset: Rect },
 }
 

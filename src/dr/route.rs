@@ -67,7 +67,7 @@ pub fn init_maze_cost_via_helper(w: &mut CostWorker<'_, '_>, net: &DrNet, add: b
         let via = ap.vias[0];
         let vd = &tech.via_defs[via];
         let (Some(x), Some(y), Some(z)) = (w.g.xs.binary_search(&p.point.0).ok(), w.g.ys.binary_search(&p.point.1).ok(), w.g.z_of(vd.layer1)) else { continue };
-        let fig = DrFig::Via { via, origin: p.point, bi: (x, y, z), ei: (x, y, z + 1), tapered: false };
+        let fig = DrFig::Via { via, origin: p.point, bi: (x, y, z), ei: (x, y, z + 1), tapered: false, bottom_connected: false, top_connected: false };
         w.mod_path_cost(&fig, if add { ModCost::AddRoute } else { ModCost::SubRoute }, true, true, ndr);
     }
 }

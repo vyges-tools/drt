@@ -119,7 +119,10 @@ pub fn write_path(w: &CostWorker<'_, '_>, cx: &WriteCtx<'_>, points: &[Idx]) -> 
                 }
                 // Tapered: a rule net's via at a point of a taper box on either of the path's layers.
                 let tapered = cx.ndr.is_some() && cx.auto_taper && (cx.taper_at.contains_key(&(end.0, end.1, start.2)) || cx.taper_at.contains_key(&(end.0, end.1, end.2)));
-                out.push(DrFig::Via { via, origin, bi: (start.0 as usize, start.1 as usize, z as usize), ei: (start.0 as usize, start.1 as usize, z as usize + 1), tapered });
+                let (bot, top) = ((start.0, start.1, z), (start.0, start.1, z + 1));
+                let bottom_connected = pin_connected(cx, bot, origin, l);
+                let top_connected = pin_connected(cx, top, origin, w.g.zs[z as usize + 1]);
+                out.push(DrFig::Via { via, origin, bi: (start.0 as usize, start.1 as usize, z as usize), ei: (start.0 as usize, start.1 as usize, z as usize + 1), tapered, bottom_connected, top_connected });
             }
         }
     }
@@ -156,6 +159,13 @@ fn split_path_seg(cx: &WriteCtx<'_>, sx: i32, sy: i32, ex: i32, ey: i32, z: i32,
     (None, false)
 }
 
+/// Whether a wire end or via end at the node lands on the net's pin: a real access point of it,
+/// or (at any access point, or on the worker's border) a point where the pin has an access point
+/// on the layer.
+fn pin_connected(cx: &WriteCtx<'_>, idx: Idx, pt: P, l: usize) -> bool {
+    cx.real_ap.contains(&idx) || ((cx.ap.contains(&idx) || in_border(&cx.route_box, pt.0, pt.1)) && (cx.has_access_point)(pt, l))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_path_seg(w: &CostWorker<'_, '_>, cx: &WriteCtx<'_>, sx: i32, sy: i32, ex: i32, ey: i32, z: i32, vertical: bool, taper: bool, i: usize, points: &[Idx]) -> DrFig {
     let tech = w.cx.tech;
@@ -165,12 +175,7 @@ fn process_path_seg(w: &CostWorker<'_, '_>, cx: &WriteCtx<'_>, sx: i32, sy: i32,
     let end = (w.g.xs[ex as usize], w.g.ys[ey as usize]);
     let mut st = Style { width: layer.width, begin_ext: layer.width / 2, end_ext: layer.width / 2, begin: End::Extend, end: End::Extend };
     for (is_begin, idx, pt) in [(true, (sx, sy, z), begin), (false, (ex, ey, z), end)] {
-        let truncate = if cx.real_ap.contains(&idx) {
-            true
-        } else {
-            (cx.ap.contains(&idx) || in_border(&cx.route_box, pt.0, pt.1)) && (cx.has_access_point)(pt, l)
-        };
-        if truncate {
+        if pin_connected(cx, idx, pt, l) {
             if is_begin {
                 st.begin = End::Truncate;
                 st.begin_ext = 0;
