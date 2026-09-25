@@ -1,0 +1,14 @@
+[book]
+title = "vyges-drt"
+description = "Detailed routing, starting with pin access: every pin's access points and each routed terminal's preferred point"
+authors = ["Vyges"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/vyges-tools/drt"
+
+# The chapter (src/drt.md) and the CLI reference (src/reference/vyges-drt.md) are written to drop
+# into the Vyges book unchanged, as engines/drt.md and engines/reference/vyges-drt.md.

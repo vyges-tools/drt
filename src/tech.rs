@@ -269,7 +269,7 @@ pub mod read {
                         "VERTICAL" => Dir::Vertical,
                         _ => Dir::None,
                     };
-                    let pitch = db.layer_get_pitch(&name) as i32;
+                    let pitch = db.layer_get_pitch(&name);
                     let wrong_way_width = db.layer_get_wrong_way_width(&name) as i32;
                     let v55 = db.layer_v55_spacing_table(&name)?;
                     let spacing = match (v55.widths_and_lengths, v55.table) {

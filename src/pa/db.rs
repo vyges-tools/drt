@@ -19,8 +19,11 @@ use crate::tech::{read, LayerKind, Master, Tech};
 
 type Res<T> = Result<T, String>;
 
+/// The masters in use, every instance (database order), every port.
+pub type Design = (HashMap<String, Master>, Vec<DesignInst>, Vec<DesignPort>);
+
 /// Every instance (database order), every port, and the masters they use.
-pub fn read_design(db: &Db, tech: &Tech) -> Res<(HashMap<String, Master>, Vec<DesignInst>, Vec<DesignPort>)> {
+pub fn read_design(db: &Db, tech: &Tech) -> Res<Design> {
     let mut masters: HashMap<String, Master> = HashMap::new();
     let mut insts = Vec::new();
     for name in db.inst_names() {

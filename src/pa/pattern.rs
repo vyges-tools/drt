@@ -508,7 +508,7 @@ mod tests {
         let got = prep_pattern_inst(&inst, &mut tr);
         let ev = tr.0.unwrap();
         assert_eq!(got, vec![Pattern { aps: vec![Some((0, 1)), Some((1, 0)), Some((2, 0))], left: Some((0, 1)), right: Some((2, 0)), cost: 2 }]);
-        assert!(ev.iter().any(|e| *e == Event::Pass { reversed: true, max_aps: 2 }));
+        assert!(ev.contains(&Event::Pass { reversed: true, max_aps: 2 }));
         // The forward pass's first path runs through the violating look-back: its cost says so.
         let first_round = ev.iter().find_map(|e| if let Event::Round { cost, .. } = e { Some(*cost) } else { None });
         assert_eq!(first_round, Some(VIOLATION_COST));
