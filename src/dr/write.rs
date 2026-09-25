@@ -421,3 +421,31 @@ fn patch_cost(w: &CostWorker<'_, '_>, st: &MazeState, rb: &Rect, at: Idx, horz: 
     }
     cost
 }
+
+/// A wire end as the write-out encodes it (the database's point ops): a truncated end with
+/// extension 0 whatever its style; else with its extension when that differs from half the
+/// layer's width; else a plain point.
+pub fn end_point_op(p: (i32, i32), trunc: bool, ext: i32, half: i32) -> Vec<i32> {
+    if trunc {
+        vec![2, p.0, p.1, 0]
+    } else if ext != half {
+        vec![2, p.0, p.1, ext]
+    } else {
+        vec![1, p.0, p.1]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::end_point_op;
+
+    /// Rule: a TRUNCATED end is written with extension 0 even when its style extends it; an
+    /// untruncated end carries its extension only when it is not half the layer's width.
+    #[test]
+    fn a_truncated_end_is_written_with_extension_zero() {
+        assert_eq!(end_point_op((5, 7), true, 70, 70), vec![2, 5, 7, 0]);
+        assert_eq!(end_point_op((5, 7), true, 210, 70), vec![2, 5, 7, 0]);
+        assert_eq!(end_point_op((5, 7), false, 210, 70), vec![2, 5, 7, 210]);
+        assert_eq!(end_point_op((5, 7), false, 70, 70), vec![1, 5, 7]);
+    }
+}

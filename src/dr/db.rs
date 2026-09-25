@@ -156,15 +156,7 @@ pub fn write_routes(db: &mut Db, tech: &Tech, tech_vias: usize, d: &crate::dr::d
     for (&net, (shapes, _)) in &per {
         let ndr = has_ndr(net);
         let w = wires.entry(net).or_default();
-        let point = |ops: &mut Vec<i32>, p: (i32, i32), trunc: bool, ext: i32, half: i32| {
-            if trunc {
-                ops.extend([2, p.0, p.1, 0]);
-            } else if ext != half {
-                ops.extend([2, p.0, p.1, ext]);
-            } else {
-                ops.extend([1, p.0, p.1]);
-            }
-        };
+        let point = |ops: &mut Vec<i32>, p: (i32, i32), trunc: bool, ext: i32, half: i32| ops.extend(crate::dr::write::end_point_op(p, trunc, ext, half));
         for s in shapes.segs.iter().flatten() {
             let l = &tech.layers[s.layer];
             let li = w.name(&l.name);
