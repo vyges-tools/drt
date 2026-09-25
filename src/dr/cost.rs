@@ -724,7 +724,8 @@ impl CostWorker<'_, '_> {
 /// indices), or a patch (its layer's metal around an origin).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrFig {
-    Seg { layer: usize, begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool },
+    /// `begin_trunc` / `end_trunc`: the end's style is TRUNCATE (at an access point), else extend.
+    Seg { layer: usize, begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool, begin_trunc: bool, end_trunc: bool },
     /// `tapered`: a non-default-rule net's via inside a pin's taper box.
     Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool },
     Patch { layer: usize, origin: P, offset: Rect },
@@ -768,7 +769,7 @@ impl CostWorker<'_, '_> {
         let tech = self.cx.tech;
         let eol_of = |z: usize| ndr.and_then(|(_, e)| e.get(z).copied().flatten());
         match *fig {
-            DrFig::Seg { layer, begin, end, width, begin_ext, end_ext, bi, ei, tapered } => {
+            DrFig::Seg { layer, begin, end, width, begin_ext, end_ext, bi, ei, tapered, .. } => {
                 let b = DrFig::seg_box(begin, end, width, begin_ext, end_ext);
                 let ndr = if tapered { None } else { ndr };
                 let z = bi.2;
@@ -834,10 +835,10 @@ impl CostWorker<'_, '_> {
 pub struct Unmodelled(pub String);
 
 /// The costs before routing: fixed shapes, access points, block pins' planar access.
-pub fn init_maze_cost(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect) -> Result<(), Unmodelled> {
+pub fn init_maze_cost<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>) -> Result<(), Unmodelled> {
     init_maze_cost_fixed_obj(w, ext_box)?;
     init_maze_cost_ap(w, nets);
-    init_maze_cost_conn_fig(w, nets, ext_box);
+    init_maze_cost_conn_fig(w, nets, ext_box, ndr_of);
     init_maze_cost_planar_term(w, ext_box);
     Ok(())
 }
@@ -846,10 +847,19 @@ pub fn init_maze_cost(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect
 /// shapes in the worker (its pin shapes the fixed-shape query returns, merged per layer), and
 /// for each boundary edge shorter than the layer's end-of-line width, route cost where a wire
 /// or via would sit in the space beyond it.
-fn init_maze_cost_conn_fig(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect) {
+fn init_maze_cost_conn_fig<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>) {
+    let tech = w.cx.tech;
     let owners: BTreeSet<usize> = nets.iter().map(|n| n.net).collect();
     for &owner in &owners {
-        mod_eol_costs_poly(w, owner, ext_box, ModCost::AddRoute);
+        // Its committed shapes around the route box: route cost (cut spacing, no end of line).
+        let mut metal: Vec<(usize, Rect)> = Vec::new();
+        for n in nets.iter().filter(|n| n.net == owner) {
+            for f in &n.ext {
+                w.mod_path_cost(f, ModCost::AddRoute, false, true, ndr_of(n));
+                metal.extend(f.metal(tech));
+            }
+        }
+        mod_eol_costs_poly_with(w, owner, ext_box, &metal, ModCost::AddRoute);
     }
 }
 
@@ -1211,7 +1221,7 @@ mod tests {
         let blk = Rect { xl: 0, yl: 0, xh: 900, yh: 900 };
         let pin = Rect { xl: 400, yl: 400, xh: 500, yh: 1400 };
         let fixed: Vec<PackedRTree<Fixed>> = (0..5).map(|l| PackedRTree::new(if l == 2 { vec![(blk, Fixed::Blockage), (pin, Fixed::InstTerm { net: Some(0), inst: 0, term: 0 })] } else { Vec::new() })).collect();
-        with_defaults(&t, &mut g, &[], &fixed, |w| init_maze_cost(w, &[], &Rect { xl: 0, yl: 0, xh: 900, yh: 900 }).expect("modelled"));
+        with_defaults(&t, &mut g, &[], &fixed, |w| init_maze_cost(w, &[], &Rect { xl: 0, yl: 0, xh: 900, yh: 900 }, &|_| None).expect("modelled"));
         assert!(!g.is_blocked(4, 5, 0, Dir6::E));
         assert!(g.is_blocked(2, 2, 0, Dir6::E));
     }
@@ -1283,7 +1293,7 @@ mod tests {
         // A boundary point (no access record): every direction open, even one blocked before.
         let edge = DrAccessPattern { point: (500, 500), layer: 2, begin_area: 0, pin_cost: 0, ap: None };
         g.set_blocked(5, 5, 0, Dir6::E, true);
-        let net = DrNet { id: 0, net: 0, pins: vec![DrPin { term: None, id: 0, patterns: vec![pat] }, DrPin { term: None, id: 1, patterns: vec![edge] }], num_pins_in: 2, pin_box: Rect { xl: 0, yl: 0, xh: 0, yh: 0 } };
+        let net = DrNet { id: 0, net: 0, pins: vec![DrPin { term: None, id: 0, patterns: vec![pat] }, DrPin { term: None, id: 1, patterns: vec![edge] }], num_pins_in: 2, pin_box: Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, ext: Vec::new() };
         let svia = with(&t, &mut g, |w| {
             init_maze_cost_ap(w, std::slice::from_ref(&net));
             w.ap_svia.clone()

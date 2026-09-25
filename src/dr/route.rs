@@ -110,6 +110,8 @@ pub struct NetCtx<'a> {
     /// The net's non-default rule itself (widths, preferred vias).
     pub ndr_rule: Option<&'a crate::dr::rules::NdrRule>,
     pub route_box: Rect,
+    /// The net's rule as the path costs read it (with its end-of-line rules).
+    pub ndr_cost: Option<Ndr<'a>>,
 }
 
 /// One search's record: the destination pin, the path (dst first).
@@ -281,7 +283,7 @@ pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCf
         w.mod_path_cost(f, ModCost::SubRoute, false, true, ndr);
     }
     let tech = w.cx.tech;
-    let metal: Vec<(usize, Rect)> = old.iter().flat_map(|f| f.metal(tech)).collect();
+    let metal: Vec<(usize, Rect)> = net.ext.iter().chain(old).flat_map(|f| f.metal(tech)).collect();
     crate::dr::cost::mod_eol_costs_poly_with(w, net.net, cx.ext_box, &metal, ModCost::SubRoute);
     if reroutes == 0 {
         init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
@@ -306,12 +308,15 @@ pub fn maze_net_end(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet,
     }
     init_maze_cost_guide_helper(w, st, cx.guides, false);
     init_maze_cost_ap_helper(w, st, net, true, cx.is_macro_term, cx.is_port_term);
+    for f in &net.ext {
+        w.mod_path_cost(f, ModCost::AddRoute, false, false, cx.ndr_cost);
+    }
 }
 
 /// After the net's check: its end-of-line route costs from its pins and what it wrote, merged.
 pub fn after_check(w: &mut CostWorker<'_, '_>, net: &DrNet, figs: &[DrFig], ext_box: &Rect) {
     let tech = w.cx.tech;
-    let metal: Vec<(usize, Rect)> = figs.iter().flat_map(|f| f.metal(tech)).collect();
+    let metal: Vec<(usize, Rect)> = net.ext.iter().chain(figs).flat_map(|f| f.metal(tech)).collect();
     crate::dr::cost::mod_eol_costs_poly_with(w, net.net, ext_box, &metal, ModCost::AddRoute);
 }
 
@@ -323,6 +328,10 @@ fn maze_net_init(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet, cx
     }
     init_maze_cost_guide_helper(w, st, cx.guides, true);
     init_maze_cost_ap_helper(w, st, net, false, cx.is_macro_term, cx.is_port_term);
+    // Its committed shapes' route cost off (same-net spacing to them is not a violation).
+    for f in &net.ext {
+        w.mod_path_cost(f, ModCost::SubRoute, false, false, cx.ndr_cost);
+    }
 }
 
 fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, cx: &NetCtx<'_>) -> (Vec<Search>, Vec<DrFig>, bool) {

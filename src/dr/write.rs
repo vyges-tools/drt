@@ -200,7 +200,7 @@ fn process_path_seg(w: &CostWorker<'_, '_>, cx: &WriteCtx<'_>, sx: i32, sy: i32,
             st.begin_ext = layer.wrong_way_width / 2;
         }
     }
-    DrFig::Seg { layer: l, begin, end, width: st.width, begin_ext: st.begin_ext, end_ext: st.end_ext, bi: (sx as usize, sy as usize, z as usize), ei: (ex as usize, ey as usize, z as usize), tapered }
+    DrFig::Seg { layer: l, begin, end, width: st.width, begin_ext: st.begin_ext, end_ext: st.end_ext, bi: (sx as usize, sy as usize, z as usize), ei: (ex as usize, ey as usize, z as usize), tapered, begin_trunc: st.begin == End::Truncate, end_trunc: st.end == End::Truncate }
 }
 
 /// A non-default rule's width (extensions half of it) when wider. (Wire extensions are not

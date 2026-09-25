@@ -107,16 +107,35 @@ struct NetState {
     reroutes: u32,
     ripup_avoids: u32,
     figs: Vec<DrFig>,
+    /// The net's committed shapes around the route box.
+    ext: Vec<DrFig>,
 }
 
 fn touches(a: &Rect, b: &Rect) -> bool {
     a.xh >= b.xl && a.xl <= b.xh && a.yh >= b.yl && a.yl <= b.yh
 }
 
+/// The marker costs added so far (planar, via nodes), which decay after each route.
+#[derive(Debug, Clone, Default)]
+pub struct History {
+    planar: BTreeSet<Idx>,
+    via: BTreeSet<Idx>,
+}
+
+/// Before the queue: the markers standing in the worker's check box cost the grid.
+pub fn initial_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, nets: &[DrNet], markers: &[Marker]) -> History {
+    let mut h = History::default();
+    let state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: Vec::new(), ext: n.ext.clone() }).collect();
+    for m in markers {
+        add_marker_cost(w, q, nets, &state, m, &mut h.planar, &mut h.via);
+    }
+    h
+}
+
 /// Run the first iteration's queue on a worker: `order` the routing order.
-pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<'_>, nets: &[DrNet], order: &[usize]) -> Vec<Event> {
+pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<'_>, nets: &[DrNet], order: &[usize], hist: History) -> Vec<Event> {
     let mut events = Vec::new();
-    let mut state: Vec<NetState> = nets.iter().map(|_| NetState { reroutes: 0, ripup_avoids: 0, figs: Vec::new() }).collect();
+    let mut state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: Vec::new(), ext: n.ext.clone() }).collect();
     let by_name: HashMap<String, Vec<usize>> = {
         let mut m: HashMap<String, Vec<usize>> = HashMap::new();
         for i in 0..nets.len() {
@@ -127,8 +146,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
     let mut queue: VecDeque<Entry> = order.iter().map(|&i| Entry { block: Block::Net(i), num_reroute: 0, do_route: true, checking: None }).collect();
     let mut gc_version = 1i64;
     let mut checked: HashMap<Block, i64> = HashMap::new();
-    let mut planar_hist: BTreeSet<Idx> = BTreeSet::new();
-    let mut via_hist: BTreeSet<Idx> = BTreeSet::new();
+    let History { planar: mut planar_hist, via: mut via_hist } = hist;
     while let Some(e) = queue.pop_front() {
         let mut did_route = false;
         let (markers, checking_obj): (Vec<Marker>, Owner) = match (&e.block, e.do_route) {
@@ -210,7 +228,7 @@ fn worker_for<'t>(q: &QueueCtx<'t>, state: &[NetState]) -> Worker<'t> {
     gw.check_ndrs = true;
     gw.max_ndr_spacing = q.max_ndr_spacing.to_vec();
     for (i, s) in state.iter().enumerate() {
-        if s.figs.is_empty() {
+        if s.figs.is_empty() && s.ext.is_empty() {
             continue;
         }
         let owner = Owner::Net((q.name)(i));
@@ -220,7 +238,7 @@ fn worker_for<'t>(q: &QueueCtx<'t>, state: &[NetState]) -> Worker<'t> {
         }
         let mut non_tapered: Vec<(usize, Rect)> = Vec::new();
         let mut patches: Vec<(usize, Rect)> = Vec::new();
-        for f in &s.figs {
+        for f in s.ext.iter().chain(&s.figs) {
             for (l, b) in f.metal(tech) {
                 gw.add(&owner, l, b, false);
                 if ndr.is_some() {
@@ -401,7 +419,7 @@ fn add_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, _nets: &[DrNet]
     let mut vio_nets: BTreeSet<usize> = BTreeSet::new();
     // The route shapes on the marker's layer touching its box, net by net.
     for (ni, s) in state.iter().enumerate() {
-        for f in &s.figs {
+        for f in s.ext.iter().chain(&s.figs) {
             let on_layer: Vec<Rect> = match f {
                 DrFig::Via { via: v, origin, .. } => {
                     let vd = &tech.via_defs[*v];

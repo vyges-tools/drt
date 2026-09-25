@@ -4,6 +4,7 @@
 #[cfg(feature = "odb")]
 pub mod db;
 pub mod cost;
+pub mod design;
 pub mod drw;
 pub mod guides;
 pub mod maze;

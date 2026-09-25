@@ -30,7 +30,7 @@ type P = (i32, i32);
 type TermKey = ((bool, usize), usize);
 
 /// One part of a net: its terminals and its boundary points.
-type NetPart = (Vec<usize>, Vec<(P, usize)>);
+type NetPart = (Vec<usize>, Vec<(P, usize)>, Vec<crate::dr::cost::DrFig>);
 
 /// Per net, the boundary points `(point, layer)` of one gcell (ordered).
 pub type BoundaryPins = BTreeMap<usize, BTreeSet<(P, usize)>>;
@@ -112,6 +112,12 @@ pub struct WorkerBoxes {
 /// The workers of one iteration, in the order they run: the four checkerboard groups, each in
 /// creation order (x outer, y inner).
 pub fn worker_boxes(grid: &GCellGrid, size: i32, offset: i32, mt_safe: i32, drc_safe: i32) -> Vec<WorkerBoxes> {
+    worker_groups(grid, size, offset, mt_safe, drc_safe).into_iter().flatten().collect()
+}
+
+/// The workers of one iteration as its four checkerboard groups (each written back before the
+/// next group starts).
+pub fn worker_groups(grid: &GCellGrid, size: i32, offset: i32, mt_safe: i32, drc_safe: i32) -> Vec<Vec<WorkerBoxes>> {
     let (nx, ny) = (grid.x.1, grid.y.1);
     let mut groups: Vec<Vec<WorkerBoxes>> = vec![Vec::new(); 4];
     let bloat = |r: &Rect, d: i32| Rect { xl: r.xl - d, yl: r.yl - d, xh: r.xh + d, yh: r.yh + d };
@@ -132,7 +138,7 @@ pub fn worker_boxes(grid: &GCellGrid, size: i32, offset: i32, mt_safe: i32, drc_
         xi += 1;
         i += size;
     }
-    groups.into_iter().flatten().collect()
+    groups
 }
 
 /// An access point as a worker reads it.
@@ -186,6 +192,8 @@ pub struct DrNet {
     pub pins: Vec<DrPin>,
     pub num_pins_in: usize,
     pub pin_box: Rect,
+    /// Committed shapes of the net around the route box (kept as they are while it reroutes).
+    pub ext: Vec<crate::dr::cost::DrFig>,
 }
 
 /// What a worker reads of the design to build its nets.
@@ -198,6 +206,10 @@ pub struct DrNetInput<'a> {
     pub terms: &'a [DrTerm],
     /// Per layer, its minimum area (0 without one).
     pub min_area: &'a [i64],
+    /// The committed routes (none before the first worker writes back).
+    pub routes: Option<(&'a crate::tech::Tech, &'a crate::dr::design::DesignRoutes)>,
+    /// A net's terminals with a pin shape at the point on the layer.
+    pub term_at: Option<&'a dyn Fn(P, usize, usize) -> Vec<usize>>,
 }
 
 fn sq_dist(a: &Rect, b: &Rect) -> i64 {
@@ -222,6 +234,40 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
         nets.insert(net);
         net_terms.entry(net).or_default().insert((term_key(t), t));
     }
+    // Committed shapes in the extended box: each net's parts inside the route box (dropped — the
+    // first iteration rips everything up) and outside it (kept, as the net's ext shapes).
+    let mut net_route: BTreeMap<usize, Vec<crate::dr::cost::DrFig>> = BTreeMap::new();
+    let mut net_ext: BTreeMap<usize, Vec<crate::dr::cost::DrFig>> = BTreeMap::new();
+    if let Some((tech, d)) = inp.routes {
+        for k in d.query(tech, ext_box) {
+            let sh = d.shapes[k].as_ref().expect("a shape");
+            nets.insert(sh.net);
+            let (r, e) = split_obj(route_box, &sh.fig);
+            net_route.entry(sh.net).or_default().extend(r);
+            net_ext.entry(sh.net).or_default().extend(e);
+        }
+    }
+    for (&net, objs) in &mut net_route {
+        let ext = net_ext.entry(net).or_default();
+        for f in std::mem::take(objs) {
+            if let crate::dr::cost::DrFig::Seg { layer, begin, end, begin_trunc, end_trunc, .. } = f {
+                let on_border = seg_on_border(route_box, begin, end);
+                if in_box(route_box, begin) && in_box(route_box, end) && (!on_border || (begin_trunc && end_trunc)) {
+                    if on_border {
+                        if let Some(term_at) = inp.term_at {
+                            for p in [begin, end] {
+                                for t in term_at(p, layer, net) {
+                                    net_terms.entry(net).or_default().insert((term_key(t), t));
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    ext.push(f);
+                }
+            }
+        }
+    }
     let mut guides: Vec<(usize, usize, P, P)> = Vec::new();
     for (l, tree) in inp.guides.iter().enumerate() {
         for v in tree.query(route_box) {
@@ -241,9 +287,10 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
         let terms: Vec<usize> = net_terms.get(&net).map_or(Vec::new(), |s| s.iter().map(|&(_, t)| t).collect());
         let g = net_guides.get(&net).cloned().unwrap_or_default();
         let bounds: Vec<(P, usize)> = boundary.get(&net).map_or(Vec::new(), |s| s.iter().copied().collect());
-        for (part_terms, part_bounds) in init_nets_init_dr_helper(inp, &terms, &g, &bounds) {
+        let ext = net_ext.remove(&net).unwrap_or_default();
+        for (part_terms, part_bounds, part_ext) in init_nets_init_dr_helper(inp, &terms, &g, &bounds, ext) {
             let id = out.len();
-            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box };
+            let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext: part_ext };
             init_net_term(inp, route_box, &mut dnet, &part_terms, &mut pin_cnt);
             // Boundary points, ordered (a map by point then layer), area 0 in the first iteration.
             let set: BTreeSet<(P, usize)> = part_bounds.into_iter().collect();
@@ -255,14 +302,87 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
         }
     }
     init_nets_num_pins_in(&mut out, ext_box);
+    if let Some((tech, _)) = inp.routes {
+        init_nets_boundary_area(tech, route_box, &mut out);
+    }
     out
+}
+
+/// Each boundary point's access area: the net's committed wires that start (or end) there and
+/// leave the route box, length × width; plus half the box of a via of the net (a patch's whole
+/// box) found AT THE POINT whose origin is the wire's far end (⛔ the reference searches the
+/// shapes at the point, not at the far end — so this adds only when the far end is the point).
+fn init_nets_boundary_area(tech: &crate::tech::Tech, rb: &Rect, nets: &mut [DrNet]) {
+    use crate::dr::cost::DrFig;
+    for net in nets.iter_mut() {
+        let ext = net.ext.clone();
+        for pin in net.pins.iter_mut() {
+            if pin.term.is_some() {
+                continue;
+            }
+            for ap in pin.patterns.iter_mut() {
+                let (bp, l) = (ap.point, ap.layer);
+                let q = Rect { xl: bp.0, yl: bp.1, xh: bp.0, yh: bp.1 };
+                // The net's shapes at the point on the layer, with their boxes there.
+                let mut here: Vec<(&DrFig, Rect)> = Vec::new();
+                for f in &ext {
+                    match f {
+                        DrFig::Via { via, origin, .. } => {
+                            let vd = &tech.via_defs[*via];
+                            let figs = if vd.layer1 == l { &vd.layer1_figs } else if vd.layer2 == l { &vd.layer2_figs } else if vd.cut == l { &vd.cut_figs } else { continue };
+                            for r in figs {
+                                let b = Rect { xl: r.xl + origin.0, yl: r.yl + origin.1, xh: r.xh + origin.0, yh: r.yh + origin.1 };
+                                if touches(&b, &q) {
+                                    here.push((f, b));
+                                }
+                            }
+                        }
+                        _ => {
+                            let (fl, b) = crate::dr::design::stored_box(tech, f);
+                            if fl == l && touches(&b, &q) {
+                                here.push((f, b));
+                            }
+                        }
+                    }
+                }
+                let mut area: i64 = 0;
+                for &(f, _) in &here {
+                    let DrFig::Seg { begin: psb, end: pse, width, .. } = *f else { continue };
+                    let len = i64::from((pse.0 - psb.0).abs() + (pse.1 - psb.1).abs());
+                    let far = if bp == psb && !in_box(rb, pse) {
+                        Some(pse)
+                    } else if !in_box(rb, psb) && bp == pse {
+                        Some(psb)
+                    } else {
+                        None
+                    };
+                    let Some(far) = far else { continue };
+                    area += len * i64::from(width);
+                    for &(g, b) in &here {
+                        match g {
+                            DrFig::Via { origin, .. } if *origin == far => {
+                                area += i64::from(b.dx()) * i64::from(b.dy()) / 2;
+                                break;
+                            }
+                            DrFig::Patch { origin, .. } if *origin == far => {
+                                area += i64::from(b.dx()) * i64::from(b.dy());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ap.begin_area = area;
+            }
+        }
+    }
 }
 
 /// A net's parts: its guides and terminals (terminals' boxes) that touch, depth first; parts
 /// without a guide dropped. One part (or none): everything. Several: each terminal to the part
 /// nearest it (its own part first), each boundary point to the part whose guide is nearest (plus
 /// the layer difference).
-fn init_nets_init_dr_helper(inp: &DrNetInput<'_>, terms: &[usize], guides: &[(usize, Rect)], bounds: &[(P, usize)]) -> Vec<NetPart> {
+fn init_nets_init_dr_helper(inp: &DrNetInput<'_>, terms: &[usize], guides: &[(usize, Rect)], bounds: &[(P, usize)], ext: Vec<crate::dr::cost::DrFig>) -> Vec<NetPart> {
     // Nodes: guides first, then terminals.
     let mut rects: Vec<Rect> = guides.iter().map(|g| g.1).collect();
     let n_guides = rects.len();
@@ -303,9 +423,9 @@ fn init_nets_init_dr_helper(inp: &DrNetInput<'_>, terms: &[usize], guides: &[(us
     }
     comps.retain(|c| c.iter().any(|&k| k < n_guides));
     if comps.len() <= 1 {
-        return vec![(terms.to_vec(), bounds.to_vec())];
+        return vec![(terms.to_vec(), bounds.to_vec(), ext)];
     }
-    let mut out: Vec<NetPart> = vec![(Vec::new(), Vec::new()); comps.len()];
+    let mut out: Vec<NetPart> = vec![(Vec::new(), Vec::new(), Vec::new()); comps.len()];
     for (i, &t) in terms.iter().enumerate() {
         let r = inp.terms[t].bbox;
         let (mut best_d, mut best) = (i64::MAX, None);
@@ -345,7 +465,114 @@ fn init_nets_init_dr_helper(inp: &DrNetInput<'_>, terms: &[usize], guides: &[(us
             out[j].1.push((pt, l));
         }
     }
+    // Each ext shape to the part whose guide it lies on (same layer, touching), else the nearest.
+    for f in ext {
+        if let Some(j) = obj_component(inp, &f, &comps, guides, n_guides) {
+            out[j].2.push(f);
+        }
+    }
     out
+}
+
+fn obj_component(inp: &DrNetInput<'_>, f: &crate::dr::cost::DrFig, comps: &[Vec<usize>], guides: &[(usize, Rect)], n_guides: usize) -> Option<usize> {
+    let (tech, _) = inp.routes?;
+    let (layer, rect, same_layer_hit) = match f {
+        crate::dr::cost::DrFig::Seg { layer, .. } | crate::dr::cost::DrFig::Patch { layer, .. } => (*layer, crate::dr::design::stored_box(tech, f).1, true),
+        crate::dr::cost::DrFig::Via { .. } => (usize::MAX, crate::dr::design::stored_box(tech, f).1, false),
+    };
+    let (mut best_d, mut best) = (i64::MAX, None);
+    for (j, comp) in comps.iter().enumerate() {
+        for &k in comp {
+            if k >= n_guides {
+                continue;
+            }
+            if same_layer_hit && guides[k].0 == layer && touches(&guides[k].1, &rect) {
+                return Some(j);
+            }
+            let d = sq_dist(&guides[k].1, &rect);
+            if d < best_d {
+                if !same_layer_hit && d == 0 {
+                    return Some(j);
+                }
+                best_d = d;
+                best = Some(j);
+            }
+        }
+    }
+    best
+}
+
+fn in_box(r: &Rect, p: P) -> bool {
+    p.0 >= r.xl && p.0 <= r.xh && p.1 >= r.yl && p.1 <= r.yh
+}
+
+fn seg_on_border(r: &Rect, b: P, e: P) -> bool {
+    if b.0 == e.0 {
+        b.0 == r.xl || b.0 == r.xh
+    } else {
+        b.1 == r.yl || b.1 == r.yh
+    }
+}
+
+/// A committed shape against the route box (the first iteration): a wire across it or on its
+/// low sides split into the parts before, inside and after it (a part that reaches into the box
+/// is a route part, its cut ends extending), one along the far side of it or wholly across its
+/// line outside it ext; a via or patch a route part when its origin is strictly inside.
+fn split_obj(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate::dr::cost::DrFig>, Vec<crate::dr::cost::DrFig>) {
+    use crate::dr::cost::DrFig;
+    let (mut route, mut ext) = (Vec::new(), Vec::new());
+    match *f {
+        DrFig::Seg { begin, end, .. } => {
+            let vertical = begin.0 == end.0;
+            let (c, clo, chi) = if vertical { (begin.0, rb.xl, rb.xh) } else { (begin.1, rb.yl, rb.yh) };
+            if c <= clo || chi <= c {
+                ext.push(f.clone());
+                return (route, ext);
+            }
+            let (bc, ec, bmin, bmax) = if vertical { (begin.1, end.1, rb.yl, rb.yh) } else { (begin.0, end.0, rb.xl, rb.xh) };
+            let part = |lo: i32, hi: i32, ext_begin: bool, ext_end: bool| -> DrFig {
+                let mut g = f.clone();
+                if let DrFig::Seg { begin: b, end: e, begin_trunc, end_trunc, .. } = &mut g {
+                    *b = if vertical { (c, lo) } else { (lo, c) };
+                    *e = if vertical { (c, hi) } else { (hi, c) };
+                    if ext_begin {
+                        *begin_trunc = false;
+                    }
+                    if ext_end {
+                        *end_trunc = false;
+                    }
+                }
+                g
+            };
+            if bc < bmin {
+                let ne = ec.min(bmin);
+                if ec < bmin {
+                    ext.push(part(bc, ne, false, false));
+                } else {
+                    route.push(part(bc, ne, false, ec != bmin));
+                }
+            }
+            if bc < bmax && ec > bmin {
+                route.push(part(bc.max(bmin), ec.min(bmax), bc < bmin, ec > bmax));
+            }
+            if ec > bmax {
+                let nb = bc.max(bmax);
+                if bc > bmax {
+                    ext.push(part(nb, ec, false, false));
+                } else {
+                    route.push(part(nb, ec, bc != bmax, false));
+                }
+            }
+        }
+        DrFig::Via { origin, .. } | DrFig::Patch { origin, .. } => {
+            if origin.0 > rb.xl && origin.0 < rb.xh && origin.1 > rb.yl && origin.1 < rb.yh {
+                route.push(f.clone());
+            } else {
+                ext.push(f.clone());
+            }
+        }
+    }
+    (route, ext)
 }
 
 /// Each terminal a pin: its pins' points (the instance's class) inside the route box, the chosen
@@ -444,6 +671,36 @@ pub fn grid_maps(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern],
         }
     }
     for net in nets {
+        // The net's committed shapes: a wire's ends and line, each via's point on its layers.
+        for f in &net.ext {
+            match *f {
+                crate::dr::cost::DrFig::Seg { layer: l, begin, end, .. } => {
+                    let l2 = non_pref_layer(tech, cfg, l).unwrap_or(l);
+                    if begin.0 == end.0 {
+                        let (lx, ly) = if tech.layers[l].is_horizontal() { (l2, l) } else { (l, l2) };
+                        xm.entry(Some(lx)).or_default().insert(begin.0, false);
+                        ym.entry(Some(ly)).or_default().insert(begin.1, false);
+                        ym.entry(Some(ly)).or_default().insert(end.1, false);
+                    } else {
+                        let (lx, ly) = if tech.layers[l].is_vertical() { (l, l2) } else { (l2, l) };
+                        xm.entry(Some(lx)).or_default().insert(begin.0, false);
+                        xm.entry(Some(lx)).or_default().insert(end.0, false);
+                        ym.entry(Some(ly)).or_default().insert(begin.1, false);
+                    }
+                }
+                crate::dr::cost::DrFig::Via { via, origin, .. } => {
+                    let vd = &tech.via_defs[via];
+                    for l in [vd.layer1, vd.layer2] {
+                        if tech.layers[l].is_horizontal() {
+                            ym.entry(Some(l)).or_default().insert(origin.1, false);
+                        } else {
+                            xm.entry(Some(l)).or_default().insert(origin.0, false);
+                        }
+                    }
+                }
+                crate::dr::cost::DrFig::Patch { .. } => {}
+            }
+        }
         for pin in &net.pins {
             for ap in &pin.patterns {
                 let mut l = ap.layer;
@@ -657,3 +914,32 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
 pub fn mt_safe_dist(ndrs: &[&crate::dr::rules::NdrRule]) -> i32 {
     ndrs.iter().flat_map(|n| n.spacings.iter().copied()).fold(2000, i32::max)
 }
+
+/// Each net's committed shapes placed on the worker's grid: a wire's ends (clamped into the
+/// extended box), a via's point on its two layers. A shape whose point the grid lacks keeps
+/// index 0 there.
+pub fn localize_ext(tech: &crate::tech::Tech, g: &GridGraph, ext_box: &Rect, nets: &mut [DrNet]) {
+    let ix = |v: &[i32], c: i32| v.binary_search(&c).unwrap_or(0);
+    for n in nets.iter_mut() {
+        for f in n.ext.iter_mut() {
+            match f {
+                crate::dr::cost::DrFig::Seg { layer, begin, end, bi, ei, .. } => {
+                    let b = (begin.0.max(ext_box.xl), begin.1.max(ext_box.yl));
+                    let e = (end.0.min(ext_box.xh), end.1.min(ext_box.yh));
+                    let z = g.zs.iter().position(|&l| l == *layer).unwrap_or(0);
+                    *bi = (ix(&g.xs, b.0), ix(&g.ys, b.1), z);
+                    *ei = (ix(&g.xs, e.0), ix(&g.ys, e.1), z);
+                }
+                crate::dr::cost::DrFig::Via { via, origin, bi, ei, .. } => {
+                    let vd = &tech.via_defs[*via];
+                    let z1 = g.zs.iter().position(|&l| l == vd.layer1).unwrap_or(0);
+                    let z2 = g.zs.iter().position(|&l| l == vd.layer2).unwrap_or(0);
+                    *bi = (ix(&g.xs, origin.0), ix(&g.ys, origin.1), z1);
+                    *ei = (ix(&g.xs, origin.0), ix(&g.ys, origin.1), z2);
+                }
+                crate::dr::cost::DrFig::Patch { .. } => {}
+            }
+        }
+    }
+}
+
