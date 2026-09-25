@@ -499,3 +499,102 @@ pub fn connectivity_check(d: &mut DesignRoutes, tech: &Tech, name: &dyn Fn(usize
     }
     Ok(())
 }
+
+/// A wire's gcells grown by one gcell at each end along its axis (not below the first gcell).
+fn segment_box(grid: &crate::dr::guides::GCellGrid, s: &conn::Seg) -> Rect {
+    let b = s.bbox();
+    let (mut ll, mut ur) = (grid.idx((b.xl, b.yl)), grid.idx((b.xh, b.yh)));
+    if s.begin.0 == s.end.0 {
+        ll.1 = (ll.1 - 1).max(0);
+        ur.1 += 1;
+    } else {
+        ll.0 = (ll.0 - 1).max(0);
+        ur.0 += 1;
+    }
+    let (a, z) = (grid.gcell_box(ll), grid.gcell_box(ur));
+    Rect { xl: a.xl, yl: a.yl, xh: z.xh, yh: z.yh }
+}
+
+/// A net's objects on `layer` touching `r`: its vias (by the metal on that layer), then its
+/// wires, then its patches, each list in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetObj {
+    Seg(usize),
+    Via(usize),
+    Patch(usize),
+}
+
+fn net_objs_overlapping(tech: &Tech, n: &NetShapes, layer: usize, r: &Rect) -> Vec<NetObj> {
+    let mut out = Vec::new();
+    let sh = |f: &Rect, o: P| Rect { xl: f.xl + o.0, yl: f.yl + o.1, xh: f.xh + o.0, yh: f.yh + o.1 };
+    let bbox = |figs: &[Rect], o: P| figs.iter().map(|f| sh(f, o)).reduce(|a, b| Rect { xl: a.xl.min(b.xl), yl: a.yl.min(b.yl), xh: a.xh.max(b.xh), yh: a.yh.max(b.yh) });
+    for (k, v) in n.vias.iter().enumerate() {
+        let Some(v) = v else { continue };
+        let vd = &tech.via_defs[v.via];
+        let hit = |l: usize, figs: &[Rect]| l == layer && bbox(figs, v.origin).is_some_and(|b| touches(&b, r));
+        if hit(vd.layer1, &vd.layer1_figs) || hit(vd.layer2, &vd.layer2_figs) || hit(vd.cut, &vd.cut_figs) {
+            out.push(NetObj::Via(k));
+        }
+    }
+    for (k, s) in n.segs.iter().enumerate() {
+        if let Some(s) = s {
+            if s.layer == layer && touches(&s.bbox(), r) {
+                out.push(NetObj::Seg(k));
+            }
+        }
+    }
+    for (k, p) in n.patches.iter().enumerate() {
+        if let Some(p) = p {
+            if p.layer == layer && touches(&sh(&p.offset, p.origin), r) {
+                out.push(NetObj::Patch(k));
+            }
+        }
+    }
+    out
+}
+
+fn add_obj_boxes(tech: &Tech, grid: &crate::dr::guides::GCellGrid, n: &NetShapes, o: NetObj, boxes: &mut Vec<Rect>, depth: u32) {
+    match o {
+        NetObj::Seg(k) => boxes.push(segment_box(grid, n.segs[k].as_ref().expect("a live wire"))),
+        NetObj::Via(k) => {
+            let origin = n.vias[k].as_ref().expect("a live via").origin;
+            for s in n.segs.iter().flatten() {
+                if s.begin == origin || s.end == origin {
+                    boxes.push(segment_box(grid, s));
+                }
+            }
+        }
+        NetObj::Patch(k) => {
+            if depth > 0 {
+                return;
+            }
+            let p = n.patches[k].as_ref().expect("a live patch");
+            let b = Rect { xl: p.offset.xl + p.origin.0, yl: p.offset.yl + p.origin.1, xh: p.offset.xh + p.origin.0, yh: p.offset.yh + p.origin.1 };
+            for q in net_objs_overlapping(tech, n, p.layer, &b) {
+                if q != o {
+                    add_obj_boxes(tech, grid, n, q, boxes, depth + 1);
+                }
+            }
+        }
+    }
+}
+
+/// The worker boxes for a marker no original guide covers: per source net that has guides
+/// (`guided`), its objects on the marker's layer touching it, each reduced to gcell boxes — a
+/// wire's grown one gcell along its axis, a via's connected wires', a patch's patched objects'
+/// (one level).
+pub fn off_guide_boxes(d: &DesignRoutes, tech: &Tech, grid: &crate::dr::guides::GCellGrid, m: &Marker, guided: &dyn Fn(&Owner) -> Option<usize>) -> Vec<Rect> {
+    let per = net_shapes(d);
+    let mut objs: Vec<(usize, NetObj)> = Vec::new();
+    for o in &m.owners {
+        let Some(net) = guided(o) else { continue };
+        if let Some((n, _)) = per.get(&net) {
+            objs.extend(net_objs_overlapping(tech, n, m.layer, &m.bbox).into_iter().map(|x| (net, x)));
+        }
+    }
+    let mut boxes = Vec::new();
+    for (net, o) in objs {
+        add_obj_boxes(tech, grid, &per[&net].0, o, &mut boxes, 0);
+    }
+    boxes
+}

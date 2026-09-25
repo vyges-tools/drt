@@ -239,6 +239,72 @@ pub fn written_back(iter: usize, ripup: RipUp, wm: &WorkerMarkers, best: usize) 
     !(iter > 0 && ripup == RipUp::All && best > 5 * wm.init_num)
 }
 
+/// Whether a box runs vertically (narrower than tall; a square counts horizontal).
+fn is_vertical(r: &Rect) -> bool {
+    r.xh - r.xl < r.yh - r.yl
+}
+
+fn touch(a: &Rect, b: &Rect) -> bool {
+    a.xh >= b.xl && a.xl <= b.xh && a.yh >= b.yl && a.yl <= b.yh
+}
+
+/// The guide-tiles flow's worker boxes: per marker (design order), per source net with original
+/// guides (`guides`), each of its guides touching the marker; a marker with a guided net that no
+/// guide covers takes `off_guide`'s boxes instead. Then boxes alike in direction that touch are
+/// merged, the scan starting over after each merge.
+pub fn guide_tile_boxes(markers: &[Marker], guides: &dyn Fn(&crate::gc::Owner) -> Option<Vec<Rect>>, off_guide: &dyn Fn(&Marker) -> Vec<Rect>) -> Vec<Rect> {
+    let mut boxes: Vec<Rect> = Vec::new();
+    for m in markers {
+        let (mut covered, mut guided) = (false, false);
+        for o in &m.owners {
+            let Some(g) = guides(o) else { continue };
+            if g.is_empty() {
+                continue;
+            }
+            guided = true;
+            for r in g {
+                if touch(&r, &m.bbox) {
+                    boxes.push(r);
+                    covered = true;
+                }
+            }
+        }
+        if guided && !covered {
+            boxes.extend(off_guide(m));
+        }
+    }
+    let mut i = 0;
+    while i < boxes.len() {
+        let mut j = i + 1;
+        while j < boxes.len() {
+            if is_vertical(&boxes[i]) == is_vertical(&boxes[j]) && touch(&boxes[i], &boxes[j]) {
+                let b = boxes.remove(j);
+                let a = &mut boxes[i];
+                (a.xl, a.yl, a.xh, a.yh) = (a.xl.min(b.xl), a.yl.min(b.yl), a.xh.max(b.xh), a.yh.max(b.yh));
+                j = i + 1;
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+    boxes
+}
+
+/// The tiles' batches: each box bloated by `bloat`, placed in the first batch none of whose boxes
+/// it touches, else a new batch.
+pub fn tile_batches(boxes: &[Rect], bloat: i32) -> Vec<Vec<usize>> {
+    let big: Vec<Rect> = boxes.iter().map(|b| Rect { xl: b.xl - bloat, yl: b.yl - bloat, xh: b.xh + bloat, yh: b.yh + bloat }).collect();
+    let mut batches: Vec<Vec<usize>> = Vec::new();
+    for (i, b) in big.iter().enumerate() {
+        match batches.iter_mut().find(|batch| batch.iter().all(|&k| !touch(b, &big[k]))) {
+            Some(batch) => batch.push(i),
+            None => batches.push(vec![i]),
+        }
+    }
+    batches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +360,18 @@ mod tests {
         f.last_effective = false;
         assert_eq!(f.next(18, &s[5], false), Flow::Stubborn);
         assert_eq!(f.next(18, &s[6], false), Flow::Skip);
+    }
+
+    /// Rule: boxes alike in direction that touch merge (the scan restarting); across directions
+    /// they stay apart; batches keep bloated boxes apart.
+    #[test]
+    fn guide_tiles_merge_and_batch() {
+        let o = Owner::Net("a".into());
+        let g = vec![Rect { xl: 0, yl: 0, xh: 100, yh: 10 }, Rect { xl: 90, yl: 0, xh: 200, yh: 10 }, Rect { xl: 0, yl: 0, xh: 10, yh: 300 }];
+        let m = Marker { rule: Rule::Short, layer: 4, bbox: Rect { xl: 5, yl: 5, xh: 95, yh: 6 }, owners: vec![o.clone()], victim: (o.clone(), 4, Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, false), aggressor: (o, 4, Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, false) };
+        let boxes = guide_tile_boxes(&[m], &|_| Some(g.clone()), &|_| Vec::new());
+        assert_eq!(boxes, vec![Rect { xl: 0, yl: 0, xh: 200, yh: 10 }, Rect { xl: 0, yl: 0, xh: 10, yh: 300 }]);
+        assert_eq!(tile_batches(&[Rect { xl: 0, yl: 0, xh: 10, yh: 10 }, Rect { xl: 30, yl: 0, xh: 40, yh: 10 }, Rect { xl: 100, yl: 0, xh: 110, yh: 10 }], 10), vec![vec![0, 2], vec![1]]);
     }
 
     /// Rule: a markers-driven row widens by the rounded increase, +2 after congestion, −0.2 else.

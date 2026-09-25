@@ -154,12 +154,18 @@ impl RouteRq {
     /// The bulk load: per net, its route shapes, then its committed ones.
     fn new(tech: &crate::tech::Tech, state: &[NetState]) -> RouteRq {
         let mut per: Vec<Vec<(Rect, RqRef)>> = Vec::new();
+        // A route shape's entries are ripped up with its net (a bulk-loaded entry's id is its place
+        // in its layer's load).
+        let mut ids: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
         for (ni, s) in state.iter().enumerate() {
             for (ext, figs) in [(false, &s.figs), (true, &s.ext)] {
                 for (k, f) in figs.iter().enumerate() {
                     for (l, r) in Self::rects(tech, f) {
                         while per.len() <= l {
                             per.push(Vec::new());
+                        }
+                        if !ext {
+                            ids.entry(ni).or_default().push((l, per[l].len()));
                         }
                         per[l].push((r, (ni, ext, k)));
                     }
@@ -168,7 +174,7 @@ impl RouteRq {
         }
         let n = tech.layers.len().max(per.len());
         per.resize(n, Vec::new());
-        RouteRq { trees: per.into_iter().map(DynRTree::new).collect(), ids: HashMap::new() }
+        RouteRq { trees: per.into_iter().map(DynRTree::new).collect(), ids }
     }
 
     fn add_net(&mut self, tech: &crate::tech::Tech, net: usize, figs: &[DrFig]) {
