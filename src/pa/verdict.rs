@@ -78,18 +78,34 @@ pub fn access_segment(layer: &Layer, begin: (i32, i32), end: (i32, i32)) -> Rect
 }
 
 fn check(tech: &Tech, target: &[TargetShape], point: (i32, i32), ap_layer: usize, trial: &[(usize, Rect)], owner: &Owner) -> Vec<Marker> {
-    let win = window(tech, point, ap_layer);
+    let trial: Vec<(&Owner, usize, Rect)> = trial.iter().map(|&(l, r)| (owner, l, r)).collect();
+    check_in(tech, target, window(tech, point, ap_layer), &trial)
+}
+
+/// The checks over `win`: the target's shapes that touch it, fixed; the trial's shapes, each with
+/// its own owner, not fixed.
+pub(crate) fn check_in(tech: &Tech, target: &[TargetShape], win: Rect, trial: &[(&Owner, usize, Rect)]) -> Vec<Marker> {
     let mut w = Worker::new(tech);
     for (o, layer, r) in target {
         if r.xl <= win.xh && win.xl <= r.xh && r.yl <= win.yh && win.yl <= r.yh {
             w.add(o, *layer, *r, true);
         }
     }
-    for &(layer, r) in trial {
+    for &(owner, layer, r) in trial {
         w.add(owner, layer, r, false);
     }
     w.init();
     w.run().to_vec()
+}
+
+/// A via's shapes on its three layers, at `at`.
+pub fn via_shapes(via: &ViaDef, at: (i32, i32)) -> Vec<(usize, Rect)> {
+    let sh = |r: &Rect| Rect::new(r.xl + at.0, r.yl + at.1, r.xh + at.0, r.yh + at.1);
+    let mut out: Vec<(usize, Rect)> = Vec::new();
+    out.extend(via.layer1_figs.iter().map(|r| (via.layer1, sh(r))));
+    out.extend(via.cut_figs.iter().map(|r| (via.cut, sh(r))));
+    out.extend(via.layer2_figs.iter().map(|r| (via.layer2, sh(r))));
+    out
 }
 
 /// A planar trial: the segment from the point to `end` on the access point's layer.
@@ -101,11 +117,7 @@ pub fn planar_markers(tech: &Tech, target: &[TargetShape], owner: &Owner, point:
 /// A via trial: the via at the point (its three layers' shapes), and the segment from the point
 /// to `end` on the via's OTHER metal layer.
 pub fn via_markers(tech: &Tech, target: &[TargetShape], owner: &Owner, point: (i32, i32), layer: usize, via: &ViaDef, end: (i32, i32)) -> Vec<Marker> {
-    let at = |r: &Rect| Rect::new(r.xl + point.0, r.yl + point.1, r.xh + point.0, r.yh + point.1);
-    let mut trial: Vec<(usize, Rect)> = Vec::new();
-    trial.extend(via.layer1_figs.iter().map(|r| (via.layer1, at(r))));
-    trial.extend(via.cut_figs.iter().map(|r| (via.cut, at(r))));
-    trial.extend(via.layer2_figs.iter().map(|r| (via.layer2, at(r))));
+    let mut trial = via_shapes(via, point);
     let other = if via.layer1 == layer { via.layer2 } else { via.layer1 };
     trial.push((other, access_segment(&tech.layers[other], point, end)));
     check(tech, target, point, layer, &trial, owner)

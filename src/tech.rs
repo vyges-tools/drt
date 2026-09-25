@@ -358,6 +358,12 @@ pub mod read {
     pub fn transform(db: &Db, inst: &str) -> Transform {
         Transform { orient: db.inst_get_orient(inst), origin: (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)) }
     }
+
+    /// The instance's placement location: the lower-left of its placed box — NOT the origin its
+    /// orientation is applied about (they differ for every flipped or rotated instance).
+    pub fn location(db: &Db, inst: &str) -> (i32, i32) {
+        (db.inst_get_location_x(inst), db.inst_get_location_y(inst))
+    }
 }
 
 #[cfg(test)]
