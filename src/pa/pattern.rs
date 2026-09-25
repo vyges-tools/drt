@@ -13,8 +13,8 @@
 //! Rules:
 //! - pins are sorted by the ROUNDED mean coordinate (half away from zero) of their access points
 //!   RELATIVE TO THE INSTANCE'S PLACEMENT LOCATION (its placed box's lower-left — not the origin
-//!   its orientation turns about; rounding half away from zero is not shift-invariant), then by pin index within its terminal; pins still tied keep
-//!   their terminal order (the sort is stable at these sizes);
+//!   its orientation turns about; rounding half away from zero is not shift-invariant), then
+//!   by pin index within its terminal, then by terminal order (instance-terminal ids);
 //! - an edge's cost is, in order: [`VIOLATION_COST`] if either end is a known violating access
 //!   point; 0 from the source or into the sink; [`VIOLATION_COST`] if the two vias (each end's,
 //!   when it has an up access) violate — a verdict cached per edge — or, the first time the edge is
@@ -147,7 +147,8 @@ pub fn prep_pattern_inst_helper(inst: &Instance<'_>, use_x: bool, patterns: &mut
         let coord = f64::from(if use_x { sx } else { sy }) / pin.aps.len() as f64;
         pins.push((coord.round() as i32, i));
     }
-    pins.sort_by_key(|&(c, i)| (c, inst.pins[i].pin));
+    // Instance-terminal ids run in terminal order, so `i` is the reference's third key.
+    pins.sort_by_key(|&(c, i)| (c, inst.pins[i].pin, i));
     trace.push(|| Event::Sorted { use_x, pins: pins.iter().map(|&(c, i)| (i, c)).collect() });
     let order: Vec<usize> = pins.iter().map(|&(_, i)| i).collect();
     let n = gen_patterns(inst, &order, patterns, trace);
