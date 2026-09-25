@@ -1230,7 +1230,8 @@ pub fn mt_safe_dist(ndrs: &[&crate::dr::rules::NdrRule]) -> i32 {
 pub fn localize_ext(tech: &crate::tech::Tech, g: &GridGraph, ext_box: &Rect, nets: &mut [DrNet]) {
     let ix = |v: &[i32], c: i32| v.binary_search(&c).unwrap_or(0);
     for n in nets.iter_mut() {
-        for f in n.ext.iter_mut() {
+        // Its committed shapes, ext and route alike.
+        for f in n.ext.iter_mut().chain(n.route.iter_mut()) {
             match f {
                 crate::dr::cost::DrFig::Seg { layer, begin, end, bi, ei, .. } => {
                     let b = (begin.0.max(ext_box.xl), begin.1.max(ext_box.yl));
