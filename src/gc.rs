@@ -66,6 +66,9 @@ pub enum Rule {
     CutSpacing,
     /// A line end closer than its end-of-line spacing to a facing edge.
     EolSpacing,
+    /// Left by the connectivity check between iterations where it removed or changed a net's
+    /// shape: the next iteration re-checks the worker it falls in (it is not itself a violation).
+    Recheck,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

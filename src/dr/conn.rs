@@ -115,6 +115,42 @@ pub struct NetShapes {
     pub patches: Vec<Option<Patch>>,
 }
 
+/// A shape of the net, by list index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ref {
+    Seg(usize),
+    Via(usize),
+    Patch(usize),
+}
+
+/// A change the check makes to the design, in order: taking a shape out of the design's region
+/// query, putting a wire in (with its geometry at that moment), dropping a shape from the net's
+/// list, appending a new wire to it, adding a marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Op {
+    Unindex(Ref),
+    IndexSeg(usize, Seg),
+    Drop(Ref),
+    AppendSeg(usize),
+    Marker(usize, Rect),
+}
+
+/// The check's changes by phase (the design applies each phase over every net before the next):
+/// the overlap splits, the overlap merges, the finish.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CheckLog {
+    pub split: Vec<Op>,
+    pub merge: Vec<Op>,
+    pub finish: Vec<Op>,
+}
+
+impl CheckLog {
+    /// The markers added, in order.
+    pub fn markers(&self) -> Vec<(usize, Rect)> {
+        self.finish.iter().filter_map(|o| if let Op::Marker(l, r) = o { Some((*l, *r)) } else { None }).collect()
+    }
+}
+
 /// A route object: a wire or via of the net, by list index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Obj {
@@ -132,14 +168,15 @@ struct Span {
 type ByTrack = Vec<BTreeMap<i32, Vec<usize>>>;
 
 /// The check of one net. `pins_at(point, layer)` gives the net's terms with a shape at the point
-/// on the layer, each by its order key (kind, then id). Returns the markers it adds, in order;
-/// an error when a term is left unreached.
-pub fn check_net<K: Ord + Clone>(tech: &Tech, net: &mut NetShapes, pins_at: &dyn Fn(P, usize) -> Vec<K>) -> Result<Vec<(usize, Rect)>, String> {
+/// on the layer, each by its order key (kind, then id). Returns its changes to the design, in
+/// order (the markers among them); an error when a term is left unreached.
+pub fn check_net<K: Ord + Clone>(tech: &Tech, net: &mut NetShapes, pins_at: &dyn Fn(P, usize) -> Vec<K>) -> Result<CheckLog, String> {
     let nl = tech.layers.len();
+    let mut log = CheckLog::default();
     let mut objs = init_route_objs(net);
     let (horz, vert) = organize_path_segs_by_layer_and_track(net, &objs, nl);
-    let found = find_segment_overlaps(net, &mut objs, &horz, &vert)?;
-    handle_segment_overlaps(net, &objs, &horz, &vert, &found);
+    let found = find_segment_overlaps(net, &mut objs, &horz, &vert, &mut log.split)?;
+    handle_segment_overlaps(net, &objs, &horz, &vert, &found, &mut log.merge);
     let objs = init_route_objs(net);
     let pin2ep = build_pin2ep_map(tech, net, &objs, pins_at);
     let (npins, mut node_map) = build_node_map(tech, net, &objs, &pin2ep, nl);
@@ -150,9 +187,15 @@ pub fn check_net<K: Ord + Clone>(tech: &Tech, net: &mut NetShapes, pins_at: &dyn
         return Err(format!("{} term(s) not reached", n - nr - reached));
     }
     let mut objs: Vec<Option<Obj>> = objs.into_iter().map(Some).collect();
-    let mut markers = Vec::new();
-    finish(tech, net, &mut objs, &visited, nr, n, &mut node_map, &mut markers)?;
-    Ok(markers)
+    finish(tech, net, &mut objs, &visited, nr, n, &mut node_map, &mut log.finish)?;
+    Ok(log)
+}
+
+fn seg_ref(o: Obj) -> usize {
+    match o {
+        Obj::Seg(k) => k,
+        Obj::Via(_) => unreachable!("a via where a wire is expected"),
+    }
 }
 
 fn seg(net: &NetShapes, o: Obj) -> &Seg {
@@ -197,13 +240,13 @@ struct Overlaps {
     vert: Vec<Vec<(Vec<usize>, Vec<Span>)>>,
 }
 
-fn find_segment_overlaps(net: &mut NetShapes, objs: &mut Vec<Obj>, horz: &ByTrack, vert: &ByTrack) -> Result<Overlaps, String> {
+fn find_segment_overlaps(net: &mut NetShapes, objs: &mut Vec<Obj>, horz: &ByTrack, vert: &ByTrack, log: &mut Vec<Op>) -> Result<Overlaps, String> {
     let mut out = Overlaps { horz: Vec::new(), vert: Vec::new() };
     for (by, dst) in [(horz, &mut out.horz), (vert, &mut out.vert)] {
         for tracks in by {
             let mut per = Vec::new();
             for indices in tracks.values() {
-                per.push(handle_overlaps_perform(net, objs, indices)?);
+                per.push(handle_overlaps_perform(net, objs, indices, log)?);
             }
             dst.push(per);
         }
@@ -211,28 +254,28 @@ fn find_segment_overlaps(net: &mut NetShapes, objs: &mut Vec<Obj>, horz: &ByTrac
     Ok(out)
 }
 
-fn handle_segment_overlaps(net: &mut NetShapes, objs: &[Obj], horz: &ByTrack, vert: &ByTrack, found: &Overlaps) {
+fn handle_segment_overlaps(net: &mut NetShapes, objs: &[Obj], horz: &ByTrack, vert: &ByTrack, found: &Overlaps, log: &mut Vec<Op>) {
     for (by, per, is_horz) in [(horz, &found.horz, true), (vert, &found.vert, false)] {
         for (l, tracks) in by.iter().enumerate() {
             for (t, &track) in tracks.keys().enumerate() {
                 let (victims, spans) = &per[l][t];
-                merge_commit(net, objs, victims, track, spans, is_horz);
+                merge_commit(net, objs, victims, track, spans, is_horz, log);
             }
         }
     }
 }
 
-fn handle_overlaps_perform(net: &mut NetShapes, objs: &mut Vec<Obj>, indices: &[usize]) -> Result<(Vec<usize>, Vec<Span>), String> {
+fn handle_overlaps_perform(net: &mut NetShapes, objs: &mut Vec<Obj>, indices: &[usize], log: &mut Vec<Op>) -> Result<(Vec<usize>, Vec<Span>), String> {
     let mut spans: Vec<(Span, usize)> = indices.iter().map(|&i| (Span { lo: seg(net, objs[i]).low(), hi: seg(net, objs[i]).high() }, i)).collect();
     spans.sort();
-    split_path_segs(net, objs, &mut spans)?;
+    split_path_segs(net, objs, &mut spans, log)?;
     Ok(merge_perform_helper(&spans))
 }
 
 /// Overlapping runs of a track's sorted spans: split points are the truncated ends strictly
 /// inside a run (not its first low, not its highest end), each run committed when the next span
 /// starts at or past the run's highest end.
-fn split_path_segs(net: &mut NetShapes, objs: &mut Vec<Obj>, spans: &mut Vec<(Span, usize)>) -> Result<(), String> {
+fn split_path_segs(net: &mut NetShapes, objs: &mut Vec<Obj>, spans: &mut Vec<(Span, usize)>, log: &mut Vec<Op>) -> Result<(), String> {
     let mut highest: Option<Obj> = None;
     let mut first = 0usize;
     let mut split_points: Vec<i32> = Vec::new();
@@ -246,7 +289,7 @@ fn split_path_segs(net: &mut NetShapes, objs: &mut Vec<Obj>, spans: &mut Vec<(Sp
         if highest.is_none_or(|h| curr.0.lo >= seg(net, h).high()) {
             if !split_points.is_empty() {
                 if let Some(h) = highest {
-                    split_path_segs_commit(net, objs, &mut split_points, h, first, &mut i, spans)?;
+                    split_path_segs_commit(net, objs, &mut split_points, h, first, &mut i, spans, log)?;
                 }
             }
             first = i;
@@ -277,7 +320,7 @@ fn split_path_segs(net: &mut NetShapes, objs: &mut Vec<Obj>, spans: &mut Vec<(Sp
     if !split_points.is_empty() {
         if let Some(h) = highest {
             let mut end = spans.len();
-            split_path_segs_commit(net, objs, &mut split_points, h, first, &mut end, spans)?;
+            split_path_segs_commit(net, objs, &mut split_points, h, first, &mut end, spans, log)?;
         }
     }
     Ok(())
@@ -286,7 +329,8 @@ fn split_path_segs(net: &mut NetShapes, objs: &mut Vec<Obj>, spans: &mut Vec<(Sp
 /// One run's splits: the run's wires with a split point strictly inside are re-cut to the
 /// consecutive pieces between split points (the last reaching the run's highest end with its end
 /// style); pieces left over become new bare wires appended to the net; the run re-sorted.
-fn split_path_segs_commit(net: &mut NetShapes, objs: &mut Vec<Obj>, split_points: &mut Vec<i32>, highest: Obj, first: usize, i: &mut usize, spans: &mut Vec<(Span, usize)>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn split_path_segs_commit(net: &mut NetShapes, objs: &mut Vec<Obj>, split_points: &mut Vec<i32>, highest: Obj, first: usize, i: &mut usize, spans: &mut Vec<(Span, usize)>, log: &mut Vec<Op>) -> Result<(), String> {
     split_points.sort();
     let h = seg(net, highest).clone();
     if split_points.last() == Some(&h.high()) {
@@ -299,6 +343,8 @@ fn split_path_segs_commit(net: &mut NetShapes, objs: &mut Vec<Obj>, split_points
         let mut s = 0usize;
         while s <= split_points.len() && cur < split_span_idxs.len() {
             let k = split_span_idxs[cur];
+            let sk = seg_ref(objs[spans[k].1]);
+            log.push(Op::Unindex(Ref::Seg(sk)));
             let ps = seg_mut(net, objs[spans[k].1]);
             if s != 0 {
                 spans[k].0.lo = split_points[s - 1];
@@ -319,6 +365,7 @@ fn split_path_segs_commit(net: &mut NetShapes, objs: &mut Vec<Obj>, split_points
                 ps.set_high(split_points[s]);
                 (ps.end_trunc, ps.end_ext) = (true, 0);
             }
+            log.push(Op::IndexSeg(sk, ps.clone()));
             s += 1;
             cur += 1;
         }
@@ -332,8 +379,12 @@ fn split_path_segs_commit(net: &mut NetShapes, objs: &mut Vec<Obj>, split_points
             spans.insert(*i, (Span { lo, hi }, objs.len()));
             *i += 1;
             let (begin, end) = if h.is_vertical() { ((h.begin.0, lo), (h.begin.0, hi)) } else { ((lo, h.begin.1), (hi, h.begin.1)) };
-            objs.push(Obj::Seg(net.segs.len()));
-            net.segs.push(Some(Seg { layer: h.layer, begin, end, width: 0, begin_trunc: true, begin_ext: 0, end_trunc: hi_trunc, end_ext: 0, tapered: false }));
+            let nk = net.segs.len();
+            objs.push(Obj::Seg(nk));
+            let piece = Seg { layer: h.layer, begin, end, width: 0, begin_trunc: true, begin_ext: 0, end_trunc: hi_trunc, end_ext: 0, tapered: false };
+            net.segs.push(Some(piece.clone()));
+            log.push(Op::AppendSeg(nk));
+            log.push(Op::IndexSeg(nk, piece));
             s += 1;
         }
         spans[first..*i].sort();
@@ -374,13 +425,14 @@ fn merge_perform_helper(spans: &[(Span, usize)]) -> (Vec<usize>, Vec<Span>) {
 
 /// Each run merges into its first victim (stretched to the run's span); the victims after it up
 /// to the span's end are removed, the highest-reaching one's end style kept.
-fn merge_commit(net: &mut NetShapes, objs: &[Obj], victims: &[usize], track: i32, new_spans: &[Span], is_horz: bool) {
+fn merge_commit(net: &mut NetShapes, objs: &[Obj], victims: &[usize], track: i32, new_spans: &[Span], is_horz: bool, log: &mut Vec<Op>) {
     if victims.is_empty() {
         return;
     }
     let mut cnt = 0usize;
     for ns in new_spans {
         let vo = objs[victims[cnt]];
+        log.push(Op::Unindex(Ref::Seg(seg_ref(vo))));
         let mut high = seg(net, vo).high();
         let (b, e) = if is_horz { ((ns.lo, track), (ns.hi, track)) } else { ((track, ns.lo), (track, ns.hi)) };
         {
@@ -399,12 +451,15 @@ fn merge_commit(net: &mut NetShapes, objs: &[Obj], victims: &[usize], track: i32
                 (end_trunc, end_ext, high) = (c.end_trunc, c.end_ext, c.high());
             }
             if let Obj::Seg(k) = co {
+                log.push(Op::Unindex(Ref::Seg(k)));
+                log.push(Op::Drop(Ref::Seg(k)));
                 net.segs[k] = None;
             }
             cnt += 1;
         }
         let v = seg_mut(net, vo);
         (v.end_trunc, v.end_ext) = (end_trunc, end_ext);
+        log.push(Op::IndexSeg(seg_ref(vo), v.clone()));
     }
 }
 
@@ -609,7 +664,7 @@ fn astar(net: &NetShapes, node_map: &BTreeMap<Node, BTreeSet<usize>>, objs: &[Ob
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish(tech: &Tech, net: &mut NetShapes, objs: &mut [Option<Obj>], visited: &[bool], g: usize, n: usize, node_map: &mut BTreeMap<Node, BTreeSet<usize>>, markers: &mut Vec<(usize, Rect)>) -> Result<(), String> {
+fn finish(tech: &Tech, net: &mut NetShapes, objs: &mut [Option<Obj>], visited: &[bool], g: usize, n: usize, node_map: &mut BTreeMap<Node, BTreeSet<usize>>, log: &mut Vec<Op>) -> Result<(), String> {
     let mut reverse: BTreeMap<usize, BTreeSet<Node>> = BTreeMap::new();
     for (pr, idxs) in node_map.iter() {
         for &i in idxs {
@@ -632,13 +687,14 @@ fn finish(tech: &Tech, net: &mut NetShapes, objs: &mut [Option<Obj>], visited: &
         match objs[i] {
             Some(Obj::Seg(k)) => {
                 let s = net.segs[k].take().expect("a live wire");
-                markers.push((s.layer, s.bbox()));
+                log.extend([Op::Marker(s.layer, s.bbox()), Op::Unindex(Ref::Seg(k)), Op::Drop(Ref::Seg(k))]);
             }
             Some(Obj::Via(k)) => {
                 let v = net.vias[k].take().expect("a live via");
                 let vd = &tech.via_defs[v.via];
                 let b = vd.layer1_bbox();
-                markers.push((vd.layer1, Rect { xl: b.xl + v.origin.0, yl: b.yl + v.origin.1, xh: b.xh + v.origin.0, yh: b.yh + v.origin.1 }));
+                log.push(Op::Marker(vd.layer1, Rect { xl: b.xl + v.origin.0, yl: b.yl + v.origin.1, xh: b.xh + v.origin.0, yh: b.yh + v.origin.1 }));
+                log.extend([Op::Unindex(Ref::Via(k)), Op::Drop(Ref::Via(k))]);
             }
             None => {}
         }
@@ -710,11 +766,15 @@ fn finish(tech: &Tech, net: &mut NetShapes, objs: &mut [Option<Obj>], visited: &
         let mut ps2 = ps1.clone();
         let k2 = net.segs.len();
         added.push(k2);
+        log.push(Op::AppendSeg(k2));
+        log.push(Op::Unindex(Ref::Seg(k1)));
         let s1 = net.segs[k1].as_mut().expect("a live wire");
         (s1.end_trunc, s1.end_ext) = (true, 0);
         s1.end = split;
+        log.push(Op::IndexSeg(k1, s1.clone()));
         (ps2.begin_trunc, ps2.begin_ext) = (true, 0);
         ps2.begin = split;
+        log.push(Op::IndexSeg(k2, ps2.clone()));
         net.segs.push(Some(ps2));
     }
     // Every wire shrinks to its outermost shared node.
@@ -732,8 +792,9 @@ fn finish(tech: &Tech, net: &mut NetShapes, objs: &mut [Option<Obj>], visited: &
         let (Some(min), Some(max)) = (pts.iter().next(), pts.iter().next_back()) else { continue };
         let s = net.segs[k].as_mut().expect("a live wire");
         if s.begin < min.0 || max.0 < s.end {
-            markers.push((s.layer, s.bbox()));
+            log.extend([Op::Marker(s.layer, s.bbox()), Op::Unindex(Ref::Seg(k))]);
             (s.begin, s.end) = (min.0, max.0);
+            log.push(Op::IndexSeg(k, s.clone()));
         }
     }
     // Patches off every remaining wire end and via layer.
@@ -747,11 +808,11 @@ fn finish(tech: &Tech, net: &mut NetShapes, objs: &mut [Option<Obj>], visited: &
         valid.insert((v.origin, vd.layer1));
         valid.insert((v.origin, vd.layer2));
     }
-    for p in net.patches.iter_mut() {
+    for (k, p) in net.patches.iter_mut().enumerate() {
         let Some(pw) = p else { continue };
         if !valid.contains(&(pw.origin, pw.layer)) {
             let o = pw.offset;
-            markers.push((pw.layer, Rect { xl: o.xl + pw.origin.0, yl: o.yl + pw.origin.1, xh: o.xh + pw.origin.0, yh: o.yh + pw.origin.1 }));
+            log.extend([Op::Marker(pw.layer, Rect { xl: o.xl + pw.origin.0, yl: o.yl + pw.origin.1, xh: o.xh + pw.origin.0, yh: o.yh + pw.origin.1 }), Op::Unindex(Ref::Patch(k)), Op::Drop(Ref::Patch(k))]);
             *p = None;
         }
     }
@@ -770,7 +831,7 @@ mod tests {
         let t = crate::gc::tests::tech();
         let mut n = NetShapes { segs, vias: Vec::new(), patches: Vec::new() };
         let pins_at = |p: P, l: usize| -> Vec<usize> { pins.iter().filter(|(q, _)| l == 4 && *q == p).map(|(_, k)| *k).collect() };
-        let m = check_net(&t, &mut n, &pins_at).expect("connected");
+        let m = check_net(&t, &mut n, &pins_at).expect("connected").markers();
         (n, m)
     }
 
@@ -881,7 +942,7 @@ mod tests {
         let mut n = NetShapes { segs: vec![h(0, 100, true, true)], vias: Vec::new(), patches: vec![Some(on.clone()), Some(off)] };
         let pins = [((0, 0), 0), ((100, 0), 1)];
         let pins_at = |p: P, _l: usize| -> Vec<usize> { pins.iter().filter(|(q, _)| *q == p).map(|(_, k)| *k).collect() };
-        let m = check_net(&t, &mut n, &pins_at).expect("connected");
+        let m = check_net(&t, &mut n, &pins_at).expect("connected").markers();
         assert_eq!(n.patches, vec![Some(on), None]);
         assert_eq!(m, vec![(4, Rect { xl: 40, yl: -10, xh: 60, yh: 10 })]);
     }
