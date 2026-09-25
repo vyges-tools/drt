@@ -6,11 +6,13 @@ use vyges_drt::pa::{db as padb, flow};
 use vyges_drt::tech::read;
 use vyges_opendb::Db;
 
-const USAGE: &str = "vyges-drt — detailed routing: pin access
+const USAGE: &str = "vyges-drt — detailed routing
 
 USAGE:
   vyges-drt pin_access (--db IN.odb | --lef A.lef [--lef B.lef …] --def D.def)
                        [--max-routing-layer LAYER] --out OUT.odb [-o REPORT.json]
+  vyges-drt detailed_route --db IN.odb [--via-access-layer LAYER] --out OUT.def|OUT.odb
+                       [-o REPORT.json]
   vyges-drt --describe
   vyges-drt --help
   vyges-drt --version
@@ -21,17 +23,25 @@ access pattern per class and one per instance along each row of abutting cells, 
 results into the database: every master pin's access points, each routed instance terminal's
 preferred points, each single-pin port's points. The report (JSON) goes to stdout.
 
+detailed_route routes the design on its route guides: pin access, guide processing, track
+assignment, then search-and-repair iterations until no design-rule marker stands, and writes the
+routes (a DEF or a database). The routing layers are the block's minimum and maximum routing
+layers as the database holds them; the non-default rules are the database's.
+
 OPTIONS:
   --db IN.odb                 read the design from a database
   --lef FILE / --def FILE     or from LEF files and a DEF
   --max-routing-layer LAYER   set the block's maximum routing layer first (as a
                               signal-layer range ending at LAYER does)
+  --via-access-layer LAYER    detailed_route: the via-access layer (default the second
+                              routing layer)
   --out OUT.odb               write the database here
   -o FILE                     write the JSON report to FILE instead of stdout
   --describe                  print a machine-readable JSON description of the command
 
 EXIT STATUS:
-  0  written   access points computed and the database written
+  0  written   access points computed (or the design routed clean) and the output written
+  1  markers   detailed_route: routing ended with design-rule markers standing; written
   2  vacuous   nothing to access: no routed instance terminal and no routed port. NOT a pass;
                nothing is written
   2  error     usage, unreadable input
@@ -85,10 +95,11 @@ struct Args {
     out: Option<String>,
     report: Option<String>,
     max_layer: Option<String>,
+    via_access: Option<String>,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
-    let mut a = Args { lefs: Vec::new(), def: None, db: None, out: None, report: None, max_layer: None };
+    let mut a = Args { lefs: Vec::new(), def: None, db: None, out: None, report: None, max_layer: None, via_access: None };
     let mut it = args.iter();
     while let Some(k) = it.next() {
         let v = it.next()?.clone();
@@ -99,6 +110,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "--out" => a.out = Some(v),
             "-o" => a.report = Some(v),
             "--max-routing-layer" => a.max_layer = Some(v),
+            "--via-access-layer" => a.via_access = Some(v),
             _ => return None,
         }
     }
@@ -131,6 +143,39 @@ struct Outcome {
 
 fn fail(status: &'static str, code: u8, reason: String) -> Outcome {
     Outcome { status, code, fields: vec![("reason", json_str(&reason))] }
+}
+
+fn route(a: &Args) -> Outcome {
+    let Some(p) = &a.db else { return fail("error", 2, "detailed_route reads a database (--db)".into()) };
+    let mut db = match Db::open(p) {
+        Ok(d) => d,
+        Err(e) => return fail("error", 2, e.to_string()),
+    };
+    let tech = match read::tech(&db) {
+        Ok(t) => t,
+        Err(e) => return fail("error", 2, e.to_string()),
+    };
+    let mut opts = vyges_drt::dr::run::Options::default();
+    if let Some(l) = &a.via_access {
+        match tech.layer_num(l) {
+            Some(n) => opts.via_access_layer = Some(n),
+            None => return fail("error", 2, format!("no layer {l}")),
+        }
+    }
+    let s = match vyges_drt::dr::run::detailed_route(&mut db, &tech, &opts) {
+        Ok(s) => s,
+        Err(e) => return fail("refused", 3, e),
+    };
+    let out = a.out.as_ref().expect("--out");
+    let written = if out.ends_with(".def") { db.write_def(out) } else { db.write(out) };
+    if let Err(e) = written {
+        return fail("error", 2, e.to_string());
+    }
+    Outcome {
+        status: if s.markers == 0 { "written" } else { "markers" },
+        code: u8::from(s.markers > 0),
+        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("nets_written", s.nets_written.to_string())],
+    }
 }
 
 fn run(a: &Args) -> Outcome {
@@ -228,7 +273,7 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             return ExitCode::SUCCESS;
         }
-        Some("pin_access") => {}
+        Some("pin_access") | Some("detailed_route") => {}
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
@@ -238,7 +283,7 @@ fn main() -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    let o = run(&a);
+    let o = if args[0] == "detailed_route" { route(&a) } else { run(&a) };
     let mut report = format!("{{\"tool\":\"drt\",\"status\":{}", json_str(o.status));
     for (k, v) in &o.fields {
         report.push_str(&format!(",\"{k}\":{v}"));
