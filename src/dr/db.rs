@@ -138,3 +138,167 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
     }
     Ok(TaDesign { nets, net_index, fixed, owners })
 }
+
+/// The routed design written into the database, net by net (routed nets, database order): each
+/// net's routing replaced by its committed shapes — its wires in list order, then its vias, then
+/// its patches — as paths: a wire on its layer (with the net's rule unless tapered), each end a
+/// point carrying its extension when it is truncated (0) or differs from half the layer's width;
+/// a via at its origin (a technology via by name, else the router's via written as a default
+/// block via the first time it is used: its above, cut, then below rectangles); a patch as a
+/// rectangle about its origin. Then [`port_stacks`], appended to their nets' wires. `tech_vias`:
+/// how many of the technology's vias come from the database (the rest the router made).
+///
+/// ⚠️ Divergence, refused nowhere yet: the reference first removes every non-FIXED wire of EVERY
+/// net and keeps FIXED ones; here only the nets written are replaced (a FIXED wire included).
+pub fn write_routes(db: &mut Db, tech: &Tech, tech_vias: usize, d: &crate::dr::design::DesignRoutes, names: &[String], has_ndr: &dyn Fn(usize) -> bool) -> Result<(), String> {
+    let per = crate::dr::design::net_shapes(d);
+    let mut wires: std::collections::BTreeMap<usize, NetWire> = std::collections::BTreeMap::new();
+    for (&net, (shapes, _)) in &per {
+        let ndr = has_ndr(net);
+        let w = wires.entry(net).or_default();
+        let point = |ops: &mut Vec<i32>, p: (i32, i32), trunc: bool, ext: i32, half: i32| {
+            if trunc {
+                ops.extend([2, p.0, p.1, 0]);
+            } else if ext != half {
+                ops.extend([2, p.0, p.1, ext]);
+            } else {
+                ops.extend([1, p.0, p.1]);
+            }
+        };
+        for s in shapes.segs.iter().flatten() {
+            let l = &tech.layers[s.layer];
+            let li = w.name(&l.name);
+            w.ops.extend([0, li, i32::from(ndr && !s.tapered)]);
+            point(&mut w.ops, s.begin, s.begin_trunc, s.begin_ext, l.width / 2);
+            point(&mut w.ops, s.end, s.end_trunc, s.end_ext, l.width / 2);
+            w.wires += 1;
+        }
+        for v in shapes.vias.iter().flatten() {
+            let vd = &tech.via_defs[v.via];
+            let li = w.name(&tech.layers[vd.layer1].name);
+            w.ops.extend([0, li, i32::from(ndr && !v.tapered)]);
+            w.ops.extend([1, v.origin.0, v.origin.1]);
+            w.via_points.insert(v.origin);
+            let vi = w.name(&vd.name);
+            if v.via < tech_vias {
+                w.ops.extend([3, vi]);
+            } else {
+                let mut boxes: Vec<i32> = Vec::new();
+                for (tag, figs) in [(2, &vd.layer2_figs), (1, &vd.cut_figs), (0, &vd.layer1_figs)] {
+                    for r in figs {
+                        boxes.extend([tag, r.xl, r.yl, r.xh, r.yh]);
+                    }
+                }
+                db.block_create_via(&vd.name, (&tech.layers[vd.layer1].name, &tech.layers[vd.cut].name, &tech.layers[vd.layer2].name), &boxes).map_err(|e| e.to_string())?;
+                w.ops.extend([4, vi]);
+            }
+            w.vias += 1;
+        }
+        for p in shapes.patches.iter().flatten() {
+            let li = w.name(&tech.layers[p.layer].name);
+            w.ops.extend([0, li, 0]);
+            w.ops.extend([1, p.origin.0, p.origin.1]);
+            w.ops.extend([5, p.offset.xl, p.offset.yl, p.offset.xh, p.offset.yh]);
+            w.wires += 1;
+        }
+    }
+    port_stacks(db, tech, tech_vias, names, &mut wires)?;
+    for (net, w) in &wires {
+        db.net_write_wire(&names[*net], &w.ops, &w.names).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// One net's wire as written: its encoding ops, the names they index, and what the reference
+/// counts of it — wire shapes (segments and rectangles), vias, and the distinct points its via
+/// paths start at.
+#[derive(Default)]
+struct NetWire {
+    ops: Vec<i32>,
+    names: Vec<String>,
+    wires: usize,
+    vias: usize,
+    via_points: std::collections::BTreeSet<(i32, i32)>,
+}
+
+impl NetWire {
+    fn name(&mut self, n: &str) -> i32 {
+        if let Some(k) = self.names.iter().position(|x| x == n) {
+            return k as i32;
+        }
+        self.names.push(n.to_string());
+        (self.names.len() - 1) as i32
+    }
+}
+
+/// After the routes, a via stack from the top routing layer up to each port wholly above it
+/// (only when the block's maximum routing layer is set; ports in database order, not on special
+/// nets), appended to its net's wire: a path on the top routing layer at [`best_via_position`] in
+/// the port's first pin, then each cut layer's default via up to the port's lowest layer. A net
+/// whose wire is vias alone, at as many distinct points as it has ports above, is already stacked
+/// and left alone.
+fn port_stacks(db: &Db, tech: &Tech, tech_vias: usize, names: &[String], wires: &mut std::collections::BTreeMap<usize, NetWire>) -> Result<(), String> {
+    use crate::pa::stack::{best_via_position, default_via};
+    if db.block_get_max_routing_layer() < 0 {
+        return Ok(());
+    }
+    let cfg = crate::pa::db::config(db, tech);
+    let top = cfg.top_routing_layer;
+    let tracks = crate::tech::read::tracks(db, tech).map_err(|e| e.to_string())?;
+    let level = |l: i64| db.layer_get_routing_level(&db.layer_name_by_number(l));
+    let top_level = db.layer_get_routing_level(&tech.layers[top].name);
+    // A port's lowest routing level, and its first pin's box.
+    let port = |term: &str| -> Result<(i32, Option<Rect>), String> {
+        let mut bottom = i32::MAX;
+        let mut first: Option<Rect> = None;
+        for p in 0..db.num_bterm_get_b_pins(term) {
+            let boxes = db.bpin_layer_boxes(term, p).map_err(|e| e.to_string())?;
+            for &(l, ..) in &boxes {
+                bottom = bottom.min(level(l));
+            }
+            if p == 0 {
+                first = boxes.iter().map(|&(_, x0, y0, x1, y1)| Rect::new(x0, y0, x1, y1)).reduce(|a, r| Rect::new(a.xl.min(r.xl), a.yl.min(r.yl), a.xh.max(r.xh), a.yh.max(r.yh)));
+            }
+        }
+        Ok((bottom, first))
+    };
+    let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
+    for term in db.bterm_names() {
+        let net = db.bterm_get_net(&term);
+        if net.is_empty() {
+            return Err(format!("port {term} has no net (the reference dereferences it)"));
+        }
+        if db.net_is_special(&net) {
+            continue;
+        }
+        let (bottom, first) = port(&term)?;
+        if bottom == i32::MAX || bottom <= top_level {
+            continue;
+        }
+        let n_above = db.net_bterms(&net).iter().map(|t| port(t).map(|(b, _)| b != i32::MAX && b > top_level)).collect::<Result<Vec<bool>, String>>()?.into_iter().filter(|&a| a).count();
+        let Some(&ni) = index.get(net.as_str()) else { return Err(format!("net {net} not in the design")) };
+        let w = wires.entry(ni).or_default();
+        if w.wires == 0 && w.vias > 0 && w.via_points.len() == n_above {
+            continue;
+        }
+        let pin_rect = first.unwrap_or(Rect { xl: 0, yl: 0, xh: 0, yh: 0 });
+        let at = best_via_position(tech, &tracks, top, pin_rect);
+        let li = w.name(&tech.layers[top].name);
+        w.ops.extend([0, li, 0, 1, at.0, at.1]);
+        w.via_points.insert(at);
+        for lvl in top_level..bottom {
+            // The cut above routing level `lvl`: the technology's layers alternate routing, cut.
+            let cut = top + 1 + 2 * (lvl - top_level) as usize;
+            let via = default_via(tech, cut, top).filter(|&v| v < tech_vias).ok_or_else(|| format!("port {term}: no technology default via on {}", tech.layers.get(cut).map_or("?", |l| l.name.as_str())))?;
+            let vi = w.name(&tech.via_defs[via].name);
+            w.ops.extend([3, vi]);
+            w.vias += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The gcell grid the routing used, written to the database (one uniform pattern per axis).
+pub fn write_gcell_grid(db: &mut Db, grid: &crate::dr::guides::GCellGrid) -> Result<(), String> {
+    db.block_set_gcell_grid(grid.x, grid.y).map_err(|e| e.to_string())
+}
