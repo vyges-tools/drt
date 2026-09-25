@@ -78,9 +78,11 @@ pub struct Marker {
     pub bbox: Rect,
     /// The owners involved, sorted, without repeats.
     pub owners: Vec<Owner>,
-    /// The checked shape's owner (layer, rectangle, fixed) and the other's.
-    pub victim: (Owner, usize, Rect, bool),
-    pub aggressor: (Owner, usize, Rect, bool),
+    /// The checked shape's owner (layer, rectangle, fixed) and the other's — the check's own
+    /// markers only: a COPY keeps its sources but not its sides (the design's markers and a
+    /// worker's starting markers are copies).
+    pub victim: Option<Side>,
+    pub aggressor: Option<Side>,
 }
 
 /// The markers' final order: each run of consecutive markers alike in layer, rule, x extent and
@@ -97,6 +99,16 @@ pub fn normalize_marker_order(markers: &mut [Marker]) {
         }
         markers[begin..end].sort_by(|a, b| a.bbox.yl.cmp(&b.bbox.yl).then(b.bbox.yh.cmp(&a.bbox.yh)).then(area(&b.bbox).cmp(&area(&a.bbox))));
         begin = end;
+    }
+}
+
+/// A marker side: its owner, layer, rectangle, and whether the shape is fixed.
+pub type Side = (Owner, usize, Rect, bool);
+
+impl Marker {
+    /// A copy as the design and a worker's starting list hold it: its sources, not its sides.
+    pub fn copied(&self) -> Marker {
+        Marker { victim: None, aggressor: None, ..self.clone() }
     }
 }
 
@@ -675,7 +687,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, layer, rule, owners.clone())) {
             let victim = (self.owner(v.0).clone(), layer, v.1, v.2);
             let aggressor = (self.owner(g.0).clone(), layer, g.1, g.2);
-            self.markers.push(Marker { rule, layer, bbox, owners, victim, aggressor });
+            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
         }
     }
 
@@ -1301,7 +1313,7 @@ pub(crate) mod tests {
     fn marker_at(yl: i32, yh: i32, xh: i32) -> Marker {
         let o = Owner::Net("a".into());
         let r = Rect { xl: 0, yl, xh, yh };
-        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: (o.clone(), 4, r, false), aggressor: (o, 4, r, false) }
+        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o, 4, r, false)) }
     }
 
     /// Rule: a run of consecutive markers alike in layer, rule, x extent and owners is re-sorted by

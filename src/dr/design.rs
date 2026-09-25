@@ -234,9 +234,10 @@ pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
     for k in d.marker_ids_in(&wb.drc_box) {
         d.remove_marker(k);
     }
+    // The design keeps copies (sources, not sides).
     for m in wb.markers {
         if touches(&m.bbox, &wb.drc_box) {
-            d.add_marker(m.clone());
+            d.add_marker(m.copied());
         }
     }
 }
@@ -469,7 +470,7 @@ pub fn apply_check_ops(d: &mut DesignRoutes, tech: &Tech, net: usize, name: &str
             }
             Op::Marker(l, r) => {
                 let o = Owner::Net(name.to_string());
-                d.add_marker(Marker { rule: Rule::Recheck, layer: *l, bbox: *r, owners: vec![o.clone()], victim: (o.clone(), *l, *r, false), aggressor: (o, *l, *r, false) });
+                d.add_marker(Marker { rule: Rule::Recheck, layer: *l, bbox: *r, owners: vec![o.clone()], victim: Some((o.clone(), *l, *r, false)), aggressor: Some((o, *l, *r, false)) });
             }
         }
     }

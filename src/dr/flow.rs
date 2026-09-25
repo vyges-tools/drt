@@ -211,7 +211,7 @@ pub struct WorkerMarkers {
 /// The worker's markers from the design's in its check box (`iter`: 0-based).
 pub fn worker_markers(in_drc: Vec<Marker>, iter: usize) -> WorkerMarkers {
     let need_recheck = in_drc.iter().any(|m| m.rule == Rule::Recheck);
-    let markers: Vec<Marker> = in_drc.into_iter().filter(|m| m.rule != Rule::Recheck).collect();
+    let markers: Vec<Marker> = in_drc.into_iter().filter(|m| m.rule != Rule::Recheck).map(|m| m.copied()).collect();
     let init_num = if iter <= 1 && markers.is_empty() { 1 } else { markers.len() };
     WorkerMarkers { markers, need_recheck, init_num }
 }
@@ -313,7 +313,7 @@ mod tests {
     fn marker(rule: Rule, x: i32) -> Marker {
         let o = Owner::Net("a".into());
         let r = Rect { xl: x, yl: 0, xh: x + 10, yh: 10 };
-        Marker { rule, layer: 4, bbox: r, owners: vec![o.clone()], victim: (o.clone(), 4, r, false), aggressor: (o, 4, r, false) }
+        Marker { rule, layer: 4, bbox: r, owners: vec![o.clone()], victim: None, aggressor: None }
     }
 
     /// Rule: 65 rows; the first three rip everything up; row 3 is the first markers-driven one
@@ -336,6 +336,18 @@ mod tests {
         assert!(worker_markers(Vec::new(), 2).skipped(2));
         let wm = worker_markers(vec![marker(Rule::Recheck, 0)], 2);
         assert!(wm.need_recheck && wm.markers.is_empty() && !wm.skipped(2));
+    }
+
+    /// Rule: a worker's starting markers are copies — their sources kept, their sides (victim,
+    /// aggressor) not.
+    #[test]
+    fn starting_markers_are_copies_without_sides() {
+        let o = Owner::Net("a".into());
+        let r = Rect { xl: 0, yl: 0, xh: 10, yh: 10 };
+        let sided = Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o.clone(), 4, r, false)) };
+        let wm = worker_markers(vec![sided], 2);
+        assert_eq!(wm.markers[0].owners, vec![o]);
+        assert!(wm.markers[0].victim.is_none() && wm.markers[0].aggressor.is_none());
     }
 
     /// Rule: written back unless, markers driving the queue, the end count exceeds the start, or,
@@ -368,7 +380,7 @@ mod tests {
     fn guide_tiles_merge_and_batch() {
         let o = Owner::Net("a".into());
         let g = vec![Rect { xl: 0, yl: 0, xh: 100, yh: 10 }, Rect { xl: 90, yl: 0, xh: 200, yh: 10 }, Rect { xl: 0, yl: 0, xh: 10, yh: 300 }];
-        let m = Marker { rule: Rule::Short, layer: 4, bbox: Rect { xl: 5, yl: 5, xh: 95, yh: 6 }, owners: vec![o.clone()], victim: (o.clone(), 4, Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, false), aggressor: (o, 4, Rect { xl: 0, yl: 0, xh: 0, yh: 0 }, false) };
+        let m = Marker { rule: Rule::Short, layer: 4, bbox: Rect { xl: 5, yl: 5, xh: 95, yh: 6 }, owners: vec![o], victim: None, aggressor: None };
         let boxes = guide_tile_boxes(&[m], &|_| Some(g.clone()), &|_| Vec::new());
         assert_eq!(boxes, vec![Rect { xl: 0, yl: 0, xh: 200, yh: 10 }, Rect { xl: 0, yl: 0, xh: 10, yh: 300 }]);
         assert_eq!(tile_batches(&[Rect { xl: 0, yl: 0, xh: 10, yh: 10 }, Rect { xl: 30, yl: 0, xh: 40, yh: 10 }, Rect { xl: 100, yl: 0, xh: 110, yh: 10 }], 10), vec![vec![0, 2], vec![1]]);

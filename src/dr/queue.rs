@@ -82,6 +82,10 @@ pub struct QueueCtx<'a> {
     pub max_ndr_spacing: &'a [i32],
     pub marker_decay: f32,
     pub maze_end_iter: u32,
+    /// The worker's markers drive the queue (not everything ripped up): a reroute is dropped
+    /// when its net and the owner that queued it were both last checked clean since the last
+    /// route.
+    pub markers_drive: bool,
 }
 
 /// The sort key of an owner or net: (kind, name, id), as the reroute queue orders them.
@@ -260,7 +264,10 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
     let gc_dump = std::env::var("VYGD_GC").is_ok();
     let mut gw = check_init(q, nets, &state, if gc_dump { Some(&mut events) } else { None });
     let mut gc_version = 1i64;
-    let mut checked: HashMap<Block, i64> = HashMap::new();
+    // Per owner checked (or net routed): the version it was checked at and its marker count; the
+    // last check's marker count (what a check that runs nothing records).
+    let mut checked: HashMap<Block, (i64, usize)> = HashMap::new();
+    let mut last_markers = 0usize;
     let History { planar: mut planar_hist, via: mut via_hist, mut rq } = hist;
     while let Some(e) = queue.pop_front() {
         let mut did_route = false;
@@ -269,6 +276,14 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let i = *i;
                 if e.num_reroute != state[i].reroutes as i32 {
                     continue;
+                }
+                if q.markers_drive {
+                    if let Some(c) = &e.checking {
+                        let clean = |b: &Block| checked.get(b) == Some(&(gc_version, 0));
+                        if clean(&Block::Owner(Owner::Net((q.name)(i)))) && clean(&Block::Owner(c.clone())) {
+                            continue;
+                        }
+                    }
                 }
                 let cx = (q.net_ctx)(i);
                 let ndr = (q.ndr)(i);
@@ -290,25 +305,27 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 }
                 let m = check(&mut gw, &owner);
                 after_check(w, &nets[i], &figs, cx.ext_box);
-                checked.insert(Block::Owner(owner.clone()), gc_version);
+                checked.insert(Block::Owner(owner.clone()), (gc_version, m.len()));
+                last_markers = m.len();
                 events.push(Event::Route { net: i, reroutes, searches, figs, markers: m.clone() });
                 (m, owner)
             }
             (b, _) => {
-                if checked.get(b) == Some(&gc_version) {
+                if checked.get(b).map(|v| v.0) == Some(gc_version) {
                     continue;
                 }
                 let owner = match b {
                     // ⛔ A worker net queued to check (it avoided a ripup) names the worker net,
                     // which the check does not know: nothing is checked.
                     Block::Net(_) => {
-                        checked.insert(b.clone(), gc_version);
+                        checked.insert(b.clone(), (gc_version, last_markers));
                         continue;
                     }
                     Block::Owner(o) => o.clone(),
                 };
                 let m = check(&mut gw, &owner);
-                checked.insert(b.clone(), gc_version);
+                checked.insert(b.clone(), (gc_version, m.len()));
+                last_markers = m.len();
                 events.push(Event::Check { owner: owner.clone(), markers: m.clone() });
                 (m, owner)
             }
@@ -474,7 +491,8 @@ fn update_queue(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], by_nam
 #[allow(clippy::too_many_arguments)]
 fn update_from_marker(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], by_name: &HashMap<String, Vec<usize>>, m: &Marker, uv: &mut BTreeSet<(i32, String, i64)>, ua: &mut BTreeSet<(i32, String, i64)>, checks: &mut Vec<Entry>, routes: &mut Vec<Entry>, checking: &Option<Owner>) {
     let rb = &q.route_box;
-    if !touches(&m.bbox, rb) && !touches(&m.aggressor.2, rb) && !touches(&m.victim.2, rb) {
+    // A marker off the route box counts when a side's shape reaches it (a copied marker has none).
+    if !touches(&m.bbox, rb) && !m.aggressor.as_ref().is_some_and(|a| touches(&a.2, rb)) && !m.victim.as_ref().is_some_and(|v| touches(&v.2, rb)) {
         return;
     }
     let dr_nets = |o: &Owner| -> Vec<usize> {
@@ -486,11 +504,12 @@ fn update_from_marker(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], 
     let mut victim_owners: Vec<Owner> = Vec::new();
     let mut aggressor_owners: Vec<Owner> = Vec::new();
     let mut movable_owners: BTreeSet<(i32, String, i64)> = BTreeSet::new();
-    let agg = &m.aggressor.0;
-    let agg_nets = dr_nets(agg);
+    // The aggressor (a copied marker has none: every source is then a candidate).
+    let agg: Option<&Owner> = m.aggressor.as_ref().map(|a| &a.0);
+    let agg_nets = agg.map_or(Vec::new(), dr_nets);
     for &i in &agg_nets {
         if can_ripup(q, state, i) {
-            movable_owners.insert(owner_key(q, agg));
+            movable_owners.insert(owner_key(q, agg.expect("an aggressor")));
         }
     }
     let srcs: Vec<Owner> = {
@@ -503,6 +522,7 @@ fn update_from_marker(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], 
         if !can_ripup(q, state, i) {
             continue;
         }
+        let agg = agg.expect("an aggressor");
         if ua.insert(owner_key(q, agg)) {
             aggressor_owners.push(agg.clone());
         }
