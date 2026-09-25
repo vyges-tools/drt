@@ -7,6 +7,7 @@ pub mod conn;
 pub mod cost;
 pub mod design;
 pub mod drw;
+pub mod flow;
 pub mod guides;
 pub mod maze;
 pub mod queue;
