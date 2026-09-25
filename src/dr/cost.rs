@@ -626,11 +626,9 @@ impl CostWorker<'_, '_> {
     fn mod_eol_spacing_cost_helper(&mut self, tst: &Rect, z: usize, t: ModCost, eol_type: u8, reset_h: bool, reset_v: bool) {
         let tech = self.cx.tech;
         let l = self.g.zs[z];
-        let bx;
-        let mut via_box = Rect { xl: 0, yl: 0, xh: 0, yh: 0 };
-        if eol_type == 0 {
+        let bx = if eol_type == 0 {
             let hw2 = self.cx.width(l) / 2;
-            bx = Rect { xl: tst.xl - hw2 + 1, yl: tst.yl - hw2 + 1, xh: tst.xh + hw2 - 1, yh: tst.yh + hw2 - 1 };
+            Rect { xl: tst.xl - hw2 + 1, yl: tst.yl - hw2 + 1, xh: tst.xh + hw2 - 1, yh: tst.yh + hw2 - 1 }
         } else {
             let via = if eol_type == 1 {
                 if l > 0 { self.cx.default_via(l as i64 - 1) } else { None }
@@ -641,10 +639,9 @@ impl CostWorker<'_, '_> {
             };
             let Some(v) = via else { return };
             let vd = &tech.via_defs[v];
-            via_box = if eol_type == 2 { vd.layer1_bbox() } else { vd.layer2_bbox() };
-            bx = Rect { xl: tst.xl - via_box.xh + 1, yl: tst.yl - via_box.yh + 1, xh: tst.xh - via_box.xl - 1, yh: tst.yh - via_box.yl - 1 };
-        }
-        let _ = via_box;
+            let vb = if eol_type == 2 { vd.layer1_bbox() } else { vd.layer2_bbox() };
+            Rect { xl: tst.xl - vb.xh + 1, yl: tst.yl - vb.yh + 1, xh: tst.xh - vb.xl - 1, yh: tst.yh - vb.yl - 1 }
+        };
         let Some((x1, y1, x2, y2)) = self.range(&bx) else { return };
         for i in x1..=x2 {
             for j in y1..=y2 {
