@@ -468,7 +468,7 @@ mod tests {
     // Touching closed intervals join; an empty one (low above high) is dropped.
     #[test]
     fn ranges_join_when_touching_and_drop_empties() {
-        assert_eq!(merge(&[(5, 3), (4, 6), (1, 3), (9, 9)]), vec![(1, 6), (9, 9)]);
+        assert_eq!(merge(&[(5, 3), (4, 6), (1, 3), (9, 9), (20, 15)]), vec![(1, 6), (9, 9)]);
     }
 
     // Shrinking can leave a range empty — it is kept.
@@ -548,6 +548,20 @@ mod tests {
         let mut out = Ranges::new();
         c.via2via_cut_spc(0, 0, true, &mut out);
         assert_eq!(out, vec![(0, 160)]);
+    }
+
+    // Via to via on one layer: only when BOTH vias are wider than the wire across the run, at
+    // the wider via's width and the SHORTER run (here 120, below the table's 150 column).
+    #[test]
+    fn via_to_via_needs_both_fat_and_takes_the_shorter_run() {
+        let t = tech(vec![via("big", r(-100, -100, 100, 100), r(-50, -50, 50, 50)), via("short", r(-100, -60, 100, 60), r(-50, -50, 50, 50)), via("thin", r(-100, -50, 100, 50), r(-50, -50, 50, 50))]);
+        let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
+        let mut out = Ranges::new();
+        c.via2via_min_spc(2, 0, 1, true, &mut out, None);
+        assert_eq!(out, vec![(200, 250)]);
+        let mut out = Ranges::new();
+        c.via2via_min_spc(2, 0, 2, true, &mut out, None);
+        assert_eq!(out, vec![]);
     }
 
     // Line to line: a z-shape runs alongside for the wire's width, a u-shape for the pitch.
