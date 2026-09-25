@@ -27,7 +27,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
-use crate::tech::{LayerKind, Tech};
+use crate::tech::{EolRule, LayerKind, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -61,6 +61,8 @@ pub enum Rule {
     MetalSpacing,
     /// Closer than the cut layer's spacing.
     CutSpacing,
+    /// A line end closer than its end-of-line spacing to a facing edge.
+    EolSpacing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,6 +114,94 @@ impl Edge {
     }
 }
 
+/// A polygon edge of one owner's merged shapes on a layer, vertex to vertex, inside on its left.
+#[derive(Debug, Clone, Copy)]
+struct Seg {
+    from: (i32, i32),
+    to: (i32, i32),
+    net: usize,
+    /// Which polygon of the owner it bounds (a connected piece of the owner's shapes, holes
+    /// included).
+    pin: usize,
+    /// On the owner's FIXED shapes' boundary too (or a fixed rectangle's).
+    fixed: bool,
+    prev: usize,
+    next: usize,
+}
+
+impl Seg {
+    fn dir(&self) -> EdgeDir {
+        Edge { from: self.from, to: self.to, net: self.net }.dir()
+    }
+    fn len(&self) -> i32 {
+        (self.to.0 - self.from.0).abs() + (self.to.1 - self.from.1).abs()
+    }
+    fn vec(&self) -> (i64, i64) {
+        (i64::from(self.to.0 - self.from.0), i64::from(self.to.1 - self.from.1))
+    }
+}
+
+/// The turn from `a` to `b`: 1 left, -1 right, 0 parallel (the sign of the cross product).
+fn orientation(a: &Seg, b: &Seg) -> i32 {
+    let ((a1, b1), (a2, b2)) = (a.vec(), b.vec());
+    (a1 * b2 - b1 * a2).signum() as i32
+}
+
+/// A region's polygon edges, with their polygon, whether fixed, and the ring order. At a point
+/// where two polygons touch only at a corner, an edge continues with the LEFT turn — each polygon
+/// stays its own.
+/// An edge as its two points.
+type EdgePoints = ((i32, i32), (i32, i32));
+
+fn polygon_segs(out: &mut Vec<Seg>, slices: &[Rect], fixed_edges: &BTreeSet<EdgePoints>, net: usize) {
+    // The polygons: slices joined where they share a boundary of some length.
+    let mut parent: Vec<usize> = (0..slices.len()).collect();
+    fn find(p: &mut [usize], i: usize) -> usize {
+        let mut r = i;
+        while p[r] != r {
+            r = p[r];
+        }
+        p[i] = r;
+        r
+    }
+    for i in 0..slices.len() {
+        for j in i + 1..slices.len() {
+            let (a, b) = (&slices[i], &slices[j]);
+            let x_run = a.xh.min(b.xh) - a.xl.max(b.xl);
+            let y_run = a.yh.min(b.yh) - a.yl.max(b.yl);
+            let joined = ((a.xh == b.xl || b.xh == a.xl) && y_run > 0) || ((a.yh == b.yl || b.yh == a.yl) && x_run > 0);
+            if joined {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                parent[ri] = rj;
+            }
+        }
+    }
+    let base = out.len();
+    let raw = boundary(slices);
+    for &(from, to) in &raw {
+        let e = Edge { from, to, net };
+        // The slice on the edge's inside.
+        let inside = slices.iter().position(|s| match e.dir() {
+            EdgeDir::E => s.yl == from.1 && s.xl.max(from.0) < s.xh.min(to.0),
+            EdgeDir::W => s.yh == from.1 && s.xl.max(to.0) < s.xh.min(from.0),
+            EdgeDir::N => s.xh == from.0 && s.yl.max(from.1) < s.yh.min(to.1),
+            EdgeDir::S => s.xl == from.0 && s.yl.max(to.1) < s.yh.min(from.1),
+        });
+        let pin = inside.map_or(usize::MAX, |k| find(&mut parent, k));
+        out.push(Seg { from, to, net, pin, fixed: fixed_edges.contains(&(from, to)), prev: usize::MAX, next: usize::MAX });
+    }
+    let mut starts: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (k, seg) in out.iter().enumerate().skip(base) {
+        starts.entry(seg.from).or_default().push(k);
+    }
+    for k in base..out.len() {
+        let cands = &starts[&out[k].to];
+        let next = if cands.len() == 1 { cands[0] } else { *cands.iter().find(|&&c| orientation(&out[k], &out[c]) == 1).unwrap_or(&cands[0]) };
+        out[k].next = next;
+        out[next].prev = k;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct Net {
     owner: Option<Owner>,
@@ -119,6 +209,8 @@ struct Net {
     route: Vec<Polygon90Set>,
     fixed_cuts: Vec<Vec<Rect>>,
     route_cuts: Vec<Vec<Rect>>,
+    /// The fixed routing-layer rectangles as added (their edges count as fixed edges too).
+    fixed_rects: Vec<Vec<Rect>>,
     /// After `init`: the fixed and the route shapes as disjoint slices, and the fixed shapes'
     /// maximal rectangles.
     fixed_slices: Vec<Vec<Rect>>,
@@ -132,6 +224,11 @@ pub struct Worker<'a> {
     index: HashMap<Owner, usize>,
     shapes: Vec<Vec<Shape>>,
     edges: Vec<Vec<Edge>>,
+    /// Per layer, every owner's polygon edges (for end-of-line checks).
+    segs: Vec<Vec<Seg>>,
+    /// Skip end-of-line checks on edges running along the layer's direction above the first metal
+    /// layer (the long sides of a wire): set for via and pattern trials, not planar ones.
+    pub ignore_long_side_eol: bool,
     markers: Vec<Marker>,
     seen: BTreeSet<(Rect, usize, Rule, Vec<Owner>)>,
 }
@@ -183,6 +280,17 @@ fn generalized_intersect(a: &Rect, b: &Rect) -> Rect {
     let (xl, xh) = axis(a.xl, a.xh, b.xl, b.xh);
     let (yl, yh) = axis(a.yl, a.yh, b.yl, b.yh);
     Rect { xl, yl, xh, yh }
+}
+
+/// A one-unit strip just inside an edge, along its length.
+fn parallel_edge_rect(e: &Seg) -> Rect {
+    let (lo, hi) = (e.from, e.to);
+    match e.dir() {
+        EdgeDir::E => Rect { xl: lo.0, yl: lo.1, xh: hi.0, yh: hi.1 + 1 },
+        EdgeDir::W => Rect { xl: hi.0, yl: hi.1 - 1, xh: lo.0, yh: lo.1 },
+        EdgeDir::N => Rect { xl: lo.0 - 1, yl: lo.1, xh: hi.0, yh: hi.1 },
+        EdgeDir::S => Rect { xl: hi.0, yl: hi.1, xh: lo.0 + 1, yh: lo.1 },
+    }
 }
 
 /// Area of a region (disjoint slices) inside `r`.
@@ -280,7 +388,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -297,6 +405,7 @@ impl<'a> Worker<'a> {
             route: vec![Polygon90Set::new(); n],
             fixed_cuts: vec![Vec::new(); n],
             route_cuts: vec![Vec::new(); n],
+            fixed_rects: vec![Vec::new(); n],
             ..Net::default()
         });
         self.index.insert(owner.clone(), self.nets.len() - 1);
@@ -310,7 +419,10 @@ impl<'a> Worker<'a> {
         match (self.tech.layers[layer].kind == LayerKind::Cut, fixed) {
             (true, true) => net.fixed_cuts[layer].push(r),
             (true, false) => net.route_cuts[layer].push(r),
-            (false, true) => net.fixed[layer].insert_rect(r),
+            (false, true) => {
+                net.fixed[layer].insert_rect(r);
+                net.fixed_rects[layer].push(r);
+            }
             (false, false) => net.route[layer].insert_rect(r),
         }
     }
@@ -321,6 +433,7 @@ impl<'a> Worker<'a> {
         let n = self.tech.layers.len();
         self.shapes = vec![Vec::new(); n];
         self.edges = vec![Vec::new(); n];
+        self.segs = vec![Vec::new(); n];
         for (i, net) in self.nets.iter_mut().enumerate() {
             net.fixed_slices = net.fixed.iter_mut().map(|s| s.rectangles()).collect();
             net.route_slices = net.route.iter_mut().map(|s| s.rectangles()).collect();
@@ -334,6 +447,13 @@ impl<'a> Worker<'a> {
                 for (from, to) in boundary(&slices) {
                     self.edges[layer].push(Edge { from, to, net: i });
                 }
+                if self.tech.layers[layer].kind == LayerKind::Routing && !slices.is_empty() {
+                    let mut fixed_edges: BTreeSet<EdgePoints> = boundary(&net.fixed_slices[layer]).into_iter().collect();
+                    for r in &net.fixed_rects[layer] {
+                        fixed_edges.extend([((r.xl, r.yl), (r.xh, r.yl)), ((r.xh, r.yl), (r.xh, r.yh)), ((r.xh, r.yh), (r.xl, r.yh)), ((r.xl, r.yh), (r.xl, r.yl))]);
+                    }
+                    polygon_segs(&mut self.segs[layer], &slices, &fixed_edges, i);
+                }
                 for r in all.max_rectangles() {
                     let fixed = net.fixed_max[layer].contains(&r);
                     self.shapes[layer].push(Shape { rect: r, net: i, fixed });
@@ -346,9 +466,11 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Metal spacing, then cut spacing, over every owner's shapes; the markers made.
+    /// Metal spacing, then end-of-line spacing, then cut spacing, over every owner's shapes; the
+    /// markers made.
     pub fn run(&mut self) -> &[Marker] {
         self.check_metal_spacing();
+        self.check_metal_end_of_line();
         self.check_cut_spacing();
         &self.markers
     }
@@ -369,6 +491,204 @@ impl<'a> Worker<'a> {
     /// Every shape on `layer` touching `r`.
     fn query(&self, layer: usize, r: &Rect) -> Vec<usize> {
         (0..self.shapes[layer].len()).filter(|&k| touches(&self.shapes[layer][k].rect, r)).collect()
+    }
+
+    // ---- end-of-line spacing ----
+
+    /// Per routing layer with end-of-line rules, per owner, per polygon edge: each rule —
+    /// skipping, with `ignore_long_side_eol`, edges along the layer above the first metal layer.
+    fn check_metal_end_of_line(&mut self) {
+        for layer in 0..self.tech.layers.len() {
+            let l = &self.tech.layers[layer];
+            if l.kind != LayerKind::Routing || l.eol.is_empty() {
+                continue;
+            }
+            let vertical = l.is_vertical();
+            let rules = l.eol.clone();
+            for net in 0..self.nets.len() {
+                for k in 0..self.segs[layer].len() {
+                    let e = self.segs[layer][k];
+                    if e.net != net {
+                        continue;
+                    }
+                    if self.ignore_long_side_eol && layer > 2 {
+                        let along = match e.dir() {
+                            EdgeDir::N | EdgeDir::S => vertical,
+                            EdgeDir::E | EdgeDir::W => !vertical,
+                        };
+                        if along {
+                            continue;
+                        }
+                    }
+                    for r in &rules {
+                        self.check_eol(layer, k, r);
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_eol(&mut self, layer: usize, k: usize, r: &EolRule) {
+        if !self.is_eol_edge(layer, k, r) {
+            return;
+        }
+        if let Some(has_route) = self.qualifies_as_eol(layer, k, r) {
+            self.eol_has_eol(layer, k, r, has_route);
+        }
+    }
+
+    /// Shorter than the rule's width, with a convex corner at each end.
+    fn is_eol_edge(&self, layer: usize, k: usize, r: &EolRule) -> bool {
+        let segs = &self.segs[layer];
+        let e = &segs[k];
+        if e.len() >= r.width {
+            return false;
+        }
+        orientation(&segs[e.prev], e) == 1 && orientation(e, &segs[e.next]) == 1
+    }
+
+    /// Whether the owner's ROUTE shapes overlap `r` (with an area).
+    fn route_overlaps(&self, net: usize, layer: usize, r: &Rect) -> bool {
+        self.nets[net].route_slices[layer].iter().any(|s| overlap(s, r).is_some())
+    }
+
+    /// `None` unless the edge is a qualifying line end; else whether it carries route shapes.
+    fn qualifies_as_eol(&self, layer: usize, k: usize, r: &EolRule) -> Option<bool> {
+        if !self.is_eol_edge(layer, k, r) {
+            return None;
+        }
+        let e = self.segs[layer][k];
+        let mut has_route = !e.fixed && self.route_overlaps(e.net, layer, &parallel_edge_rect(&e));
+        let triggered = match r.parallel {
+            None => true,
+            Some(p) => {
+                let left = self.eol_parallel_edge_one_dir(layer, k, r, &p, true, &mut has_route);
+                let right = self.eol_parallel_edge_one_dir(layer, k, r, &p, false, &mut has_route);
+                if p.two_edges {
+                    left && right
+                } else {
+                    left || right
+                }
+            }
+        };
+        triggered.then_some(has_route)
+    }
+
+    /// Every polygon edge on `layer` touching `q`.
+    fn query_segs(&self, layer: usize, q: &Rect) -> Vec<usize> {
+        (0..self.segs[layer].len())
+            .filter(|&i| {
+                let s = &self.segs[layer][i];
+                touches(&Rect::new(s.from.0, s.from.1, s.to.0, s.to.1), q)
+            })
+            .collect()
+    }
+
+    fn eol_parallel_edge_one_dir(&self, layer: usize, k: usize, r: &EolRule, p: &ParallelEdge, is_low: bool, has_route: &mut bool) -> bool {
+        let e = self.segs[layer][k];
+        let (pt, par_within, par_space, w) = (if is_low { e.from } else { e.to }, p.within, p.space, r.within);
+        let (x, y) = pt;
+        let q = match (is_low, e.dir()) {
+            (true, EdgeDir::E) => Rect { xl: x - par_space, yl: y - w, xh: x, yh: y + par_within },
+            (true, EdgeDir::W) => Rect { xl: x, yl: y - par_within, xh: x + par_space, yh: y + w },
+            (true, EdgeDir::N) => Rect { xl: x - par_within, yl: y - par_space, xh: x + w, yh: y },
+            (true, EdgeDir::S) => Rect { xl: x - w, yl: y, xh: x + par_within, yh: y + par_space },
+            (false, EdgeDir::E) => Rect { xl: x, yl: y - w, xh: x + par_space, yh: y + par_within },
+            (false, EdgeDir::W) => Rect { xl: x - par_space, yl: y - par_within, xh: x, yh: y + w },
+            (false, EdgeDir::N) => Rect { xl: x - par_within, yl: y, xh: x + w, yh: y + par_space },
+            (false, EdgeDir::S) => Rect { xl: x - w, yl: y - par_space, xh: x + par_within, yh: y },
+        };
+        let mut sol = false;
+        for i in self.query_segs(layer, &q) {
+            let ptr = self.segs[layer][i];
+            let turn = if is_low { orientation(&ptr, &e) } else { orientation(&e, &ptr) };
+            if turn != -1 {
+                continue;
+            }
+            let trig = parallel_edge_rect(&ptr);
+            if overlap(&q, &trig).is_none() {
+                continue;
+            }
+            sol = true;
+            if !*has_route && !ptr.fixed {
+                if let Some(t) = overlap(&q, &trig) {
+                    if self.route_overlaps(ptr.net, layer, &t) {
+                        *has_route = true;
+                        break;
+                    }
+                }
+            }
+        }
+        sol
+    }
+
+    /// The window beyond a line end: `space` out, `within` past each side.
+    fn eol_query_rect(e: &Seg, r: &EolRule) -> Rect {
+        let (w, sp) = (r.within, r.space);
+        let (lo, hi) = (e.from, e.to);
+        match e.dir() {
+            EdgeDir::E => Rect { xl: lo.0 - w, yl: lo.1 - sp, xh: hi.0 + w, yh: hi.1 },
+            EdgeDir::W => Rect { xl: hi.0 - w, yl: hi.1, xh: lo.0 + w, yh: lo.1 + sp },
+            EdgeDir::N => Rect { xl: lo.0, yl: lo.1 - w, xh: hi.0 + sp, yh: hi.1 + w },
+            EdgeDir::S => Rect { xl: hi.0 - sp, yl: hi.1 - w, xh: lo.0, yh: lo.1 + w },
+        }
+    }
+
+    fn eol_has_eol(&mut self, layer: usize, k: usize, r: &EolRule, has_route: bool) {
+        let e = self.segs[layer][k];
+        let q = Self::eol_query_rect(&e, r);
+        for i in self.query_segs(layer, &q) {
+            self.eol_has_eol_check(layer, k, i, &q, has_route);
+        }
+    }
+
+    fn eol_has_eol_check(&mut self, layer: usize, k: usize, i: usize, q: &Rect, mut has_route: bool) {
+        let (e, ptr) = (self.segs[layer][k], self.segs[layer][i]);
+        if (ptr.net, ptr.pin) == (e.net, e.pin) {
+            return;
+        }
+        if e.fixed && ptr.fixed {
+            return;
+        }
+        let opposite = matches!((e.dir(), ptr.dir()), (EdgeDir::E, EdgeDir::W) | (EdgeDir::W, EdgeDir::E) | (EdgeDir::N, EdgeDir::S) | (EdgeDir::S, EdgeDir::N));
+        if !opposite {
+            return;
+        }
+        let trig = parallel_edge_rect(&ptr);
+        if overlap(q, &trig).is_none() {
+            return;
+        }
+        if !has_route && !ptr.fixed {
+            if let Some(t) = overlap(q, &trig) {
+                has_route = self.route_overlaps(ptr.net, layer, &t);
+            }
+        }
+        if !has_route {
+            return;
+        }
+        self.eol_has_eol_helper(layer, &e, &ptr);
+    }
+
+    /// The marker between the two edges — unless a shape already fills it.
+    fn eol_has_eol_helper(&mut self, layer: usize, e1: &Seg, e2: &Seg) {
+        let marker = generalized_intersect(&parallel_edge_rect(e1), &parallel_edge_rect(e2));
+        let mut probe = marker;
+        if area(&marker) == 0 {
+            match e1.dir() {
+                EdgeDir::W | EdgeDir::E => {
+                    probe.xl -= 1;
+                    probe.xh += 1;
+                }
+                EdgeDir::S | EdgeDir::N => {
+                    probe.yl -= 1;
+                    probe.yh += 1;
+                }
+            }
+        }
+        if self.query(layer, &probe).iter().any(|&s| overlap(&probe, &self.shapes[layer][s].rect).is_some()) {
+            return;
+        }
+        self.add_marker(Rule::EolSpacing, layer, marker, e1.net, e2.net);
     }
 
     // ---- metal spacing ----
@@ -679,9 +999,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![] },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -893,5 +1213,185 @@ pub(crate) mod tests {
         let mut e = boundary(&[Rect::new(0, 0, 10, 10)]);
         e.sort();
         assert_eq!(e, vec![((0, 0), (10, 0)), ((0, 10), (0, 0)), ((10, 0), (10, 10)), ((10, 10), (0, 10))]);
+    }
+}
+
+#[cfg(test)]
+mod eol_tests {
+    //! End-of-line spacing on constructed geometry: layer 4 (horizontal, width 140, spacing 140)
+    //! with an end-of-line rule — space 200, width 150, within 30 — unless a test says otherwise.
+    //! The base case: net `a`'s wire [0, 0]–[1000, 140] ends facing net `b`'s block 150 away.
+    use super::*;
+    use crate::tech::{EolRule, ParallelEdge};
+
+    fn tech_with(rule: EolRule) -> Tech {
+        let mut t = tests::tech();
+        t.layers[4].eol = vec![rule];
+        t
+    }
+
+    fn rule() -> EolRule {
+        EolRule { space: 200, width: 150, within: 30, parallel: None }
+    }
+
+    fn net(n: &str) -> Owner {
+        Owner::Net(n.into())
+    }
+
+    /// The end-of-line markers' boxes.
+    fn eol(t: &Tech, shapes: &[(&str, Rect, bool)], ignore_long_side: bool) -> Vec<Rect> {
+        let mut w = Worker::new(t);
+        w.ignore_long_side_eol = ignore_long_side;
+        for (o, r, f) in shapes {
+            w.add(&net(o), 4, *r, *f);
+        }
+        w.init();
+        w.run().iter().filter(|m| m.rule == Rule::EolSpacing).map(|m| m.bbox).collect()
+    }
+
+    const WIRE: Rect = Rect { xl: 0, yl: 0, xh: 1000, yh: 140 };
+    const BLOCK: Rect = Rect { xl: 1150, yl: -500, xh: 1500, yh: 500 };
+    const GAP: Rect = Rect { xl: 1000, yl: 0, xh: 1150, yh: 140 };
+
+    /// The base case: one marker, spanning the gap between the line end and the facing edge.
+    #[test]
+    fn a_line_end_facing_an_edge_within_space() {
+        assert_eq!(eol(&tech_with(rule()), &[("a", WIRE, false), ("b", BLOCK, true)], false), vec![GAP]);
+    }
+
+    /// A line end exactly as wide as the rule's width is not a line end.
+    #[test]
+    fn an_end_as_wide_as_the_rule_is_not_an_end() {
+        let t = tech_with(EolRule { width: 140, ..rule() });
+        assert!(eol(&t, &[("a", WIRE, false), ("b", BLOCK, true)], false).is_empty());
+    }
+
+    /// An end with a concave corner at either end is not a line end: here the short edge at x 1000
+    /// (y 0–40) turns right into a tab; only the tab's own end (x 1050) is one.
+    #[test]
+    fn a_concave_corner_disqualifies_an_end() {
+        let t = tech_with(rule());
+        let tab = Rect::new(1000, 40, 1050, 140);
+        let got = eol(&t, &[("a", WIRE, false), ("a", tab, false), ("b", Rect::new(1190, -500, 1500, 500), true)], false);
+        assert!(!got.is_empty() && got.iter().all(|r| r.xl == 1050), "{got:?}");
+    }
+
+    /// An end facing an edge of its OWN polygon is not checked.
+    #[test]
+    fn an_end_facing_its_own_polygon_is_not_checked() {
+        let t = tech_with(rule());
+        let own = [Rect::new(0, -800, 140, 140), Rect::new(0, -800, 1300, -500), Rect::new(1150, -800, 1300, 500), WIRE];
+        let shapes: Vec<(&str, Rect, bool)> = own.iter().map(|&r| ("a", r, false)).collect();
+        assert!(eol(&t, &shapes, false).is_empty());
+    }
+
+    /// Two fixed edges are never checked against each other.
+    #[test]
+    fn fixed_against_fixed_is_not_checked() {
+        assert!(eol(&tech_with(rule()), &[("a", WIRE, true), ("b", BLOCK, true)], false).is_empty());
+    }
+
+    /// A gap already (partly) filled by a shape is not marked.
+    #[test]
+    fn a_filled_gap_is_not_marked() {
+        let got = eol(&tech_with(rule()), &[("a", WIRE, false), ("b", BLOCK, true), ("c", Rect::new(1050, -50, 1100, 190), true)], false);
+        assert!(!got.contains(&GAP), "{got:?}");
+    }
+
+    /// Where the two edges only meet at a corner line the marker has no area; the probe for a
+    /// filling shape is widened by one across it — so a shape straddling that line fills it.
+    #[test]
+    fn a_zero_area_gap_is_probed_one_unit_wide() {
+        let t = tech_with(rule());
+        let block = Rect::new(1150, 140, 1500, 600);
+        let open = eol(&t, &[("a", WIRE, false), ("b", block, true)], false);
+        let line = Rect { xl: 1000, yl: 140, xh: 1150, yh: 140 };
+        assert!(open.contains(&line), "{open:?}");
+        let filled = eol(&t, &[("a", WIRE, false), ("b", block, true), ("c", Rect::new(1050, 130, 1100, 170), true)], false);
+        assert!(!filled.contains(&line), "{filled:?}");
+    }
+
+    /// With `ignore_long_side_eol`, above the first metal layer, edges running ALONG the layer
+    /// (here the top of a vertical stub on a horizontal layer) are not checked; without it they are.
+    #[test]
+    fn long_sides_are_skipped_only_when_asked() {
+        let t = tech_with(rule());
+        let shapes = [("a", Rect::new(0, 0, 140, 1000), false), ("b", Rect::new(-500, 1150, 500, 1500), true)];
+        assert!(!eol(&t, &shapes, false).is_empty());
+        assert!(eol(&t, &shapes, true).is_empty());
+    }
+
+    /// A planar trial checks long sides: a wrong-way segment's end on a horizontal layer is one.
+    #[test]
+    fn a_planar_trial_checks_long_sides() {
+        let t = tech_with(rule());
+        let target = vec![(net("b"), 4, Rect::new(-500, 640, 500, 900))];
+        let m = crate::pa::verdict::planar_markers(&t, &target, &net("a"), (0, 0), 4, (0, 420));
+        assert!(m.iter().any(|m| m.rule == Rule::EolSpacing), "{m:?}");
+    }
+
+    fn parallel(two_edges: bool) -> EolRule {
+        EolRule { parallel: Some(ParallelEdge { space: 120, within: 100, two_edges }), ..rule() }
+    }
+
+    const BELOW: Rect = Rect { xl: 800, yl: -400, xh: 1100, yh: -100 };
+
+    /// With a parallel edge, an end counts only when a parallel edge lies beside it.
+    #[test]
+    fn a_parallel_edge_rule_needs_a_parallel_edge() {
+        assert!(eol(&tech_with(parallel(false)), &[("a", WIRE, false), ("b", BLOCK, true)], false).is_empty());
+        assert!(eol(&tech_with(parallel(false)), &[("a", WIRE, false), ("b", BLOCK, true), ("d", BELOW, true)], false).contains(&GAP));
+    }
+
+    /// With two edges, a parallel edge is needed on BOTH sides.
+    #[test]
+    fn two_edges_needs_both_sides() {
+        let t = tech_with(parallel(true));
+        assert!(!eol(&t, &[("a", WIRE, false), ("b", BLOCK, true), ("d", BELOW, true)], false).contains(&GAP));
+        let above = Rect::new(800, 200, 1100, 500);
+        assert!(eol(&t, &[("a", WIRE, false), ("b", BLOCK, true), ("d", BELOW, true), ("u", above, true)], false).contains(&GAP));
+    }
+
+    /// Where two polygons of one net touch only at a corner, each ring turns LEFT there: the wire's
+    /// end keeps its convex corner and is checked.
+    #[test]
+    fn a_corner_pinch_keeps_each_polygon_convex() {
+        let t = tech_with(rule());
+        let got = eol(&t, &[("a", WIRE, false), ("a", Rect::new(1000, 140, 1100, 300), false), ("b", BLOCK, true)], false);
+        assert!(got.contains(&GAP), "{got:?}");
+    }
+
+    /// A fixed edge carries no route of its own even where a route shape covers it: facing an edge
+    /// whose inside is fixed, it makes no marker.
+    #[test]
+    fn a_fixed_end_does_not_carry_route() {
+        let t = tech_with(rule());
+        let b = [("b", BLOCK, true), ("b", Rect::new(1150, 500, 1500, 600), false)];
+        let got = eol(&t, &[("a", WIRE, true), ("a", WIRE, false), b[0], b[1]], false);
+        assert!(!got.contains(&GAP), "{got:?}");
+    }
+
+    /// Without route shapes at either end the pair is not checked.
+    #[test]
+    fn no_route_no_marker() {
+        let t = tech_with(rule());
+        let got = eol(&t, &[("a", WIRE, true), ("b", BLOCK, true), ("b", Rect::new(1150, 500, 1500, 600), false)], false);
+        assert!(!got.contains(&GAP), "{got:?}");
+    }
+
+    /// A fixed RECTANGLE's edges count as fixed even when the owner's merged fixed shapes do not
+    /// have that edge: fixed against fixed, no marker, though a route shape reaches the edge.
+    #[test]
+    fn a_fixed_rectangle_edge_is_fixed() {
+        let t = tech_with(rule());
+        let shapes = [
+            ("a", Rect::new(0, 0, 1000, 140), true),
+            ("a", Rect::new(500, 0, 1000, 300), true),
+            ("a", Rect::new(1000, 140, 1300, 300), false),
+            ("a", Rect::new(900, 0, 1000, 60), false),
+            ("b", Rect::new(1150, 40, 2000, 100), true),
+        ];
+        let got = eol(&t, &shapes, false);
+        assert!(!got.iter().any(|r| r.xl == 1000 && r.xh == 1150), "{got:?}");
     }
 }

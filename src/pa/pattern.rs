@@ -346,7 +346,7 @@ pub fn vias_markers(tech: &Tech, target: &[TargetShape], vias: &[((i32, i32), &V
     }
     let b = bbox.expect("a via has shapes");
     let win = Rect::new(b.xl - WINDOW_EXT, b.yl - WINDOW_EXT, b.xh + WINDOW_EXT, b.yh + WINDOW_EXT);
-    check_in(tech, target, win, &shapes)
+    check_in(tech, target, win, &shapes, true)
 }
 
 /// The path found, as an access point per pin; every point on it is marked used.

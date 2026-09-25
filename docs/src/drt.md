@@ -29,8 +29,9 @@ The rounds stop once enough sparse points are kept (three per cell pin; one for 
 point's vias are ordered by how far they stick out of the pin.
 
 **Design rules** checked in these trials, against the pin's own cell (or port): shorts between
-different nets (metal and cut), non-sufficient metal, the parallel-run spacing table, and cut
-spacing — enough for technologies without end-of-line rules.
+different nets (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing,
+and end-of-line spacing (a line end narrower than the rule's width needs its space to a facing
+edge; long sides of a wire are skipped in via trials, not in planar ones).
 
 **Access patterns.** Per class, the pins are sorted by the mean x of their points (relative to the
 instance), and a shortest path picks one point per pin: an edge between neighbouring pins costs the
@@ -65,7 +66,7 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 ## Limits
 
 Refused: a nearby-track round (a pin no other round reaches). Not modelled, so a technology that
-has them is checked without them: end-of-line spacing, a metal-width via map, unidirectional or
+has them is checked without them: LEF58 end-of-line forms, a metal-width via map, unidirectional or
 right-way-on-grid-only layers, non-default rules without auto-taper. The router settings are its
 defaults (via-access layer 2, three sparse points per pin, non-preferred tracks allowed); the top
 routing layer is the block's maximum routing layer.

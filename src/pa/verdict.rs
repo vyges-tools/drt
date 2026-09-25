@@ -77,15 +77,17 @@ pub fn access_segment(layer: &Layer, begin: (i32, i32), end: (i32, i32)) -> Rect
     }
 }
 
-fn check(tech: &Tech, target: &[TargetShape], point: (i32, i32), ap_layer: usize, trial: &[(usize, Rect)], owner: &Owner) -> Vec<Marker> {
+fn check(tech: &Tech, target: &[TargetShape], point: (i32, i32), ap_layer: usize, trial: &[(usize, Rect)], owner: &Owner, ignore_long_side_eol: bool) -> Vec<Marker> {
     let trial: Vec<(&Owner, usize, Rect)> = trial.iter().map(|&(l, r)| (owner, l, r)).collect();
-    check_in(tech, target, window(tech, point, ap_layer), &trial)
+    check_in(tech, target, window(tech, point, ap_layer), &trial, ignore_long_side_eol)
 }
 
 /// The checks over `win`: the target's shapes that touch it, fixed; the trial's shapes, each with
-/// its own owner, not fixed.
-pub(crate) fn check_in(tech: &Tech, target: &[TargetShape], win: Rect, trial: &[(&Owner, usize, Rect)]) -> Vec<Marker> {
+/// its own owner, not fixed. `ignore_long_side_eol`: see [`Worker::ignore_long_side_eol`] — via
+/// and pattern trials set it, planar trials do not.
+pub(crate) fn check_in(tech: &Tech, target: &[TargetShape], win: Rect, trial: &[(&Owner, usize, Rect)], ignore_long_side_eol: bool) -> Vec<Marker> {
     let mut w = Worker::new(tech);
+    w.ignore_long_side_eol = ignore_long_side_eol;
     for (o, layer, r) in target {
         if r.xl <= win.xh && win.xl <= r.xh && r.yl <= win.yh && win.yl <= r.yh {
             w.add(o, *layer, *r, true);
@@ -111,7 +113,7 @@ pub fn via_shapes(via: &ViaDef, at: (i32, i32)) -> Vec<(usize, Rect)> {
 /// A planar trial: the segment from the point to `end` on the access point's layer.
 pub fn planar_markers(tech: &Tech, target: &[TargetShape], owner: &Owner, point: (i32, i32), layer: usize, end: (i32, i32)) -> Vec<Marker> {
     let seg = access_segment(&tech.layers[layer], point, end);
-    check(tech, target, point, layer, &[(layer, seg)], owner)
+    check(tech, target, point, layer, &[(layer, seg)], owner, false)
 }
 
 /// A via trial: the via at the point (its three layers' shapes), and the segment from the point
@@ -120,7 +122,7 @@ pub fn via_markers(tech: &Tech, target: &[TargetShape], owner: &Owner, point: (i
     let mut trial = via_shapes(via, point);
     let other = if via.layer1 == layer { via.layer2 } else { via.layer1 };
     trial.push((other, access_segment(&tech.layers[other], point, end)));
-    check(tech, target, point, layer, &trial, owner)
+    check(tech, target, point, layer, &trial, owner, true)
 }
 
 #[cfg(test)]

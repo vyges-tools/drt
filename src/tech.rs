@@ -44,6 +44,26 @@ pub struct Layer {
     pub spacing: Option<SpacingTable>,
     /// A cut layer's minimum spacing, edge to edge.
     pub cut_spacing: Option<i32>,
+    /// A routing layer's end-of-line spacing rules, in the technology's order.
+    pub eol: Vec<EolRule>,
+}
+
+/// An end-of-line spacing rule: a line end narrower than `width` needs `space` to a facing edge
+/// within `within` beyond its sides; with a parallel edge, only when a parallel edge lies within
+/// `par_space` of a side (on both sides with `two_edges`), up to `par_within` behind the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EolRule {
+    pub space: i32,
+    pub width: i32,
+    pub within: i32,
+    pub parallel: Option<ParallelEdge>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParallelEdge {
+    pub space: i32,
+    pub within: i32,
+    pub two_edges: bool,
 }
 
 /// A parallel-run spacing table: rows by width, columns by parallel run length.
@@ -283,7 +303,12 @@ pub mod read {
                             _ => None,
                         },
                     };
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None });
+                    let eol = db
+                        .layer_v54_eol_rules(&name)?
+                        .into_iter()
+                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }) })
+                        .collect();
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;
