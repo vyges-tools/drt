@@ -133,7 +133,7 @@ pub fn via_priority(tech: &Tech) -> BTreeMap<usize, Vec<usize>> {
     by_layer.into_iter().map(|(l, m)| (l, m.into_values().collect())).collect()
 }
 
-fn priority_tuple(tech: &Tech, v: &ViaDef) -> (bool, i32, i32, bool, i64, i64, bool) {
+pub(crate) fn priority_tuple(tech: &Tech, v: &ViaDef) -> (bool, i32, i32, bool, i64, i64, bool) {
     let shape = |figs: &[Rect], layer: usize| -> (i32, bool, i64) {
         let mut ps = Polygon90Set::new();
         for &f in figs {

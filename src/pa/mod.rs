@@ -6,6 +6,7 @@ pub mod access;
 pub mod candidates;
 #[cfg(feature = "odb")]
 pub mod db;
+pub mod stack;
 pub mod flow;
 pub mod pattern;
 pub mod row;

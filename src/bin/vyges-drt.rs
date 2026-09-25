@@ -167,14 +167,14 @@ fn run(a: &Args) -> Outcome {
         Ok(t) => t,
         Err(e) => return fail("error", 2, e.to_string()),
     };
-    let (masters, insts, ports) = match padb::read_design(&db, &tech) {
+    let cfg = padb::config(&db, &tech);
+    let (masters, insts, ports) = match padb::read_design(&db, &tech, cfg.top_routing_layer) {
         Ok(d) => d,
         Err(e) => return fail("error", 2, e),
     };
     if !insts.iter().any(|i| i.unique.routes.iter().any(|&r| r)) && !ports.iter().any(|p| p.routed) {
         return fail("vacuous", 2, "no routed instance terminal and no routed port".into());
     }
-    let cfg = padb::config(&db, &tech);
     let pa = match flow::pin_access(&tech, &tracks, &cfg, &masters, &insts, &ports) {
         Ok(p) => p,
         Err(e) => return fail("refused", 3, format!("{e:?}")),

@@ -4,6 +4,8 @@
 //! Rules:
 //! - layers are numbered from the first routing layer, with a placeholder masterslice (0) and a
 //!   placeholder cut layer (1) below it; routing and cut layers then follow in technology order;
+//!   the masterslice placeholder takes the name of the last masterslice layer before the first
+//!   routing layer that is not a well or diffusion layer (LEF58 type), else `FR_MASTERSLICE`;
 //! - a routing layer's min width is `min(min width, width)`;
 //! - a via definition is a technology via: its shapes on the layer below, the cut and the layer
 //!   above, and whether it is a default via;
@@ -274,12 +276,19 @@ pub mod read {
     pub fn tech(db: &Db) -> Res<Tech> {
         let mut layers: Vec<Layer> = Vec::new();
         let placeholder = |name: &str| Layer { name: name.into(), ..Layer::default() };
+        // The last masterslice layer read so far that is not a well or diffusion layer.
+        let mut masterslice: Option<String> = None;
         for (name, dir) in db.layers_with_direction()? {
             let kind = db.layer_get_type(&name)?;
             match kind.as_str() {
+                "MASTERSLICE" => {
+                    if !matches!(db.layer_lef58_type(&name).as_str(), "NWELL" | "PWELL" | "DIFFUSION") {
+                        masterslice = Some(name);
+                    }
+                }
                 "ROUTING" if db.layer_get_routing_level(&name) > 0 => {
                     if layers.is_empty() {
-                        layers.push(placeholder("FR_MASTERSLICE"));
+                        layers.push(placeholder(masterslice.as_deref().unwrap_or("FR_MASTERSLICE")));
                         layers.push(placeholder("Fr_VIA"));
                     }
                     let width = db.layer_get_width(&name) as i32;
