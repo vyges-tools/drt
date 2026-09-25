@@ -21,11 +21,12 @@ pub fn abs_priority(is_clock: bool, has_ndr: bool) -> i32 {
     }
 }
 
-/// The first iteration's routing order: nets with more than one pin, by absolute priority
-/// (highest first), then (pins inside the worker, pin-box area, id) — the marker priorities are
-/// all equal before any marker.
-pub fn sort_reroute_nets(nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..nets.len()).filter(|&i| nets[i].pins.len() > 1).collect();
+/// The first iteration's routing order: the nets the row rips up (`ripped`: everything ripped
+/// up — those with more than one pin; incremental — those not routed before), by absolute
+/// priority (highest first), then (pins inside the worker, pin-box area, id) — the marker
+/// priorities are all equal before any marker.
+pub fn sort_reroute_nets(nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, ripped: &dyn Fn(&DrNet) -> bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..nets.len()).filter(|&i| ripped(&nets[i])).collect();
     let area = |n: &DrNet| i64::from(n.pin_box.dx()) * i64::from(n.pin_box.dy());
     order.sort_by_key(|&i| (std::cmp::Reverse(abs(&nets[i])), nets[i].num_pins_in, area(&nets[i]), nets[i].id));
     order
@@ -74,8 +75,9 @@ pub fn init_maze_cost_via_helper(w: &mut CostWorker<'_, '_>, net: &DrNet, add: b
 
 /// The first iteration's queue: every net's via reservation, made in the priority order, then
 /// the ROUTING order — the queue re-sorted by net name (bytes), then worker net id.
-pub fn init_queue<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, name: &dyn Fn(&DrNet) -> &'n str, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>, is_macro_term: &dyn Fn(usize) -> bool) -> Vec<usize> {
-    let mut order = sort_reroute_nets(nets, abs);
+#[allow(clippy::too_many_arguments)]
+pub fn init_queue<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, name: &dyn Fn(&DrNet) -> &'n str, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>, is_macro_term: &dyn Fn(usize) -> bool, ripped: &dyn Fn(&DrNet) -> bool) -> Vec<usize> {
+    let mut order = sort_reroute_nets(nets, abs, ripped);
     for &i in &order {
         init_maze_cost_via_helper(w, &nets[i], true, ndr_of(&nets[i]), is_macro_term);
     }

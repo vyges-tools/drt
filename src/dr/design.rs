@@ -58,6 +58,8 @@ pub struct DesignRoutes {
     marker_trees: Vec<DynRTree<usize>>,
     /// The nets a write-back changed since the last connectivity check.
     pub modified: BTreeSet<usize>,
+    /// Every net a write-back changed, over the whole run.
+    pub rerouted: BTreeSet<usize>,
 }
 
 /// A shape's box as the region query stores it: a wire's (ends extended), a via's over its three
@@ -100,6 +102,25 @@ impl DesignRoutes {
     /// The shapes stored on layer `l` whose box touches `b`, in query order.
     pub fn query_layer(&self, b: &Rect, l: usize) -> Vec<usize> {
         self.trees.get(l).map_or(Vec::new(), |t| t.query(b).into_iter().map(|(_, v)| v.1).collect())
+    }
+
+    /// The design as routing starts on it: the nets' existing shapes (in the order given — per
+    /// net its wires, then vias, then patches, nets in design order), each layer's query PACKED
+    /// from them at once, as the reference builds it when routing begins.
+    pub fn with_initial(tech: &Tech, shapes: Vec<(usize, DrFig)>) -> DesignRoutes {
+        let mut d = DesignRoutes::default();
+        let mut per_layer: Vec<Vec<(Rect, usize)>> = Vec::new();
+        for (k, (net, fig)) in shapes.into_iter().enumerate() {
+            let (l, b) = stored_box(tech, &fig);
+            while per_layer.len() <= l {
+                per_layer.push(Vec::new());
+            }
+            d.rq.push(Some((l, per_layer[l].len())));
+            per_layer[l].push((b, k));
+            d.shapes.push(Some(Shape { net, fig }));
+        }
+        d.trees = per_layer.into_iter().map(DynRTree::new).collect();
+        d
     }
 
     /// Commit a shape (the end of the net's list and of the writing order); its slot.
@@ -203,6 +224,7 @@ fn is_route_origin(rb: &Rect, origin: P, init_dr: bool) -> bool {
 pub fn end(d: &mut DesignRoutes, tech: &Tech, wb: &WriteBack<'_>) {
     let mod_nets: BTreeSet<usize> = wb.routed.iter().map(|(n, _)| *n).collect();
     d.modified.extend(mod_nets.iter().copied());
+    d.rerouted.extend(mod_nets.iter().copied());
     let mut bound: std::collections::BTreeMap<usize, BTreeSet<(P, usize)>> = Default::default();
     // Remove the modified nets' shapes in the extended box.
     for k in d.query(tech, &wb.ext_box) {

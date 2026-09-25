@@ -26,7 +26,10 @@ preferred points, each single-pin port's points. The report (JSON) goes to stdou
 detailed_route routes the design on its route guides: pin access, guide processing, track
 assignment, then search-and-repair iterations until no design-rule marker stands, and writes the
 routes (a DEF or a database). The routing layers are the block's minimum and maximum routing
-layers as the database holds them; the non-default rules are the database's.
+layers as the database holds them; the non-default rules are the database's. Nets already routed
+in the database are kept: their wires are read, the first three iterations reroute only the other
+nets, and the report counts both (routed_before, rerouted). Refused: FIXED wiring, a wire using
+one of the design's own vias, a routed net on a non-default rule.
 
 OPTIONS:
   --db IN.odb                 read the design from a database
@@ -174,7 +177,7 @@ fn route(a: &Args) -> Outcome {
     Outcome {
         status: if s.markers == 0 { "written" } else { "markers" },
         code: u8::from(s.markers > 0),
-        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("nets_written", s.nets_written.to_string())],
+        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("nets_written", s.nets_written.to_string()), ("routed_before", s.routed_before.to_string()), ("rerouted", s.rerouted.to_string())],
     }
 }
 

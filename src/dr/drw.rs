@@ -237,14 +237,22 @@ fn touches(a: &Rect, b: &Rect) -> bool {
 
 /// The first iteration's nets of a worker (ripping everything up: no existing routes).
 /// Errors as [`init_net_term`].
-pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect, boundary: &BoundaryPins) -> Result<Vec<DrNet>, String> {
+///
+/// Incremental (`initial`: the nets routed before routing began): those nets take no gr pins and
+/// no guides and are not built here — their committed shapes, split as above but all kept, build
+/// them as search and repair does (route parts kept), after the others.
+pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect, boundary: &BoundaryPins, initial: Option<&dyn Fn(usize) -> bool>) -> Result<Vec<DrNet>, String> {
     // Terminal order: block pins first, then instance terminals, each by database order.
     let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
+    let is_initial = |n: usize| initial.is_some_and(|f| f(n));
     let mut nets: BTreeSet<usize> = BTreeSet::new();
     let mut net_terms: BTreeMap<usize, BTreeSet<TermKey>> = BTreeMap::new();
     for v in inp.gr_pins.query(route_box) {
         let t = v.1;
         let Some(net) = inp.terms[t].net else { continue };
+        if is_initial(net) {
+            continue;
+        }
         nets.insert(net);
         net_terms.entry(net).or_default().insert((term_key(t), t));
     }
@@ -262,6 +270,9 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
         }
     }
     for (&net, objs) in &mut net_route {
+        if is_initial(net) {
+            continue;
+        }
         let ext = net_ext.entry(net).or_default();
         for f in std::mem::take(objs) {
             if let crate::dr::cost::DrFig::Seg { layer, begin, end, begin_trunc, end_trunc, .. } = f {
@@ -286,6 +297,9 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
     for (l, tree) in inp.guides.iter().enumerate() {
         for v in tree.query(route_box) {
             let (net, b, e) = v.1;
+            if is_initial(net) {
+                continue;
+            }
             nets.insert(net);
             guides.push((net, l, b, e));
         }
@@ -298,6 +312,9 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
     let mut out: Vec<DrNet> = Vec::new();
     let mut pin_cnt = 0usize;
     for &net in &nets {
+        if is_initial(net) {
+            continue;
+        }
         let terms: Vec<usize> = net_terms.get(&net).map_or(Vec::new(), |s| s.iter().map(|&(_, t)| t).collect());
         let g = net_guides.get(&net).cloned().unwrap_or_default();
         let bounds: Vec<(P, usize)> = boundary.get(&net).map_or(Vec::new(), |s| s.iter().copied().collect());
@@ -313,6 +330,13 @@ pub fn init_nets_init_dr(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect,
                 pin_cnt += 1;
             }
             out.push(dnet);
+        }
+    }
+    if let (Some((tech, _)), Some(_)) = (inp.routes, initial) {
+        for &net in nets.iter().filter(|&&n| is_initial(n)) {
+            let objs = net_route.remove(&net).unwrap_or_default();
+            let ext = net_ext.remove(&net).unwrap_or_default();
+            search_repair_net(inp, tech, route_box, ext_box, net, objs, ext, true, &mut out, &mut pin_cnt)?;
         }
     }
     init_nets_num_pins_in(&mut out, ext_box);
@@ -398,7 +422,6 @@ fn split_obj_search_repair(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate:
 /// `keep_routes`: the route parts stay on their worker nets (not everything is ripped up).
 pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: &Rect, keep_routes: bool) -> Result<Vec<DrNet>, String> {
     use crate::dr::cost::DrFig;
-    let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
     let mut nets: BTreeSet<usize> = BTreeSet::new();
     let mut net_route: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
     let mut net_ext: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
@@ -414,6 +437,22 @@ pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: 
     let mut pin_cnt = 0usize;
     for &net in &nets {
         let objs = net_route.remove(&net).unwrap_or_default();
+        let ext = net_ext.remove(&net).unwrap_or_default();
+        search_repair_net(inp, tech, route_box, ext_box, net, objs, ext, keep_routes, &mut out, &mut pin_cnt)?;
+    }
+    init_nets_num_pins_in(&mut out, ext_box);
+    init_nets_boundary_area(tech, route_box, &mut out);
+    Ok(out)
+}
+
+/// One net built from its committed shapes (search-and-repair): the terms at its route parts'
+/// pin-facing ends, its connected components, per component a worker net (ext parts, route parts
+/// — dropped unless kept —, terms, the boundary points of its ext parts).
+#[allow(clippy::too_many_arguments)]
+fn search_repair_net(inp: &DrNetInput<'_>, tech: &crate::tech::Tech, route_box: &Rect, ext_box: &Rect, net: usize, objs: Vec<crate::dr::cost::DrFig>, ext: Vec<crate::dr::cost::DrFig>, keep_routes: bool, out: &mut Vec<DrNet>, pin_cnt: &mut usize) -> Result<(), String> {
+    use crate::dr::cost::DrFig;
+    let term_key = |t: usize| (!inp.terms[t].is_port, inp.terms[t].order);
+    {
         // The terms at the route parts' pin-facing ends inside the route box.
         let mut pin2ep: BTreeMap<TermKey, BTreeSet<(P, usize)>> = BTreeMap::new();
         let mut helper = |pt: P, l: usize| {
@@ -452,7 +491,7 @@ pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: 
         let mut v_ext: Vec<Vec<DrFig>> = vec![Vec::new(); subnets];
         let mut v_route: Vec<Vec<DrFig>> = vec![Vec::new(); subnets];
         let mut v_pins: Vec<Vec<usize>> = vec![Vec::new(); subnets];
-        v_ext[0] = net_ext.remove(&net).unwrap_or_default();
+        v_ext[0] = ext;
         let terms: Vec<usize> = pin2ep.keys().map(|&(_, t)| t).collect();
         for (i, &c) in comp.iter().enumerate() {
             if i < objs.len() {
@@ -468,17 +507,15 @@ pub fn init_nets_search_repair(inp: &DrNetInput<'_>, route_box: &Rect, ext_box: 
             let id = out.len();
             let route = if keep_routes { route } else { Vec::new() };
             let mut dnet = DrNet { id, net, pins: Vec::new(), num_pins_in: 0, pin_box: *ext_box, ext, route };
-            init_net_term(inp, route_box, &mut dnet, &pins, &mut pin_cnt)?;
+            init_net_term(inp, route_box, &mut dnet, &pins, pin_cnt)?;
             for (pt, l) in ext_boundary_points(route_box, &dnet.ext) {
-                dnet.pins.push(DrPin { term: None, id: pin_cnt, patterns: vec![DrAccessPattern { point: pt, layer: l, begin_area: 0, pin_cost: 0, ap: None }] });
-                pin_cnt += 1;
+                dnet.pins.push(DrPin { term: None, id: *pin_cnt, patterns: vec![DrAccessPattern { point: pt, layer: l, begin_area: 0, pin_cost: 0, ap: None }] });
+                *pin_cnt += 1;
             }
             out.push(dnet);
         }
     }
-    init_nets_num_pins_in(&mut out, ext_box);
-    init_nets_boundary_area(tech, route_box, &mut out);
-    Ok(out)
+    Ok(())
 }
 
 /// The route parts' connected components (the terms numbered after them): nodes at every wire
@@ -1306,6 +1343,33 @@ mod tests {
             TrackPattern { layer: 4, vertical_tracks: true, start: 100, num: 5, spacing: 200 },
         ];
         (t, tracks, vec![None, None, None, Some(0), None], GridConfig { bottom_routing_layer: 2, top_routing_layer: 4 }, Rect::new(0, 0, 1000, 1000))
+    }
+
+    // Rule: in an incremental first iteration a net routed before takes no gr pin and no guide:
+    // one whose gr pin or guide lies in the route box while none of its shapes reaches the
+    // extended box makes no worker net (it would otherwise become an empty one).
+    #[test]
+    fn a_net_routed_before_takes_no_gr_pin_and_no_guide() {
+        use crate::dr::guides::GCellGrid;
+        use crate::rtree::PackedRTree;
+        let grid = GCellGrid { x: (0, 10, 1000), y: (0, 10, 1000), die: Rect::new(0, 0, 10000, 10000) };
+        let route_box = Rect::new(0, 0, 3000, 3000);
+        let ext_box = Rect::new(-500, -500, 3500, 3500);
+        let t = Tech::default();
+        let routes = crate::dr::design::DesignRoutes::default();
+        let term = DrTerm { name: "i/a".into(), is_port: false, order: 0, net: Some(0), bbox: Rect::new(900, 900, 1100, 1100), pins: Vec::new() };
+        let initial = |n: usize| n == 0;
+        let run = |gr: bool, guide: bool| {
+            let mut trees: Vec<PackedRTree<(usize, P, P)>> = (0..3).map(|_| PackedRTree::new(Vec::new())).collect();
+            if guide {
+                trees[2] = PackedRTree::new(vec![(Rect::new(500, 500, 1500, 500), (0, (500, 500), (1500, 500)))]);
+            }
+            let gr_pins = PackedRTree::new(if gr { vec![(Rect::new(1000, 1000, 1000, 1000), 0)] } else { Vec::new() });
+            let terms = [term.clone()];
+            let inp = DrNetInput { grid: &grid, guides: &trees, gr_pins: &gr_pins, terms: &terms, min_area: &[0, 0, 0], routes: Some((&t, &routes)), term_at: None };
+            init_nets_init_dr(&inp, &route_box, &ext_box, &BoundaryPins::new(), Some(&initial)).expect("nets").len()
+        };
+        assert_eq!((run(true, false), run(false, true)), (0, 0));
     }
 
     // Rule: a unidirectional layer takes its track patterns in BOTH directions into the grid —

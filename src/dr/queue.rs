@@ -86,6 +86,9 @@ pub struct QueueCtx<'a> {
     /// when its net and the owner that queued it were both last checked clean since the last
     /// route.
     pub markers_drive: bool,
+    /// A worker net that may not be ripped up by a marker (an incremental run's nets routed
+    /// before routing began).
+    pub pinned: &'a dyn Fn(usize) -> bool,
 }
 
 /// The sort key of an owner or net: (kind, name, id), as the reroute queue orders them.
@@ -468,7 +471,7 @@ fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], mut dump
 }
 
 fn can_ripup(q: &QueueCtx<'_>, state: &[NetState], i: usize) -> bool {
-    state[i].reroutes < q.maze_end_iter
+    state[i].reroutes < q.maze_end_iter && !(q.pinned)(i)
 }
 
 /// The markers' consequences for the queue: sorted routes, then sorted checks, appended.

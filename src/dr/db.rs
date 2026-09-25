@@ -10,6 +10,7 @@ use crate::gc::Owner;
 use crate::pa::flow::{DesignInst, DesignPort, MasterClass};
 use crate::polygon90::Rect;
 use crate::tech::{LayerKind, Master, Tech};
+pub use crate::dr::wire::InitialRouting;
 
 /// The rule families and layer properties routing does not model, as `layer: family` for each
 /// layer that carries one — a design with any must be refused, not routed with the rule ignored.
@@ -43,6 +44,90 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         }
     }
     out
+}
+
+/// A regular net's routing read from the database (`None` without a wire). Refused: a FIXED wire
+/// (the router then rips up incrementally in every iteration), a wire type other than ROUTED, a
+/// block via (the reader would add the design's vias to the technology's), a layer or via the
+/// technology does not have.
+pub fn read_net_routing(db: &Db, tech: &Tech, net: &str) -> Result<Option<crate::dr::wire::InitialRouting>, String> {
+    let recs = db.net_wire_decode(net).map_err(|e| e.to_string())?;
+    let Some(first) = recs.first() else { return Ok(None) };
+    match first.strip_prefix("T|") {
+        Some("ROUTED") => {}
+        Some(t) => return Err(format!("net {net}: {t} wiring not modelled")),
+        None => return Err(format!("net {net}: no wire type")),
+    }
+    let ops = crate::dr::wire::wire_ops(&recs[1..])?;
+    crate::dr::wire::parse_wire(tech, &ops).map(Some).map_err(|e| format!("net {net}: {e}"))
+}
+
+/// Each net's routing read from the database (`None` without a wire): what makes a run
+/// incremental. Refused: vias or patches with no wire (the net would not count as routed), a
+/// routed net on a non-default rule (its wires are read at the layer's width).
+pub fn initial_routing(db: &Db, tech: &Tech, nets: &[TaNet]) -> Result<Vec<Option<InitialRouting>>, String> {
+    let mut out = vec![None; nets.len()];
+    for (i, n) in nets.iter().enumerate() {
+        let Some(r) = read_net_routing(db, tech, &n.name)? else { continue };
+        if !r.has_wire() {
+            return Err(format!("net {}: vias or patches with no wire not modelled", n.name));
+        }
+        if n.ndr.is_some() {
+            return Err(format!("net {}: a routed non-default-rule net not modelled (its wires read at the layer width)", n.name));
+        }
+        out[i] = Some(r);
+    }
+    Ok(out)
+}
+
+/// The nets routed before routing began, as the design's starting shapes: per net (design
+/// order) its wires, vias and patches. A via landing on one of the net's terminals is marked
+/// connected there — on the layer below when a terminal shape on it touches the via's shape
+/// there; else on the layer above likewise. (Terminals are tried in the net's order and a
+/// terminal after one that connected the bottom is not tried for the top: refused where that
+/// order could matter — a via touching terminals both below and above.)
+pub fn initial_shapes(tech: &Tech, nets: &[TaNet], insts: &[DesignInst], masters: &HashMap<String, Master>, ports: &[DesignPort], initial: &[Option<InitialRouting>]) -> Result<Vec<(usize, crate::dr::cost::DrFig)>, String> {
+    use crate::dr::cost::DrFig;
+    let mut out = Vec::new();
+    let meets = |a: &Rect, b: &Rect| a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh;
+    for (n, r) in initial.iter().enumerate() {
+        let Some(r) = r else { continue };
+        let name = &nets[n].name;
+        let mut terms: Vec<Vec<(usize, Rect)>> = Vec::new();
+        for inst in insts {
+            for (k, net) in inst.nets.iter().enumerate() {
+                if net.as_deref() == Some(name.as_str()) {
+                    let m = &masters[&inst.unique.master];
+                    terms.push(m.terms[k].pins.iter().flat_map(|p| p.shapes.iter()).map(|&(l, b)| (l, inst.transform.apply(b))).collect());
+                }
+            }
+        }
+        for port in ports {
+            if port.owner == Owner::Net(name.clone()) {
+                terms.push(port.pins.iter().flatten().copied().collect());
+            }
+        }
+        out.extend(r.segs.iter().map(|f| (n, f.clone())));
+        for f in &r.vias {
+            let mut f = f.clone();
+            if let DrFig::Via { via, origin, bottom_connected, top_connected, .. } = &mut f {
+                let vd = &tech.via_defs[*via];
+                let at = |b: Rect| Rect { xl: b.xl + origin.0, yl: b.yl + origin.1, xh: b.xh + origin.0, yh: b.yh + origin.1 };
+                let (bot, top) = (at(vd.layer1_bbox()), at(vd.layer2_bbox()));
+                let hits = |sh: &[(usize, Rect)], l: usize, b: &Rect| sh.iter().any(|(sl, r)| *sl == l && meets(r, b));
+                let below: Vec<bool> = terms.iter().map(|sh| hits(sh, vd.layer1, &bot)).collect();
+                let above: Vec<bool> = terms.iter().map(|sh| hits(sh, vd.layer2, &top)).collect();
+                if below.iter().any(|&b| b) && above.iter().any(|&b| b) {
+                    return Err(format!("net {name}: a via on terminals below and above not modelled"));
+                }
+                *bottom_connected = below.iter().any(|&b| b);
+                *top_connected = !*bottom_connected && above.iter().any(|&b| b);
+            }
+            out.push((n, f));
+        }
+        out.extend(r.patches.iter().map(|f| (n, f.clone())));
+    }
+    Ok(out)
 }
 
 /// Track assignment's view of the design: the routed nets (database order, special nets left

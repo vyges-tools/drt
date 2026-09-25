@@ -16,4 +16,5 @@ pub mod rules;
 pub mod ta;
 #[cfg(feature = "odb")]
 pub mod run;
+pub mod wire;
 pub mod write;

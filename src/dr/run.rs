@@ -51,6 +51,9 @@ pub struct Summary {
     pub markers: usize,
     /// Nets whose routing was written.
     pub nets_written: usize,
+    /// Nets routed before routing began (an incremental run), and the nets any worker rerouted.
+    pub routed_before: usize,
+    pub rerouted: usize,
 }
 
 /// Route the design and write the routes into the database.
@@ -62,7 +65,8 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
     let (routes, iterations) = dr(&d, &g, &p, &t)?;
     let markers = routes.markers().count();
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
-    Ok(Summary { iterations, markers, nets_written })
+    let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
+    Ok(Summary { iterations, markers, nets_written, routed_before, rerouted: routes.rerouted.len() })
 }
 
 /// The design as the router reads it: technology, tracks, instances, ports, nets and their
@@ -81,6 +85,8 @@ pub struct DesignIn {
     pub no_taper: HashSet<usize>,
     pub bottom_layer: usize,
     pub die: Rect,
+    /// Per net, its routing read from the database when it has a wire (an incremental run).
+    pub initial: Vec<Option<crate::dr::db::InitialRouting>>,
 }
 
 /// The reader, then pin access.
@@ -102,10 +108,6 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
     let pa = pin_access_with(tech, &tracks, &cfg, &masters, &insts, &ports, Some(&shapes)).map_err(|e| format!("pin access: {e:?}"))?;
     let min_level = db.block_get_min_routing_layer();
     let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
-    // A net routed already makes the first iterations incremental (a rip-up mode not modelled).
-    if let Some(n) = design.nets.iter().find(|n| db.net_has_wire(&n.name)) {
-        return Err(format!("net {} is already routed: incremental routing not modelled", n.name));
-    }
     let ndrs = read_ndrs(db, tech)?;
     for n in &mut design.nets {
         let r = db.net_get_non_default_rule(&n.name);
@@ -113,10 +115,12 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
             n.ndr = Some(ndrs.iter().find(|x| x.name == r).cloned().ok_or_else(|| format!("net {}: rule {r} not read", n.name))?);
         }
     }
+    // A net routed already (a wire in the database) makes the first iterations incremental.
+    let initial = crate::dr::db::initial_routing(db, tech, &design.nets)?;
     // Non-default-rule nets without auto-taper: their routes are never tapered at the pins.
     let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die })
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial })
 }
 
 /// The non-default rules, the technology's then the block's (a name already read is skipped):
@@ -414,7 +418,8 @@ struct DrCtx<'a> {
 /// iterations run.
 pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut) -> Res<(DesignRoutes, usize)> {
     let cx = dr_init(d, g, p, t);
-    let mut routes = DesignRoutes::default();
+    let incremental = d.initial.iter().any(Option::is_some);
+    let mut routes = DesignRoutes::with_initial(&p.tech, crate::dr::db::initial_shapes(&p.tech, &d.design.nets, &d.insts, &d.masters, &d.ports, &d.initial)?);
     let mut flow = FlowState::default();
     let mut clip = ClipSize::default();
     let mut iterations = 0;
@@ -428,6 +433,7 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut) -> Res<(DesignRoutes,
         }
         let mut args = row;
         args.size = clip.size(&row, false);
+        args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
         search_repair(&cx, &mut routes, &mut flow, iter, &args)?;
         iterations = iter + 1;
         if routes.markers().next().is_none() {
@@ -508,9 +514,9 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         return Ok(());
     }
     let ripup_all = match args.ripup {
-        RipUp::All => true,
+        RipUp::All | RipUp::Incr => true,
         RipUp::Drc => false,
-        other => return Err(format!("rip-up mode {other:?} not modelled")),
+        other => return Err(format!("rip-up mode {other:?} in iteration {iter} not modelled")),
     };
     let tech = &cx.p.tech;
     let mt = mt_safe_dist(&cx.d.ndrs.iter().collect::<Vec<_>>());
@@ -621,9 +627,11 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
         Vec::new()
     } else if iter == 0 {
         let bp = merge_boundary_pins(&cx.bpins, w.start, args.size, &w.route);
-        init_nets_init_dr(&dinp, &w.route, &w.ext, &bp)?
+        let initial = |n: usize| d.initial[n].is_some();
+        init_nets_init_dr(&dinp, &w.route, &w.ext, &bp, (args.ripup == RipUp::Incr).then_some(&initial as &dyn Fn(usize) -> bool))?
     } else {
-        init_nets_search_repair(&dinp, &w.route, &w.ext, !ripup_all)?
+        // Only ripping up everything drops the committed routes (incremental keeps them).
+        init_nets_search_repair(&dinp, &w.route, &w.ext, args.ripup != RipUp::All)?
     };
     let mut nets = built;
     if nets.is_empty() {
@@ -740,6 +748,7 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
         marker_decay: args.decay,
         maze_end_iter: args.maze_end,
         markers_drive: !ripup_all,
+        pinned: &|i: usize| crate::dr::flow::ripup_pinned(args.ripup, d.initial[nets[i].net].is_some()),
     };
     // The design's markers in the check box (or, with a re-check marker there, a check's; copies
     // too) cost first, then the via reservations.
@@ -749,7 +758,8 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     let abs = |n: &DrNet| abs_priority(st_nets[n.net].is_clock, st_nets[n.net].ndr.is_some());
     let net_name = |n: &DrNet| st_nets[n.net].name.as_str();
     let ndr_of = |n: &DrNet| -> Option<crate::dr::cost::Ndr<'_>> { nets.iter().position(|x| std::ptr::eq(x, n)).and_then(|i| ndr_eol[i]) };
-    let order = if ripup_all { init_queue(cw, nets, &abs, &net_name, &ndr_of, &|k| t.macro_term[k]) } else { Vec::new() };
+    let ripped = |n: &DrNet| crate::dr::flow::first_ripped(args.ripup, n.pins.len(), d.initial[n.net].is_some());
+    let order = if ripup_all { init_queue(cw, nets, &abs, &net_name, &ndr_of, &|k| t.macro_term[k], &ripped) } else { Vec::new() };
     let mut mst = MazeState::new(tech, cw.g, d.die);
     if !args.follow_guide {
         mst.all_guided();

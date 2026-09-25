@@ -38,6 +38,32 @@ pub enum RipUp {
     Incr,
 }
 
+/// The rip-up mode an iteration runs: in an incremental run (some nets routed before routing
+/// began) the first three iterations (0–2) rip up only the other nets where the strategy rips up
+/// everything.
+pub fn effective_ripup(row: RipUp, incremental: bool, iter: usize) -> RipUp {
+    if row == RipUp::All && incremental && iter <= 2 {
+        RipUp::Incr
+    } else {
+        row
+    }
+}
+
+/// Whether a worker net starts in the first queue: ripping up everything, a net with more than
+/// one pin; incremental, a net not routed before (whatever its pins).
+pub fn first_ripped(ripup: RipUp, pins: usize, routed_before: bool) -> bool {
+    if ripup == RipUp::Incr {
+        !routed_before
+    } else {
+        pins > 1
+    }
+}
+
+/// Whether a marker may NOT rip up a worker net: in an incremental iteration, a net routed before.
+pub fn ripup_pinned(ripup: RipUp, routed_before: bool) -> bool {
+    ripup == RipUp::Incr && routed_before
+}
+
 /// One strategy row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IterArgs {
@@ -482,6 +508,30 @@ pub fn stubborn_batches(boxes: &[Vec<Rect>], bloat: i32) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule: an incremental run rips up only the nets not routed before in iterations 0–2 where
+    // the strategy rips up everything; later rows, and other modes, as the strategy says.
+    #[test]
+    fn an_incremental_run_rips_up_incrementally_in_its_first_three_iterations() {
+        assert_eq!((0..4).map(|i| effective_ripup(RipUp::All, true, i)).collect::<Vec<_>>(), vec![RipUp::Incr, RipUp::Incr, RipUp::Incr, RipUp::All]);
+        assert_eq!(effective_ripup(RipUp::All, false, 0), RipUp::All);
+        assert_eq!(effective_ripup(RipUp::Drc, true, 1), RipUp::Drc);
+    }
+
+    // Rule: the first queue takes, ripping up everything, nets with more than one pin;
+    // incrementally, the nets not routed before — a one-pin one too.
+    #[test]
+    fn the_first_queue_takes_the_nets_the_mode_rips_up() {
+        assert!(!first_ripped(RipUp::All, 1, false) && first_ripped(RipUp::All, 2, true));
+        assert!(first_ripped(RipUp::Incr, 1, false) && !first_ripped(RipUp::Incr, 5, true));
+    }
+
+    // Rule: in an incremental iteration a marker may not rip up a net routed before.
+    #[test]
+    fn a_net_routed_before_is_pinned_only_incrementally() {
+        assert!(ripup_pinned(RipUp::Incr, true));
+        assert!(!ripup_pinned(RipUp::Incr, false) && !ripup_pinned(RipUp::Drc, true) && !ripup_pinned(RipUp::All, true));
+    }
     use crate::gc::Owner;
 
     fn r(xl: i32, yl: i32, xh: i32, yh: i32) -> Rect {
@@ -578,6 +628,8 @@ mod tests {
         assert!(written_back(2, RipUp::Drc, &wm, 1) && !written_back(2, RipUp::Drc, &wm, 2));
         assert!(written_back(2, RipUp::All, &wm, 5) && !written_back(2, RipUp::All, &wm, 6));
         assert!(written_back(0, RipUp::All, &worker_markers(Vec::new(), 0), 99));
+        // Incremental: neither cap — written back however many markers it ends with.
+        assert!(written_back(2, RipUp::Incr, &wm, 99));
     }
 
     /// Rule: optimization above 100 markers or when all is ripped up; else guides after an
