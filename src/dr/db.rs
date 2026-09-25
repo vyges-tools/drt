@@ -55,6 +55,10 @@ pub struct TaDesign {
     pub nets: Vec<TaNet>,
     pub net_index: HashMap<String, usize>,
     pub fixed: Vec<Vec<(Rect, Fixed)>>,
+    /// Beside each fixed shape, who owns it as the design-rule check sees it: a net (special nets
+    /// too), an unconnected terminal (or the floating power / ground owner), an instance's
+    /// obstructions, a routing blockage.
+    pub owners: Vec<Vec<Owner>>,
 }
 
 /// Refuses (`Err`) a special wire with no shape type: its ends would extend by half its width,
@@ -72,19 +76,23 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
         nets.push(TaNet { is_clock: db.net_get_sig_type(&n) == "CLOCK", name: n, ndr: None });
     }
     let mut fixed: Vec<Vec<(Rect, Fixed)>> = vec![Vec::new(); tech.layers.len()];
+    let mut owners: Vec<Vec<Owner>> = vec![Vec::new(); tech.layers.len()];
     let layer_of = |l: i64| tech.layer_num(&db.layer_name_by_number(l));
     for (i, inst) in insts.iter().enumerate() {
         let m = &masters[&inst.unique.master];
         for (t, term) in m.terms.iter().enumerate() {
             let net = inst.nets[t].as_ref().and_then(|n| net_index.get(n)).copied();
+            let owner = crate::pa::verdict::design_owner(inst.nets[t].as_deref(), &term.sig, Owner::InstTerm(inst.name.clone(), term.name.clone()));
             for pin in &term.pins {
                 for &(l, r) in &pin.shapes {
                     fixed[l].push((inst.transform.apply(r), Fixed::InstTerm { net, inst: i, term: t }));
+                    owners[l].push(owner.clone());
                 }
             }
         }
         for &(l, r) in &m.blockages {
             fixed[l].push((inst.transform.apply(r), Fixed::InstBlockage { big: inst.class == MasterClass::Macro }));
+            owners[l].push(Owner::Inst(inst.name.clone()));
         }
     }
     for (k, port) in ports.iter().enumerate() {
@@ -95,6 +103,7 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
         for pin in &port.pins {
             for &(l, r) in pin {
                 fixed[l].push((r, Fixed::BTerm { net, port: k }));
+                owners[l].push(port.owner.clone());
             }
         }
     }
@@ -116,14 +125,16 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
                 if let Some(l) = layer_of(l) {
                     let f = if from_via { Fixed::Via { supply } } else { Fixed::Seg { supply } };
                     fixed[l].push((Rect::new(x0, y0, x1, y1), f));
+                    owners[l].push(Owner::Net(n.clone()));
                 }
             }
         }
     }
-    for (l, x0, y0, x1, y1) in db.obstruction_boxes().map_err(|e| e.to_string())? {
+    for (b, (l, x0, y0, x1, y1)) in db.obstruction_boxes().map_err(|e| e.to_string())?.into_iter().enumerate() {
         if let Some(l) = layer_of(l) {
             fixed[l].push((Rect::new(x0, y0, x1, y1), Fixed::Blockage));
+            owners[l].push(Owner::Blockage(b));
         }
     }
-    Ok(TaDesign { nets, net_index, fixed })
+    Ok(TaDesign { nets, net_index, fixed, owners })
 }

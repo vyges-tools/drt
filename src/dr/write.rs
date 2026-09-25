@@ -117,7 +117,9 @@ pub fn write_path(w: &CostWorker<'_, '_>, cx: &WriteCtx<'_>, points: &[Idx]) -> 
                         via = v;
                     }
                 }
-                out.push(DrFig::Via { via, origin, bi: (start.0 as usize, start.1 as usize, z as usize), ei: (start.0 as usize, start.1 as usize, z as usize + 1) });
+                // Tapered: a rule net's via at a point of a taper box on either of the path's layers.
+                let tapered = cx.ndr.is_some() && cx.auto_taper && (cx.taper_at.contains_key(&(end.0, end.1, start.2)) || cx.taper_at.contains_key(&(end.0, end.1, end.2)));
+                out.push(DrFig::Via { via, origin, bi: (start.0 as usize, start.1 as usize, z as usize), ei: (start.0 as usize, start.1 as usize, z as usize + 1), tapered });
             }
         }
     }

@@ -39,6 +39,8 @@ pub enum Owner {
     BlockTerm(String),
     /// An instance: its obstructions.
     Inst(String),
+    /// A routing blockage (each its own owner, by its index in the design).
+    Blockage(usize),
     /// Every unconnected ground terminal's design shapes.
     FloatingGround,
     /// Every unconnected power terminal's design shapes.
@@ -47,7 +49,7 @@ pub enum Owner {
 
 impl Owner {
     pub fn is_blockage(&self) -> bool {
-        matches!(self, Owner::Inst(_))
+        matches!(self, Owner::Inst(_) | Owner::Blockage(_))
     }
 }
 
@@ -80,6 +82,9 @@ struct Shape {
     rect: Rect,
     net: usize,
     fixed: bool,
+    /// A route rectangle touching one of its net's tapered shapes (a non-default-rule net inside
+    /// a pin's taper box): the rule's spacing does not apply to it.
+    tapered: bool,
 }
 
 /// A boundary edge, from `from` to `to`.
@@ -216,6 +221,11 @@ struct Net {
     fixed_slices: Vec<Vec<Rect>>,
     route_slices: Vec<Vec<Rect>>,
     fixed_max: Vec<Vec<Rect>>,
+    /// A non-default-rule net: its spacing per z (layer / 2 − 1).
+    ndr_spacing: Option<Vec<i32>>,
+    /// A non-default-rule net's route shapes, tapered or not, per layer.
+    tapered: Vec<Vec<Rect>>,
+    non_tapered: Vec<Vec<Rect>>,
 }
 
 pub struct Worker<'a> {
@@ -229,6 +239,17 @@ pub struct Worker<'a> {
     /// Skip end-of-line checks on edges running along the layer's direction above the first metal
     /// layer (the long sides of a wire): set for via and pattern trials, not planar ones.
     pub ignore_long_side_eol: bool,
+    /// Check only from this owner's shapes (the detailed router checks the net it just routed
+    /// against everything around it); every owner when unset.
+    pub target: Option<Owner>,
+    /// Apply non-default rules (the detailed router's checks): the largest rule spacing widens
+    /// the search, a rule net's untapered route rectangles need its spacing, and each tapered
+    /// rectangle's untapered neighbours are checked as special spacing rectangles.
+    pub check_ndrs: bool,
+    /// Per z, the largest spacing of any non-default rule in the technology.
+    pub max_ndr_spacing: Vec<i32>,
+    /// Per layer, the special spacing rectangles (after `init`).
+    spc: Vec<Vec<Shape>>,
     markers: Vec<Marker>,
     seen: BTreeSet<(Rect, usize, Rule, Vec<Owner>)>,
 }
@@ -388,7 +409,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, max_ndr_spacing: Vec::new(), spc: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -406,6 +427,8 @@ impl<'a> Worker<'a> {
             fixed_cuts: vec![Vec::new(); n],
             route_cuts: vec![Vec::new(); n],
             fixed_rects: vec![Vec::new(); n],
+            tapered: vec![Vec::new(); n],
+            non_tapered: vec![Vec::new(); n],
             ..Net::default()
         });
         self.index.insert(owner.clone(), self.nets.len() - 1);
@@ -427,6 +450,22 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// A non-default-rule owner: its spacing per z.
+    pub fn set_ndr_spacing(&mut self, owner: &Owner, spacing: Vec<i32>) {
+        let i = self.net(owner);
+        self.nets[i].ndr_spacing = Some(spacing);
+    }
+
+    /// A non-default-rule owner's route shape, tapered or not (besides [`Worker::add`]).
+    pub fn add_taper(&mut self, owner: &Owner, layer: usize, r: Rect, tapered: bool) {
+        let i = self.net(owner);
+        if tapered {
+            self.nets[i].tapered[layer].push(r);
+        } else {
+            self.nets[i].non_tapered[layer].push(r);
+        }
+    }
+
     /// Per owner and layer: the merged shapes' maximal rectangles (fixed or not) and boundary
     /// edges; cut rectangles as they are.
     pub fn init(&mut self) {
@@ -434,6 +473,7 @@ impl<'a> Worker<'a> {
         self.shapes = vec![Vec::new(); n];
         self.edges = vec![Vec::new(); n];
         self.segs = vec![Vec::new(); n];
+        self.spc = vec![Vec::new(); n];
         for (i, net) in self.nets.iter_mut().enumerate() {
             net.fixed_slices = net.fixed.iter_mut().map(|s| s.rectangles()).collect();
             net.route_slices = net.route.iter_mut().map(|s| s.rectangles()).collect();
@@ -456,11 +496,20 @@ impl<'a> Worker<'a> {
                 }
                 for r in all.max_rectangles() {
                     let fixed = net.fixed_max[layer].contains(&r);
-                    self.shapes[layer].push(Shape { rect: r, net: i, fixed });
+                    let mut tapered = false;
+                    if !fixed && net.tapered[layer].iter().any(|t| touches(&r, t)) {
+                        tapered = true;
+                        for nt in &net.non_tapered[layer] {
+                            if touches(&r, nt) {
+                                self.spc[layer].push(Shape { rect: *nt, net: i, fixed: false, tapered: false });
+                            }
+                        }
+                    }
+                    self.shapes[layer].push(Shape { rect: r, net: i, fixed, tapered });
                 }
                 for &r in net.route_cuts[layer].iter().chain(&net.fixed_cuts[layer]) {
                     let fixed = net.fixed_cuts[layer].contains(&r);
-                    self.shapes[layer].push(Shape { rect: r, net: i, fixed });
+                    self.shapes[layer].push(Shape { rect: r, net: i, fixed, tapered: false });
                 }
             }
         }
@@ -473,6 +522,11 @@ impl<'a> Worker<'a> {
         self.check_metal_end_of_line();
         self.check_cut_spacing();
         &self.markers
+    }
+
+    /// Whether checks start from this owner's shapes.
+    fn checks_from(&self, net: usize) -> bool {
+        self.target.as_ref().is_none_or(|t| self.nets[net].owner.as_ref() == Some(t))
     }
 
     fn owner(&self, net: usize) -> &Owner {
@@ -506,6 +560,9 @@ impl<'a> Worker<'a> {
             let vertical = l.is_vertical();
             let rules = l.eol.clone();
             for net in 0..self.nets.len() {
+                if !self.checks_from(net) {
+                    continue;
+                }
                 for k in 0..self.segs[layer].len() {
                     let e = self.segs[layer][k];
                     if e.net != net {
@@ -701,29 +758,58 @@ impl<'a> Worker<'a> {
                 continue;
             }
             for net in 0..self.nets.len() {
+                if !self.checks_from(net) {
+                    continue;
+                }
                 let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.shapes[layer][k].net == net).collect();
                 for k in mine {
-                    self.metal_spacing_of(layer, k);
+                    let s = self.shapes[layer][k];
+                    self.metal_spacing_of(layer, s, false);
+                }
+                // The owner's special spacing rectangles (on any layer; markers are kept once).
+                if self.check_ndrs {
+                    for sl in 0..self.spc.len() {
+                        let mine: Vec<Shape> = self.spc[sl].iter().filter(|s| s.net == net).copied().collect();
+                        for s in mine {
+                            self.metal_spacing_of(sl, s, true);
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn metal_spacing_of(&mut self, layer: usize, k: usize) {
-        let max_spc = self.tech.layers[layer].spacing.as_ref().map_or(0, |t| t.find_max());
-        let q = bloat(&self.shapes[layer][k].rect, max_spc);
+    fn metal_spacing_of(&mut self, layer: usize, s: Shape, is_spc: bool) {
+        let z = (layer / 2).saturating_sub(1);
+        let max_spc = self.tech.layers[layer].spacing.as_ref().map_or(0, |t| {
+            let m = t.find_max();
+            if self.check_ndrs {
+                m.max(self.max_ndr_spacing.get(z).copied().unwrap_or(0))
+            } else {
+                m
+            }
+        });
+        let q = bloat(&s.rect, max_spc);
+        if self.check_ndrs {
+            let others: Vec<Shape> = self.spc[layer].iter().filter(|o| touches(&o.rect, &q)).copied().collect();
+            for o in others {
+                self.metal_spacing_pair(layer, s, o, is_spc, true);
+            }
+        }
         for o in self.query(layer, &q) {
-            self.metal_spacing_pair(layer, k, o);
+            let o = self.shapes[layer][o];
+            self.metal_spacing_pair(layer, s, o, is_spc, false);
         }
     }
 
     /// Two shapes: overlapping or touching is a short (or non-sufficient metal within one owner);
-    /// apart, the spacing table.
-    fn metal_spacing_pair(&mut self, layer: usize, k1: usize, k2: usize) {
-        if k1 == k2 {
+    /// apart, the spacing table. (`is_spc`: the first is a special spacing rectangle; `other_spc`:
+    /// the second is.)
+    fn metal_spacing_pair(&mut self, layer: usize, r1: Shape, r2: Shape, is_spc: bool, other_spc: bool) {
+        // The same object: a shape against itself.
+        if is_spc == other_spc && r1.rect == r2.rect && r1.net == r2.net && r1.fixed == r2.fixed {
             return;
         }
-        let (r1, r2) = (self.shapes[layer][k1], self.shapes[layer][k2]);
         let dist_x = gap((r1.rect.xl, r1.rect.xh), (r2.rect.xl, r2.rect.xh));
         let dist_y = gap((r1.rect.yl, r1.rect.yh), (r2.rect.yl, r2.rect.yh));
         let mut marker = generalized_intersect(&r1.rect, &r2.rect);
@@ -752,7 +838,7 @@ impl<'a> Worker<'a> {
                 self.short(layer, r1, r2, marker);
             }
         } else {
-            self.spacing_table(layer, r1, r2, marker, prl_x.max(prl_y), dist_x, dist_y);
+            self.spacing_table(layer, r1, r2, marker, prl_x.max(prl_y), dist_x, dist_y, !is_spc);
         }
     }
 
@@ -767,11 +853,21 @@ impl<'a> Worker<'a> {
     /// Apart but closer than the table allows is a violation only when the gap lies between TRUE
     /// boundary edges of the two owners (both sides of it), and some trial shape reaches it.
     #[allow(clippy::too_many_arguments)]
-    fn spacing_table(&mut self, layer: usize, r1: Shape, r2: Shape, marker: Rect, prl: i32, dist_x: i32, dist_y: i32) {
+    fn spacing_table(&mut self, layer: usize, r1: Shape, r2: Shape, marker: Rect, prl: i32, dist_x: i32, dist_y: i32, check_poly_edge: bool) {
         if r1.fixed && r2.fixed {
             return;
         }
-        let req = i64::from(self.required_spacing(layer, &r1, &r2, prl));
+        let mut req = i64::from(self.required_spacing(layer, &r1, &r2, prl));
+        if self.check_ndrs {
+            let z = (layer / 2).saturating_sub(1);
+            let ndr = |s: &Shape| -> i64 {
+                if s.fixed || s.tapered {
+                    return 0;
+                }
+                self.nets[s.net].ndr_spacing.as_ref().and_then(|v| v.get(z)).map_or(0, |&v| i64::from(v))
+            };
+            req = req.max(ndr(&r1)).max(ndr(&r2));
+        }
         if i64::from(dist_x).pow(2) + i64::from(dist_y).pow(2) >= req * req {
             return;
         }
@@ -783,10 +879,14 @@ impl<'a> Worker<'a> {
         } else {
             1
         };
-        if !self.has_poly_edges(layer, &r1, &r2, &marker, kind, prl) {
-            return;
-        }
-        if !self.has_route(layer, &r1, &marker) && !self.has_route(layer, &r2, &marker) {
+        if check_poly_edge {
+            if !self.has_poly_edges(layer, &r1, &r2, &marker, kind, prl) {
+                return;
+            }
+            if !self.has_route(layer, &r1, &marker) && !self.has_route(layer, &r2, &marker) {
+                return;
+            }
+        } else if !self.spc_marker_outside_net(layer, r1.net, &marker) {
             return;
         }
         self.add_marker(Rule::MetalSpacing, layer, marker, r1.net, r2.net);
@@ -832,6 +932,40 @@ impl<'a> Worker<'a> {
             }
         }
         ((kind == 0 || kind == 2) && b && t) || ((kind == 1 || kind == 2) && l && r)
+    }
+
+    /// A special spacing rectangle's marker stands when some of it lies outside its owner's route
+    /// shapes; a marker with no extent one way is widened by 1 each side there, and stands unless
+    /// what remains is one rectangle with a side on the marker's own line.
+    fn spc_marker_outside_net(&self, layer: usize, net: usize, m: &Rect) -> bool {
+        let route = &self.nets[net].route_slices[layer];
+        let zero_x = m.dx() == 0;
+        let zero = zero_x || m.dy() == 0;
+        let mut r = *m;
+        if zero {
+            if zero_x {
+                r.xl -= 1;
+                r.xh += 1;
+            } else {
+                r.yl -= 1;
+                r.yh += 1;
+            }
+        }
+        let rest = subtract(&r, route);
+        if rest.is_empty() {
+            return false;
+        }
+        if zero && rest.len() == 1 {
+            let q = rest[0];
+            if zero_x {
+                if q.xl == m.xl || q.xh == m.xl {
+                    return false;
+                }
+            } else if q.yl == m.yl || q.yh == m.yl {
+                return false;
+            }
+        }
+        true
     }
 
     /// Whether a trial shape of the rectangle's owner lies near the marker: the rectangle's part
@@ -950,6 +1084,9 @@ impl<'a> Worker<'a> {
             let l = &self.tech.layers[layer];
             let Some(spc) = l.cut_spacing.filter(|_| l.kind == LayerKind::Cut) else { continue };
             for net in 0..self.nets.len() {
+                if !self.checks_from(net) {
+                    continue;
+                }
                 let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.shapes[layer][k].net == net).collect();
                 for k in mine {
                     let q = bloat(&self.shapes[layer][k].rect, spc);
@@ -984,6 +1121,40 @@ impl<'a> Worker<'a> {
         }
         self.add_marker(Rule::CutSpacing, layer, marker, r1.net, r2.net);
     }
+}
+
+/// A rectangle minus a set of rectangles, as the set's slices (the remainder merged, then cut
+/// into rectangles along the scan).
+fn subtract(r: &Rect, minus: &[Rect]) -> Vec<Rect> {
+    let mut xs: Vec<i32> = vec![r.xl, r.xh];
+    let mut ys: Vec<i32> = vec![r.yl, r.yh];
+    for m in minus {
+        for x in [m.xl, m.xh] {
+            if x > r.xl && x < r.xh {
+                xs.push(x);
+            }
+        }
+        for y in [m.yl, m.yh] {
+            if y > r.yl && y < r.yh {
+                ys.push(y);
+            }
+        }
+    }
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    let mut set = Polygon90Set::new();
+    for wx in xs.windows(2) {
+        for wy in ys.windows(2) {
+            let cell = Rect::new(wx[0], wy[0], wx[1], wy[1]);
+            let covered = minus.iter().any(|m| m.xl <= cell.xl && m.xh >= cell.xh && m.yl <= cell.yl && m.yh >= cell.yh);
+            if !covered {
+                set.insert_rect(cell);
+            }
+        }
+    }
+    set.rectangles()
 }
 
 #[cfg(test)]

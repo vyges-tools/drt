@@ -725,7 +725,8 @@ impl CostWorker<'_, '_> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrFig {
     Seg { layer: usize, begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool },
-    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize) },
+    /// `tapered`: a non-default-rule net's via inside a pin's taper box.
+    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool },
     Patch { layer: usize, origin: P, offset: Rect },
 }
 
@@ -789,7 +790,7 @@ impl CostWorker<'_, '_> {
                     self.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
                 }
             }
-            DrFig::Via { via, origin, bi, ei } => {
+            DrFig::Via { via, origin, bi, ei, .. } => {
                 let vd = &tech.via_defs[via];
                 for (b, z) in [(shift(&bbox(&vd.layer1_figs), origin), bi.2), (shift(&bbox(&vd.layer2_figs), origin), ei.2)] {
                     self.mod_min_spacing_cost_planar(&b, z, t, false, ndr, false, true, true);
