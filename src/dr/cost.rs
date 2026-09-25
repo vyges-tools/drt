@@ -24,6 +24,8 @@ use crate::rtree::PackedRTree;
 use crate::tech::{LayerKind, Tech};
 
 type P = (i32, i32);
+/// A net's non-default rule, with its end-of-line rule per z.
+pub type Ndr<'a> = (&'a NdrRule, &'a [Option<EolTable>]);
 /// A non-default rule as a via's spacing reads it: width, spacing, preferred via up and down, its
 /// end-of-line rule.
 type NdrVia = (i32, i32, Option<usize>, Option<usize>, EolTable);
@@ -284,6 +286,8 @@ pub struct CostCtx<'a> {
     /// nets counts twice), with their end-of-line rules per routing-layer index.
     pub ndrs: Vec<(&'a NdrRule, Vec<Option<EolTable>>)>,
     pub use_min_spacing_obs: bool,
+    /// Per routing-layer index, the via-through table: below/above (`k / 2`), along x/y (`k % 2`).
+    pub through: &'a [[bool; 4]],
     /// The via-access layer (a layer number; 2 unless set): instance pins at or below half of it,
     /// less one, as a grid z, also cost planar spacing as a blockage does.
     pub via_access_layer: usize,
@@ -357,10 +361,10 @@ impl CostWorker<'_, '_> {
     /// Planar spacing costs around a shape: once for the default wire, then once per
     /// non-default rule of the worker's nets.
     #[allow(clippy::too_many_arguments)]
-    pub fn mod_min_spacing_cost_planar(&mut self, b: &Rect, z: usize, t: ModCost, is_blockage: bool, ndr: Option<&NdrRule>, is_macro_pin: bool, reset_h: bool, reset_v: bool) {
+    pub fn mod_min_spacing_cost_planar(&mut self, b: &Rect, z: usize, t: ModCost, is_blockage: bool, ndr: Option<Ndr<'_>>, is_macro_pin: bool, reset_h: bool, reset_v: bool) {
         let l = self.g.zs[z];
         let w = self.cx.width(l);
-        let dsp = ndr.map_or(0, |n| n.spacings.get(z).copied().unwrap_or(0));
+        let dsp = ndr.map_or(0, |(n, _)| n.spacings.get(z).copied().unwrap_or(0));
         self.mod_min_spacing_cost_planar_helper(b, z, t, w, dsp, is_blockage, is_macro_pin, reset_h, reset_v, false);
         let ndrs: Vec<(i32, i32)> = self.cx.ndrs.iter().map(|(n, _)| (n.widths.get(z).copied().unwrap_or(0), n.spacings.get(z).copied().unwrap_or(0))).collect();
         for (nw, ns) in ndrs {
@@ -448,7 +452,7 @@ impl CostWorker<'_, '_> {
     /// Via spacing costs around a shape: for the via below or above (the layer's default, or a
     /// non-default rule's preferred), at each node where it would sit too close.
     #[allow(clippy::too_many_arguments)]
-    pub fn mod_min_spacing_cost_via(&mut self, b: &Rect, z: usize, t: ModCost, upper: bool, curr_ps: bool, is_blockage: bool, ndr: Option<&NdrRule>) {
+    pub fn mod_min_spacing_cost_via(&mut self, b: &Rect, z: usize, t: ModCost, upper: bool, curr_ps: bool, is_blockage: bool, ndr: Option<Ndr<'_>>) {
         let l = self.g.zs[z];
         let (min_l, max_l) = (self.g.zs[0], *self.g.zs.last().expect("a layer"));
         let default_via = if upper {
@@ -458,8 +462,9 @@ impl CostWorker<'_, '_> {
         } else {
             None
         };
-        let dsp = ndr.map_or(0, |n| n.spacings.get(z).copied().unwrap_or(0));
-        let dcon = EolTable::default();
+        let dsp = ndr.map_or(0, |(n, _)| n.spacings.get(z).copied().unwrap_or(0));
+        // The net's own rule's end of line (none: the layer's, chosen in the helper).
+        let dcon = ndr.and_then(|(_, e)| e.get(z).copied().flatten()).unwrap_or_default();
         let w = self.cx.width(l);
         self.mod_min_spacing_cost_via_helper(b, z, t, w, dsp, default_via, dcon, upper, curr_ps, is_blockage, false);
         let ndrs: Vec<NdrVia> = self
@@ -673,7 +678,8 @@ impl CostWorker<'_, '_> {
 
     /// Cut spacing costs around a cut shape: the default via's cut at each node too close to it
     /// (one plain, edge-to-edge, different-net rule).
-    pub fn mod_cut_spacing_cost(&mut self, b: &Rect, z: usize, t: ModCost) {
+    /// `avoid`: a node left alone (the via's own, when a routed via's cut is the shape).
+    pub fn mod_cut_spacing_cost(&mut self, b: &Rect, z: usize, t: ModCost, avoid: Option<(usize, usize)>) {
         let tech = self.cx.tech;
         let cut = self.g.zs[z] + 1;
         let Some(spacing) = tech.layers.get(cut).and_then(|c| c.cut_spacing) else { return };
@@ -687,6 +693,9 @@ impl CostWorker<'_, '_> {
         let req = i64::from(spacing) * i64::from(spacing);
         for i in x1..=x2 {
             for j in y1..=y2 {
+                if avoid == Some((i, j)) {
+                    continue;
+                }
                 let p = (self.g.xs[i], self.g.ys[j]);
                 for f in cf.clone() {
                     let (d2, _, _) = box_box_d2(b, &shift(&f, p));
@@ -696,6 +705,101 @@ impl CostWorker<'_, '_> {
                         break;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// A shape a route writes: a wire (its ends as maze indices too), a via (bottom and top maze
+/// indices), or a patch (its layer's metal around an origin).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrFig {
+    Seg { layer: usize, begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool },
+    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize) },
+    Patch { layer: usize, origin: P, offset: Rect },
+}
+
+impl DrFig {
+    /// A wire's box: extended past its ends by their extensions, half its width to each side.
+    pub fn seg_box(begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32) -> Rect {
+        let hw = width / 2;
+        if begin.1 == end.1 {
+            Rect { xl: begin.0 - begin_ext, yl: begin.1 - hw, xh: end.0 + end_ext, yh: end.1 + hw }
+        } else {
+            Rect { xl: begin.0 - hw, yl: begin.1 - begin_ext, xh: end.0 + hw, yh: end.1 + end_ext }
+        }
+    }
+}
+
+fn bbox(figs: &[Rect]) -> Rect {
+    figs.iter().skip(1).fold(figs[0], |a, f| Rect { xl: a.xl.min(f.xl), yl: a.yl.min(f.yl), xh: a.xh.max(f.xh), yh: a.yh.max(f.yh) })
+}
+
+impl CostWorker<'_, '_> {
+    /// A route shape's costs on the grid: its spacing to wires and vias, the vias it forbids
+    /// passing through a wire, its end of line (a wire only along its layer's direction — the
+    /// other way ends at a via or a wire, never at an end), a via's cut spacing (not at its own
+    /// node).
+    pub fn mod_path_cost(&mut self, fig: &DrFig, t: ModCost, mod_eol: bool, mod_cut: bool, ndr: Option<Ndr<'_>>) {
+        let tech = self.cx.tech;
+        let eol_of = |z: usize| ndr.and_then(|(_, e)| e.get(z).copied().flatten());
+        match *fig {
+            DrFig::Seg { layer, begin, end, width, begin_ext, end_ext, bi, ei, tapered } => {
+                let b = DrFig::seg_box(begin, end, width, begin_ext, end_ext);
+                let ndr = if tapered { None } else { ndr };
+                let z = bi.2;
+                self.mod_min_spacing_cost_planar(&b, z, t, false, ndr, false, true, true);
+                self.mod_min_spacing_cost_via(&b, z, t, true, true, false, ndr);
+                self.mod_min_spacing_cost_via(&b, z, t, false, true, false, ndr);
+                self.mod_via_forbidden_through(bi, ei, t);
+                if mod_eol && tech.layers[layer].is_horizontal() == (bi.1 == ei.1) {
+                    self.mod_eol_spacing_rules_cost(&b, z, t, false, ndr.and(eol_of(z)), true, true);
+                }
+            }
+            DrFig::Patch { layer, origin, offset } => {
+                let Some(z) = self.g.z_of(layer) else { return };
+                let b = shift(&offset, origin);
+                self.mod_min_spacing_cost_planar(&b, z, t, false, ndr, false, true, true);
+                self.mod_min_spacing_cost_via(&b, z, t, true, true, false, ndr);
+                self.mod_min_spacing_cost_via(&b, z, t, false, true, false, ndr);
+                if mod_eol {
+                    self.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
+                }
+            }
+            DrFig::Via { via, origin, bi, ei } => {
+                let vd = &tech.via_defs[via];
+                for (b, z) in [(shift(&bbox(&vd.layer1_figs), origin), bi.2), (shift(&bbox(&vd.layer2_figs), origin), ei.2)] {
+                    self.mod_min_spacing_cost_planar(&b, z, t, false, ndr, false, true, true);
+                    self.mod_min_spacing_cost_via(&b, z, t, true, false, false, ndr);
+                    self.mod_min_spacing_cost_via(&b, z, t, false, false, false, ndr);
+                    if mod_eol {
+                        self.mod_eol_spacing_rules_cost(&b, z, t, false, eol_of(z), true, true);
+                    }
+                }
+                if mod_cut {
+                    for f in vd.cut_figs.clone() {
+                        self.mod_cut_spacing_cost(&shift(&f, origin), bi.2, t, Some((bi.0, bi.1)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Via cost at every node a wire runs over (not its last) where the layer forbids a via
+    /// through a wire in that direction.
+    fn mod_via_forbidden_through(&mut self, bi: (usize, usize, usize), ei: (usize, usize, usize), t: ModCost) {
+        let horz = bi.1 == ei.1;
+        let row = self.cx.through.get(bi.2).copied().unwrap_or_default();
+        let (lower, upper) = (row[usize::from(!horz)], row[2 + usize::from(!horz)]);
+        let steps: Vec<(usize, usize)> = if horz { (bi.0..ei.0).map(|x| (x, bi.1)).collect() } else { (bi.1..ei.1).map(|y| (bi.0, y)).collect() };
+        for (x, y) in steps {
+            if lower && bi.2 > 0 {
+                let k = self.g.idx(x, y, bi.2 - 1);
+                self.g.mod_via(k, t, false);
+            }
+            if upper {
+                let k = self.g.idx(x, y, bi.2);
+                self.g.mod_via(k, t, false);
             }
         }
     }
@@ -719,30 +823,37 @@ pub fn init_maze_cost(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect
 /// for each boundary edge shorter than the layer's end-of-line width, route cost where a wire
 /// or via would sit in the space beyond it.
 fn init_maze_cost_conn_fig(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect) {
-    let tech = w.cx.tech;
     let owners: BTreeSet<usize> = nets.iter().map(|n| n.net).collect();
     for &owner in &owners {
-        for l in 0..tech.layers.len() {
-            if tech.layers[l].kind != LayerKind::Routing {
+        mod_eol_costs_poly(w, owner, ext_box, ModCost::AddRoute);
+    }
+}
+
+/// A net's end-of-line route costs from its shapes in the worker (before routing, its pin shapes
+/// the fixed-shape query returns), merged per layer: every boundary edge shorter than the
+/// layer's end-of-line width.
+pub fn mod_eol_costs_poly(w: &mut CostWorker<'_, '_>, owner: usize, ext_box: &Rect, t: ModCost) {
+    let tech = w.cx.tech;
+    for l in 0..tech.layers.len() {
+        if tech.layers[l].kind != LayerKind::Routing {
+            continue;
+        }
+        let eol = w.cx.eol_of(l);
+        if eol.space == 0 {
+            continue;
+        }
+        let Some(z) = w.g.z_of(l) else { continue };
+        let mut set = Polygon90Set::new();
+        for (b, obj) in w.cx.fixed.get(l).map_or(Vec::new(), |t| t.query(ext_box)) {
+            if obj.term_net() == Some(Some(owner)) {
+                set.insert_rect(*b);
+            }
+        }
+        for e in set.boundary_edges() {
+            if e.high - e.low >= eol.width {
                 continue;
             }
-            let eol = w.cx.eol_of(l);
-            if eol.space == 0 {
-                continue;
-            }
-            let Some(z) = w.g.z_of(l) else { continue };
-            let mut set = Polygon90Set::new();
-            for (b, obj) in w.cx.fixed.get(l).map_or(Vec::new(), |t| t.query(ext_box)) {
-                if obj.term_net() == Some(Some(owner)) {
-                    set.insert_rect(*b);
-                }
-            }
-            for e in set.boundary_edges() {
-                if e.high - e.low >= eol.width {
-                    continue;
-                }
-                w.mod_eol_cost(&e, z, eol, ModCost::AddRoute);
-            }
+            w.mod_eol_cost(&e, z, eol, t);
         }
     }
 }
@@ -780,7 +891,7 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
                     w.mod_blocked_planar(b, z, true);
                     w.mod_blocked_via(b, z, true);
                 } else {
-                    w.mod_cut_spacing_cost(b, z, ModCost::AddFixed);
+                    w.mod_cut_spacing_cost(b, z, ModCost::AddFixed, None);
                 }
             }
         }
@@ -800,7 +911,7 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
                             w.mod_eol_spacing_rules_cost(b, z, ModCost::AddFixed, false, None, true, true);
                         }
                     } else {
-                        w.mod_cut_spacing_cost(b, z, ModCost::AddFixed);
+                        w.mod_cut_spacing_cost(b, z, ModCost::AddFixed, None);
                     }
                 }
                 Fixed::Seg { supply } => {
@@ -821,7 +932,7 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
                         w.mod_eol_spacing_rules_cost(b, z, ModCost::AddFixed, false, None, true, true);
                     } else {
                         // (Adjacent-cut spacing: refused, not modelled.)
-                        w.mod_cut_spacing_cost(b, z, ModCost::AddFixed);
+                        w.mod_cut_spacing_cost(b, z, ModCost::AddFixed, None);
                     }
                 }
                 _ => {}
@@ -835,35 +946,44 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
 }
 
 fn init_maze_cost_terms(w: &mut CostWorker<'_, '_>, terms: &BTreeSet<TermKey>) -> Result<(), Unmodelled> {
-    let tech = w.cx.tech;
-    let (min_l, max_l) = (w.g.zs[0], *w.g.zs.last().expect("a layer"));
     for (_, _, _, obj) in terms {
-        let is_inst = matches!(obj, Fixed::InstTerm { .. });
         if let Fixed::InstTerm { inst, .. } = *obj {
             if (w.cx.inst_is_block)(inst) {
                 return Err(Unmodelled("a block master's pins".into()));
             }
         }
-        for (l, b) in (w.cx.term_shapes)(obj) {
-            if tech.layers[l].kind != LayerKind::Routing || l < min_l || l > max_l {
-                continue;
-            }
-            let z = w.g.z_of(l).expect("a grid layer");
-            let t = ModCost::AddFixed;
-            if is_inst {
-                w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
-                w.mod_min_spacing_cost_via(&b, z, t, false, false, false, None);
-                w.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
-                w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
-            } else {
-                w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
-                w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
-                w.mod_min_spacing_cost_via(&b, z, t, false, false, false, None);
-                w.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
-            }
-        }
+        mod_term_cost(w, obj, true, false);
     }
     Ok(())
+}
+
+/// One terminal's fixed-shape costs, every pin shape on a grid layer (cut shapes are not
+/// costed): a block pin's planar, via and end-of-line spacing; an instance pin's via (unless
+/// skipped — a net lifting its own pins keeps their via costs), end-of-line and planar spacing.
+pub fn mod_term_cost(w: &mut CostWorker<'_, '_>, obj: &Fixed, add: bool, skip_via: bool) {
+    let tech = w.cx.tech;
+    let (min_l, max_l) = (w.g.zs[0], *w.g.zs.last().expect("a layer"));
+    let is_inst = matches!(obj, Fixed::InstTerm { .. });
+    let t = if add { ModCost::AddFixed } else { ModCost::SubFixed };
+    for (l, b) in (w.cx.term_shapes)(obj) {
+        if tech.layers[l].kind != LayerKind::Routing || l < min_l || l > max_l {
+            continue;
+        }
+        let z = w.g.z_of(l).expect("a grid layer");
+        if is_inst {
+            if !skip_via {
+                w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
+                w.mod_min_spacing_cost_via(&b, z, t, false, false, false, None);
+            }
+            w.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
+            w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
+        } else {
+            w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
+            w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
+            w.mod_min_spacing_cost_via(&b, z, t, false, false, false, None);
+            w.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
+        }
+    }
 }
 
 fn init_maze_cost_ap(w: &mut CostWorker<'_, '_>, nets: &[DrNet]) {
@@ -951,7 +1071,7 @@ mod tests {
         let aps = |_: usize| Vec::new();
         let block = |_: usize| false;
         let fixed: Vec<PackedRTree<Fixed>> = Vec::new();
-        let cx = CostCtx { tech: t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block };
+        let cx = CostCtx { tech: t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block };
         let mut w = CostWorker { cx: &cx, g, ap_svia: BTreeMap::new() };
         f(&mut w)
     }

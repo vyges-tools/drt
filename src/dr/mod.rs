@@ -6,5 +6,7 @@ pub mod db;
 pub mod cost;
 pub mod drw;
 pub mod guides;
+pub mod maze;
+pub mod route;
 pub mod rules;
 pub mod ta;
