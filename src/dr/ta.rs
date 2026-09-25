@@ -234,6 +234,14 @@ fn shift(r: &Rect, p: P) -> Rect {
     Rect { xl: r.xl + p.0, yl: r.yl + p.1, xh: r.xh + p.0, yh: r.yh + p.1 }
 }
 
+/// The tracks within `lo..=hi` (both ends included), as a first and last index; the last below
+/// the first when none.
+pub fn track_range(tracks: &[i32], lo: i32, hi: i32) -> (i32, i32) {
+    let i1 = tracks.partition_point(|&x| x < lo) as i32;
+    let i2 = tracks.partition_point(|&x| x <= hi) as i32 - 1;
+    (i1, i2)
+}
+
 /// The shared state of a run: guides (with their tree) and the gr pin tree.
 pub struct TaState<'a> {
     pub input: TaInput<'a>,
@@ -329,10 +337,7 @@ impl<'s, 'a> Worker<'s, 'a> {
     }
 
     fn get_track_idx(&self, lo: i32, hi: i32, layer: usize) -> (i32, i32) {
-        let t = &self.track_locs[layer];
-        let i1 = t.partition_point(|&x| x < lo) as i32;
-        let i2 = t.partition_point(|&x| x <= hi) as i32 - 1;
-        (i1, i2)
+        track_range(&self.track_locs[layer], lo, hi)
     }
 
     // ---- init ----
@@ -1455,3 +1460,111 @@ pub fn track_assignment(st: &mut TaState<'_>, trace: &mut Option<Vec<TaEvent>>) 
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tech::{Dir, Layer, SpacingTable, ViaDef};
+
+    fn r(xl: i32, yl: i32, xh: i32, yh: i32) -> Rect {
+        Rect { xl, yl, xh, yh }
+    }
+
+    /// 0–1 placeholders, 2 horizontal routing, 3 cut, 4 vertical routing (width 100, pitch 200;
+    /// spacing 100, or 150 over runs above 200); one via whose lower metal is 300 wide.
+    fn tech() -> Tech {
+        let table = SpacingTable { widths: vec![0], prls: vec![0, 200], values: vec![vec![100, 150]] };
+        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone()), ..Default::default() };
+        let mut t = Tech::default();
+        t.layers = vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing: Some(100), ..Default::default() }, routing(Dir::Vertical)];
+        t.via_defs = vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-150, -50, 150, 50)], cut_figs: vec![r(-50, -50, 50, 50)], layer2_figs: vec![r(-50, -150, 50, 150)] }];
+        t
+    }
+
+    struct Fixture {
+        tech: Tech,
+        defaults: Vec<Option<usize>>,
+        eol: Vec<EolTable>,
+        grid: GCellGrid,
+        tracks: Vec<TrackPattern>,
+        nets: Vec<TaNet>,
+        fixed: Vec<Vec<(Rect, Fixed)>>,
+    }
+
+    fn fixture() -> Fixture {
+        Fixture {
+            tech: tech(),
+            defaults: vec![None, None, None, Some(0), None],
+            eol: vec![EolTable::default(); 2],
+            grid: GCellGrid { x: (0, 10, 1000), y: (0, 10, 1000), die: r(0, 0, 10000, 10000) },
+            tracks: vec![TrackPattern { layer: 2, vertical_tracks: false, start: 100, num: 50, spacing: 200 }, TrackPattern { layer: 4, vertical_tracks: true, start: 100, num: 50, spacing: 200 }],
+            nets: vec![TaNet { name: "n".into(), is_clock: false, ndr: None }],
+            fixed: vec![Vec::new(); 5],
+        }
+    }
+
+    fn state(f: &Fixture, guides: Vec<TaGuide>) -> TaState<'_> {
+        let input = TaInput { tech: &f.tech, defaults: &f.defaults, eol: &f.eol, grid: &f.grid, die: f.grid.die, tracks: &f.tracks, nets: &f.nets, fixed: &f.fixed, terms: &[], gr_pins: &[], cfg: TaConfig::default() };
+        TaState::new(input, guides)
+    }
+
+    fn worker<'s, 'a>(st: &'s TaState<'a>, iter: usize) -> Worker<'s, 'a> {
+        let rb = st.input.grid.die;
+        let mut w = Worker { st, route_box: rb, ext_box: rb, horizontal: true, iter, hard: false, track_locs: Vec::new(), iroutes: Vec::new(), own: Vec::new(), shapes: Vec::new(), route_costs: Vec::new(), via_costs: Vec::new(), reassign: BTreeSet::new(), trace: None };
+        let n = st.input.tech.layers.len();
+        w.shapes = (0..n).map(|_| TrackIndex::new(true)).collect();
+        w.route_costs = (0..n).map(|_| TrackIndex::new(true)).collect();
+        w.via_costs = (0..n).map(|_| TrackIndex::new(true)).collect();
+        w.init_tracks();
+        w
+    }
+
+    // Both ends are inclusive: a track exactly at `lo` or `hi` is inside.
+    #[test]
+    fn a_track_range_includes_both_ends() {
+        let t = [0, 10, 20, 30];
+        assert_eq!(track_range(&t, 10, 20), (1, 2));
+        assert_eq!(track_range(&t, 11, 19), (2, 1));
+        assert_eq!(track_range(&t, -5, 35), (0, 3));
+    }
+
+    // Neighbours' wires can arrive inverted (the begin side's wire starts beyond the end side's):
+    // the span is swapped into order.
+    #[test]
+    fn an_inverted_span_is_swapped() {
+        let f = fixture();
+        let g = |layer, b, e, route| TaGuide { net: 0, layer, begin: b, end: e, route };
+        let guides = vec![g(2, (500, 500), (2500, 500), None), g(4, (500, 500), (500, 500), Some(((2300, 500), (2300, 700)))), g(4, (2500, 500), (2500, 500), Some(((700, 500), (700, 700))))];
+        let st = state(&f, guides);
+        let w = worker(&st, 1);
+        let (b, e, ..) = w.init_iroute_helper_generic(0);
+        assert_eq!((b, e), (700, 2300));
+    }
+
+    // A segment's via spacing on the track beside it runs over the VIA's length (not the
+    // shorter of the two): here 300, above the table's 200 column, so 150 is required and a
+    // track 100 away is blocked.
+    #[test]
+    fn a_wire_to_via_run_is_the_vias_length() {
+        let f = fixture();
+        let st = state(&f, vec![TaGuide { net: 0, layer: 2, begin: (1000, 300), end: (1000, 300), route: None }]);
+        let mut w = worker(&st, 0);
+        let seg = r(950, 250, 1050, 350);
+        w.mod_min_spacing_cost_via(&seg, 2, Owner::Net(0), 0, true, true, true, &mut None);
+        assert!(w.via_costs[3].query(&r(-100000, 500, 100000, 500)).count() > 0);
+    }
+
+    // Via costs count only within half a gcell of a wire's ends: one 700 in (beyond half of
+    // 1000) does not.
+    #[test]
+    fn via_costs_count_near_the_wire_ends_only() {
+        let f = fixture();
+        let st = state(&f, vec![TaGuide { net: 0, layer: 2, begin: (500, 500), end: (4500, 500), route: None }]);
+        let mut w = worker(&st, 0);
+        w.init_iroutes();
+        w.via_costs[2].push(r(700, 500, 700, 500), (Owner::None, Con::Short(2)));
+        assert_eq!(w.get_drc_cost_helper(0, &r(0, 500, 5000, 500), 2), 0);
+        w.via_costs[2].push(r(300, 500, 300, 500), (Owner::None, Con::Short(2)));
+        assert_eq!(w.get_drc_cost_helper(0, &r(0, 500, 5000, 500), 2), 400);
+    }
+}
