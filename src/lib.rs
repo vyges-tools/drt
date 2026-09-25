@@ -12,4 +12,5 @@ pub mod dr;
 pub mod gc;
 pub mod pa;
 pub mod polygon90;
+pub mod rtree;
 pub mod tech;

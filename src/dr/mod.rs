@@ -5,3 +5,4 @@
 pub mod db;
 pub mod guides;
 pub mod rules;
+pub mod ta;
