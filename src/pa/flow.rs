@@ -50,6 +50,8 @@ pub struct DesignInst {
     pub nets: Vec<Option<String>>,
     /// Its shapes as the checks see them.
     pub target: Vec<TargetShape>,
+    /// Per master terminal: on a non-default-rule net without auto-taper.
+    pub no_taper: Vec<bool>,
 }
 
 impl DesignInst {
@@ -70,6 +72,8 @@ pub struct DesignPort {
     /// Per pin, its shapes.
     pub pins: Vec<Vec<(usize, Rect)>>,
     pub target: Vec<TargetShape>,
+    /// On a non-default-rule net without auto-taper.
+    pub no_taper: bool,
 }
 
 pub struct PinAccess {
@@ -114,6 +118,15 @@ fn pattern_instance<'a>(tech: &'a Tech, rep: &'a DesignInst, master: &Master, cl
 }
 
 pub fn pin_access(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, masters: &HashMap<String, Master>, insts: &[DesignInst], ports: &[DesignPort]) -> Result<PinAccess, FlowError> {
+    pin_access_with(tech, tracks, cfg, masters, insts, ports, None)
+}
+
+/// [`pin_access`], with every design shape (owner, layer, rectangle) for the via trials of pins
+/// on non-default-rule nets without auto-taper; refused without them when there is such a pin.
+pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, masters: &HashMap<String, Master>, insts: &[DesignInst], ports: &[DesignPort], design: Option<&[TargetShape]>) -> Result<PinAccess, FlowError> {
+    if design.is_none() && (insts.iter().any(|i| i.no_taper.iter().any(|&b| b)) || ports.iter().any(|p| p.no_taper)) {
+        return Err(FlowError::Unsupported(Unsupported("a pin on a non-default-rule net without auto-taper needs the design's shapes")));
+    }
     let cx = Context::new(tech, tracks);
     let uinsts: Vec<UniqueInst> = insts.iter().map(|i| i.unique.clone()).collect();
     let classes = compute_unique(tech, tracks, masters, &uinsts);
@@ -131,7 +144,8 @@ pub fn pin_access(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, masters: &
                     continue;
                 }
                 let owner = rep.pin_owner(master, t);
-                let pin = ApPin { cx: &cx, cfg, kind, is_block: rep.is_block, boundary: Some(rep.unique.bbox), target: &rep.target, owner: &owner };
+                let via_target = if rep.no_taper[t] { design } else { None };
+                let pin = ApPin { cx: &cx, cfg, kind, is_block: rep.is_block, boundary: Some(rep.unique.bbox), target: &rep.target, owner: &owner, via_target };
                 for (p, mp) in term.pins.iter().enumerate() {
                     let shapes: Vec<(usize, Rect)> = mp.shapes.iter().map(|&(l, r)| (l, rep.transform.apply(r))).collect();
                     per_term[t][p] = gen_pin_access(&pin, &shapes, &mut None).map_err(FlowError::Unsupported)?;
@@ -149,7 +163,8 @@ pub fn pin_access(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, masters: &
     for port in ports {
         let mut per_pin = Vec::new();
         if port.routed {
-            let pin = ApPin { cx: &cx, cfg, kind: TermKind::Io, is_block: false, boundary: None, target: &port.target, owner: &port.owner };
+            let via_target = if port.no_taper { design } else { None };
+            let pin = ApPin { cx: &cx, cfg, kind: TermKind::Io, is_block: false, boundary: None, target: &port.target, owner: &port.owner, via_target };
             for shapes in &port.pins {
                 per_pin.push(gen_pin_access(&pin, shapes, &mut None).map_err(FlowError::Unsupported)?);
             }
@@ -372,6 +387,7 @@ mod tests {
             transform: Transform { orient: "R0".into(), origin: (x, 0) },
             nets: vec![None, net.map(String::from)],
             target: vec![],
+            no_taper: vec![false, false],
         };
         let insts = vec![inst("u0", 5000, Some("n")), inst("u1", 9000, None)];
         let ap = AccessPoint { point: (5050, 40), layer: 2, lower: ApType::OnGrid, upper: ApType::OnGrid, access: [false, false, false, false, true, false], allow_via: true, vias: vec![0] };
@@ -414,7 +430,7 @@ mod tests {
     fn the_plan_writes_single_pin_ports_only() {
         let (masters, insts, mut pa) = fixture();
         let ap = pa.class_aps[0][1][0][0].clone();
-        let port = |name: &str, pins: usize| DesignPort { name: name.into(), routed: true, owner: Owner::Net(name.into()), pins: vec![vec![]; pins], target: vec![] };
+        let port = |name: &str, pins: usize| DesignPort { name: name.into(), routed: true, owner: Owner::Net(name.into()), pins: vec![vec![]; pins], target: vec![], no_taper: false };
         let ports = vec![port("one", 1), port("two", 2)];
         pa.port_aps = vec![vec![vec![ap.clone()]], vec![vec![ap.clone()], vec![ap]]];
         let ops = write_plan(&masters, &insts, &ports, &pa);

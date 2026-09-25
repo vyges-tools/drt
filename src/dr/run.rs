@@ -23,7 +23,7 @@ use crate::dr::rules::{default_vias, rule_tables, EolTable, NdrRule, NdrTables, 
 use crate::dr::ta::{track_assignment, Fixed, TaConfig, TaGuide, TaInput, TaState, TaTerm};
 use crate::gc::{Marker, Owner};
 use crate::pa::access::{AccessPoint, Config};
-use crate::pa::flow::{pin_access, DesignInst, DesignPort, MasterClass, PinAccess};
+use crate::pa::flow::{pin_access_with, DesignInst, DesignPort, MasterClass, PinAccess};
 use crate::polygon90::Rect;
 use crate::rtree::PackedRTree;
 use crate::tech::{read, LayerKind, Master, Tech, TrackPattern};
@@ -77,6 +77,8 @@ pub struct DesignIn {
     pub pa: PinAccess,
     pub design: TaDesign,
     pub ndrs: Vec<NdrRule>,
+    /// Nets on a non-default rule with auto-taper turned off.
+    pub no_taper: HashSet<usize>,
     pub bottom_layer: usize,
     pub die: Rect,
 }
@@ -93,10 +95,13 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
     if let Some(v) = opts.via_access_layer {
         cfg.via_access_layer = v;
     }
-    let pa = pin_access(tech, &tracks, &cfg, &masters, &insts, &ports).map_err(|e| format!("pin access: {e:?}"))?;
+    let mut design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
+    // Every design shape with its check owner: what a via trial of a pin on a non-default-rule
+    // net without auto-taper is checked against.
+    let shapes: Vec<crate::pa::verdict::TargetShape> = design.fixed.iter().zip(&design.owners).enumerate().flat_map(|(l, (v, o))| v.iter().zip(o).map(move |((r, _), o)| (o.clone(), l, *r))).collect();
+    let pa = pin_access_with(tech, &tracks, &cfg, &masters, &insts, &ports, Some(&shapes)).map_err(|e| format!("pin access: {e:?}"))?;
     let min_level = db.block_get_min_routing_layer();
     let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
-    let mut design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
     // A net routed already makes the first iterations incremental (a rip-up mode not modelled).
     if let Some(n) = design.nets.iter().find(|n| db.net_has_wire(&n.name)) {
         return Err(format!("net {} is already routed: incremental routing not modelled", n.name));
@@ -108,12 +113,10 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
             n.ndr = Some(ndrs.iter().find(|x| x.name == r).cloned().ok_or_else(|| format!("net {}: rule {r} not read", n.name))?);
         }
     }
-    // A net with auto-taper turned off changes pin access and routing near its pins.
-    if let Some(n) = design.nets.iter().find(|n| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)) {
-        return Err(format!("net {}: auto-taper turned off, not modelled", n.name));
-    }
+    // Non-default-rule nets without auto-taper: their routes are never tapered at the pins.
+    let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, bottom_layer, die })
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die })
 }
 
 /// The non-default rules, the technology's then the block's (a name already read is skipped):
@@ -654,7 +657,7 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     let tf = |k: usize| t.term_fixed[k];
     let mt = |k: usize| t.macro_term[k];
     let ipt = |k: usize| t.dr_terms[k].is_port;
-    let net_ctx = |i: usize| NetCtx { ext_box: &e, guides: &guides[i], term_fixed: &tf, is_macro_term: &mt, pin_name: &pin_name, ndr: ndr_t[i], auto_taper: true, is_port_term: &ipt, has_access_point: haps[i].as_ref(), ndr_rule: ndr_rule[i], route_box: r, ndr_cost: ndr_eol[i] };
+    let net_ctx = |i: usize| NetCtx { ext_box: &e, guides: &guides[i], term_fixed: &tf, is_macro_term: &mt, pin_name: &pin_name, ndr: ndr_t[i], auto_taper: !d.no_taper.contains(&nets[i].net), is_port_term: &ipt, has_access_point: haps[i].as_ref(), ndr_rule: ndr_rule[i], route_box: r, ndr_cost: ndr_eol[i] };
     let ndr = |i: usize| ndr_eol[i];
     let max_avoids = |i: usize| if st_nets[nets[i].net].is_clock { 100 } else if st_nets[nets[i].net].ndr.is_some() { 3 } else { 0 };
     let is_supply = |n: &str| !d.design.net_index.contains_key(n);

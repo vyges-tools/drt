@@ -45,6 +45,8 @@ pub fn read_design(db: &Db, tech: &Tech, top_routing_layer: usize) -> Res<Design
                 (!n.is_empty()).then_some(n)
             })
             .collect();
+        // A terminal on a non-default-rule net without auto-taper (the instance a class of its own).
+        let no_taper: Vec<bool> = nets.iter().map(|n| n.as_deref().is_some_and(|n| !db.net_get_non_default_rule(n).is_empty() && !db.net_is_auto_taper_enabled(n))).collect();
         let routes = m.terms.iter().zip(&nets).map(|(t, n)| routes_term(&t.sig, n.as_deref(), n.as_deref().is_some_and(|n| db.net_is_special(n)), false)).collect();
         let owners: Vec<Owner> = m.terms.iter().zip(&nets).map(|(t, n)| design_owner(n.as_deref(), &t.sig, Owner::InstTerm(name.clone(), t.name.clone()))).collect();
         let transform = read::transform(db, &name);
@@ -59,13 +61,14 @@ pub fn read_design(db: &Db, tech: &Tech, top_routing_layer: usize) -> Res<Design
             MasterClass::Other
         };
         insts.push(DesignInst {
-            unique: UniqueInst { master: master.clone(), orient: db.inst_get_orient(&name), location: read::location(db, &name), bbox: Rect::new(b[0], b[1], b[2], b[3]), routes, ndr_no_taper: false },
+            unique: UniqueInst { master: master.clone(), orient: db.inst_get_orient(&name), location: read::location(db, &name), bbox: Rect::new(b[0], b[1], b[2], b[3]), routes, ndr_no_taper: no_taper.iter().any(|&b| b) },
             name,
             class,
             is_block: mtype.starts_with("BLOCK"),
             transform,
             nets,
             target,
+            no_taper,
         });
     }
     let tracks = read::tracks(db, tech).map_err(|e| e.to_string())?;
@@ -98,7 +101,8 @@ pub fn read_design(db: &Db, tech: &Tech, top_routing_layer: usize) -> Res<Design
             pins = vec![vec![(layer, r)]];
         }
         let target = pins.iter().flatten().map(|&(l, r)| (dso.clone(), l, r)).collect();
-        ports.push(DesignPort { owner: net.clone().map_or(Owner::BlockTerm(term.clone()), Owner::Net), name: term, routed, pins, target });
+        let no_taper = net.as_deref().is_some_and(|n| !db.net_get_non_default_rule(n).is_empty() && !db.net_is_auto_taper_enabled(n));
+        ports.push(DesignPort { owner: net.clone().map_or(Owner::BlockTerm(term.clone()), Owner::Net), name: term, routed, pins, target, no_taper });
     }
     Ok((masters, insts, ports))
 }
