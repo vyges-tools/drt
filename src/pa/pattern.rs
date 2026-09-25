@@ -323,9 +323,17 @@ fn get_edge_cost(inst: &Instance<'_>, pass: &mut Pass, pins: &[usize], prev: (us
 /// The checks on a set of trial vias, over their bounding box widened by [`WINDOW_EXT`]: whether
 /// they are clean, and the owners the markers name.
 fn gen_patterns_gc(inst: &Instance<'_>, vias: &[((i32, i32), &ViaDef, &Owner)], commit: bool, trace: &mut Trace) -> (bool, BTreeSet<Owner>) {
+    let markers = vias_markers(inst.tech, inst.target, vias);
+    trace.push(|| Event::Check { commit, vias: vias.iter().map(|&(p, v, o)| (p, v.name.clone(), o.clone())).collect(), markers: markers.clone() });
+    let owners = markers.iter().flat_map(|m| m.owners.iter().cloned()).collect();
+    (markers.is_empty(), owners)
+}
+
+/// The markers of trial vias `(point, via, owner)` against `target`, over the vias' bounding box
+/// widened by [`WINDOW_EXT`]; no vias, no markers.
+pub fn vias_markers(tech: &Tech, target: &[TargetShape], vias: &[((i32, i32), &ViaDef, &Owner)]) -> Vec<Marker> {
     if vias.is_empty() {
-        trace.push(|| Event::Check { commit, vias: vec![], markers: vec![] });
-        return (true, BTreeSet::new());
+        return Vec::new();
     }
     let mut shapes: Vec<(&Owner, usize, Rect)> = Vec::new();
     let mut bbox: Option<Rect> = None;
@@ -337,10 +345,7 @@ fn gen_patterns_gc(inst: &Instance<'_>, vias: &[((i32, i32), &ViaDef, &Owner)], 
     }
     let b = bbox.expect("a via has shapes");
     let win = Rect::new(b.xl - WINDOW_EXT, b.yl - WINDOW_EXT, b.xh + WINDOW_EXT, b.yh + WINDOW_EXT);
-    let markers = check_in(inst.tech, inst.target, win, &shapes);
-    trace.push(|| Event::Check { commit, vias: vias.iter().map(|&(p, v, o)| (p, v.name.clone(), o.clone())).collect(), markers: markers.clone() });
-    let owners = markers.iter().flat_map(|m| m.owners.iter().cloned()).collect();
-    (markers.is_empty(), owners)
+    check_in(tech, target, win, &shapes)
 }
 
 /// The path found, as an access point per pin; every point on it is marked used.
