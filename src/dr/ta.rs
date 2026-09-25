@@ -56,16 +56,30 @@ impl Default for TaConfig {
 }
 
 /// A fixed shape the costs see.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fixed {
-    /// An instance terminal's or a block pin's shape, and its net.
-    Term(Option<usize>),
-    /// A special net's wire or via shape.
-    Wire(Option<usize>),
+    /// An instance terminal's pin shape: its net, the instance and the master terminal.
+    InstTerm { net: Option<usize>, inst: usize, term: usize },
+    /// A block pin's shape: its net and the port.
+    BTerm { net: Option<usize>, port: usize },
+    /// A special net's wire; `supply`: a power or ground net.
+    Seg { supply: bool },
+    /// A special net's via shape (on any of its layers).
+    Via { supply: bool },
     /// A design blockage.
     Blockage,
     /// An instance obstruction; `big`: the master is a block, pad or ring.
     InstBlockage { big: bool },
+}
+
+impl Fixed {
+    /// The net of a terminal's shape.
+    pub fn term_net(&self) -> Option<Option<usize>> {
+        match *self {
+            Fixed::InstTerm { net, .. } | Fixed::BTerm { net, .. } => Some(net),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -469,11 +483,13 @@ impl<'s, 'a> Worker<'s, 'a> {
             for (bounds, obj) in &objs {
                 let bx = bloat(bounds, -1);
                 match *obj {
-                    Fixed::Term(net) => {
+                    Fixed::InstTerm { net, .. } | Fixed::BTerm { net, .. } => {
                         let d = (self.cfg().shape_bloat_width * width as f32) as i32;
                         self.init_fixed_objs_helper(&bx, d, layer, net, false);
                     }
-                    Fixed::Wire(net) => {
+                    Fixed::Seg { .. } | Fixed::Via { .. } => {
+                        // A special net's shape: never one of the routed nets.
+                        let net = None;
                         let d = self.calc_bloat_dist(false, layer, bounds);
                         self.init_fixed_objs_helper(&bx, d, layer, net, false);
                         // Fat default vias below and above.

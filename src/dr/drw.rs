@@ -140,7 +140,8 @@ pub fn worker_boxes(grid: &GCellGrid, size: i32, offset: i32, mt_safe: i32, drc_
 pub struct DrAp {
     pub point: P,
     pub layer: usize,
-    /// The access bits (east, south, west, north, up, down → 1, 2, 4, 8, 16, 32).
+    /// The access bits as the database stores them (north, south, east, west, up, down → 1, 2,
+    /// 4, 8, 16, 32).
     pub access: u8,
     /// Via choices, best first.
     pub vias: Vec<usize>,
@@ -513,16 +514,37 @@ pub fn grid_coords(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern
     (coords(&xm), coords(&ym), zs)
 }
 
-/// A grid node's topology: its edges east, north and up, and whether each is off-track (a
-/// "grid cost").
+/// A grid node: its edges east, north and up; whether each is blocked, off-track (a "grid
+/// cost") or an access point's (an "ap cost"); a special via at it; and its costs — each an
+/// 8-bit count that saturates at 255 and floors at 0 (the adjacent-node getters read them).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Node {
     pub east: bool,
     pub north: bool,
     pub up: bool,
+    pub blocked_e: bool,
+    pub blocked_n: bool,
+    pub blocked_u: bool,
+    pub svia: bool,
+    pub override_via: bool,
     pub grid_cost_e: bool,
     pub grid_cost_n: bool,
     pub grid_cost_u: bool,
+    pub ap_cost_e: bool,
+    pub ap_cost_n: bool,
+    pub ap_cost_u: bool,
+    pub route_planar: u8,
+    pub route_via: u8,
+    pub marker_planar: u8,
+    pub marker_via: u8,
+    pub fixed_via: u8,
+    pub fixed_h: u8,
+    pub fixed_v: u8,
+    pub route_planar_ndr: u8,
+    pub route_via_ndr: u8,
+    pub fixed_via_ndr: u8,
+    pub fixed_h_ndr: u8,
+    pub fixed_v_ndr: u8,
 }
 
 /// A worker's grid graph.

@@ -73,13 +73,13 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
     }
     let mut fixed: Vec<Vec<(Rect, Fixed)>> = vec![Vec::new(); tech.layers.len()];
     let layer_of = |l: i64| tech.layer_num(&db.layer_name_by_number(l));
-    for inst in insts {
+    for (i, inst) in insts.iter().enumerate() {
         let m = &masters[&inst.unique.master];
         for (t, term) in m.terms.iter().enumerate() {
             let net = inst.nets[t].as_ref().and_then(|n| net_index.get(n)).copied();
             for pin in &term.pins {
                 for &(l, r) in &pin.shapes {
-                    fixed[l].push((inst.transform.apply(r), Fixed::Term(net)));
+                    fixed[l].push((inst.transform.apply(r), Fixed::InstTerm { net, inst: i, term: t }));
                 }
             }
         }
@@ -87,18 +87,19 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
             fixed[l].push((inst.transform.apply(r), Fixed::InstBlockage { big: inst.class == MasterClass::Macro }));
         }
     }
-    for port in ports {
+    for (k, port) in ports.iter().enumerate() {
         let net = match &port.owner {
             Owner::Net(n) => net_index.get(n).copied(),
             _ => None,
         };
         for pin in &port.pins {
             for &(l, r) in pin {
-                fixed[l].push((r, Fixed::Term(net)));
+                fixed[l].push((r, Fixed::BTerm { net, port: k }));
             }
         }
     }
     for n in &special {
+        let supply = matches!(db.net_get_sig_type(n).as_str(), "POWER" | "GROUND");
         let boxes = db.net_swire_expanded_boxes(n).map_err(|e| e.to_string())?;
         let vias: std::collections::HashSet<(i64, i32, i32, i32, i32)> = boxes.iter().filter(|b| b.1).map(|b| (b.0, b.2, b.3, b.4, b.5)).collect();
         for (l, x0, y0, x1, y1, shape, _) in db.net_swire_shapes(n).map_err(|e| e.to_string())? {
@@ -113,7 +114,8 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
                     continue;
                 }
                 if let Some(l) = layer_of(l) {
-                    fixed[l].push((Rect::new(x0, y0, x1, y1), Fixed::Wire(None)));
+                    let f = if from_via { Fixed::Via { supply } } else { Fixed::Seg { supply } };
+                    fixed[l].push((Rect::new(x0, y0, x1, y1), f));
                 }
             }
         }

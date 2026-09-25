@@ -61,6 +61,20 @@ fn intersect(l: &mut Ivl, r: Ivl, touch: bool) -> bool {
     valid
 }
 
+/// Intervals along a line.
+type Spans = Vec<(i32, i32)>;
+
+/// A boundary edge: on the line `x = line` (vertical) or `y = line`, from `low` to `high`, with
+/// the set on the increasing side (east or north) or the decreasing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Edge {
+    pub vertical: bool,
+    pub line: i32,
+    pub low: i32,
+    pub high: i32,
+    pub inner_increasing: bool,
+}
+
 /// A set of Manhattan shapes (`polygon_90_set_data`, HORIZONTAL).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Polygon90Set {
@@ -104,6 +118,48 @@ impl Polygon90Set {
     pub fn rectangles(&mut self) -> Vec<Rect> {
         self.clean();
         form_rectangles(&self.data)
+    }
+
+    /// The set's boundary as maximal straight edges, each with the side the set lies on — the
+    /// edges of the polygons (outlines and holes) the set would return, in no particular order.
+    /// An edge ends where the boundary turns or where the inside flips sides.
+    pub fn boundary_edges(&mut self) -> Vec<Edge> {
+        let rects = self.rectangles();
+        let mut out = Vec::new();
+        for vertical in [true, false] {
+            // Per line: the intervals covered just below/left of it and just above/right.
+            let mut lines: std::collections::BTreeMap<i32, (Spans, Spans)> = Default::default();
+            for r in &rects {
+                let (lo, hi, span) = if vertical { (r.xl, r.xh, (r.yl, r.yh)) } else { (r.yl, r.yh, (r.xl, r.xh)) };
+                lines.entry(hi).or_default().0.push(span);
+                lines.entry(lo).or_default().1.push(span);
+            }
+            for (line, (before, after)) in lines {
+                let mut cuts: Vec<i32> = before.iter().chain(after.iter()).flat_map(|&(a, b)| [a, b]).collect();
+                cuts.sort_unstable();
+                cuts.dedup();
+                let covers = |v: &[(i32, i32)], a: i32, b: i32| v.iter().any(|&(l, h)| l <= a && b <= h);
+                let mut open: Option<(i32, i32, bool)> = None;
+                for w in cuts.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let (lo_side, hi_side) = (covers(&before, a, b), covers(&after, a, b));
+                    let seg = (lo_side != hi_side).then_some(hi_side);
+                    match (open, seg) {
+                        (Some((l, h, inc)), Some(i)) if h == a && inc == i => open = Some((l, b, inc)),
+                        (_, seg) => {
+                            if let Some((l, h, inc)) = open.take() {
+                                out.push(Edge { vertical, line, low: l, high: h, inner_increasing: inc });
+                            }
+                            open = seg.map(|i| (a, b, i));
+                        }
+                    }
+                }
+                if let Some((l, h, inc)) = open {
+                    out.push(Edge { vertical, line, low: l, high: h, inner_increasing: inc });
+                }
+            }
+        }
+        out
     }
 
     /// `get_max_rectangles`: every maximal rectangle inside the set, in `MaxCover`'s order.
@@ -603,5 +659,49 @@ mod tests {
         let mut m = s.max_rectangles();
         m.sort();
         assert_eq!(m, vec![Rect::new(0, 10, 30, 20), Rect::new(10, 0, 20, 30)]);
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    // An L of two rectangles: six edges, the notch's two inner edges facing out of the set.
+    #[test]
+    fn an_l_has_six_edges_with_their_inside_sides() {
+        let mut s = Polygon90Set::new();
+        s.insert_rect(Rect::new(0, 0, 30, 10));
+        s.insert_rect(Rect::new(0, 10, 10, 30));
+        let mut e = s.boundary_edges();
+        e.sort();
+        let v = |line, low, high, inc| Edge { vertical: true, line, low, high, inner_increasing: inc };
+        let h = |line, low, high, inc| Edge { vertical: false, line, low, high, inner_increasing: inc };
+        let mut want = vec![v(0, 0, 30, true), v(10, 10, 30, false), v(30, 0, 10, false), h(0, 0, 30, true), h(10, 10, 30, false), h(30, 0, 10, false)];
+        want.sort();
+        assert_eq!(e, want);
+    }
+
+    // A ring: the hole's edges face inward (the set lies outside the hole).
+    #[test]
+    fn a_hole_has_edges_facing_its_centre() {
+        let mut s = Polygon90Set::new();
+        for r in [Rect::new(0, 0, 30, 10), Rect::new(0, 20, 30, 30), Rect::new(0, 10, 10, 20), Rect::new(20, 10, 30, 20)] {
+            s.insert_rect(r);
+        }
+        let e = s.boundary_edges();
+        assert_eq!(e.len(), 8);
+        assert!(e.contains(&Edge { vertical: true, line: 10, low: 10, high: 20, inner_increasing: false }));
+        assert!(e.contains(&Edge { vertical: false, line: 20, low: 10, high: 20, inner_increasing: true }));
+    }
+
+    // Corner-touching squares: the shared line carries two edges, one per side.
+    #[test]
+    fn the_inside_flipping_sides_ends_an_edge() {
+        let mut s = Polygon90Set::new();
+        s.insert_rect(Rect::new(0, 0, 10, 10));
+        s.insert_rect(Rect::new(10, 10, 20, 20));
+        let e = s.boundary_edges();
+        assert!(e.contains(&Edge { vertical: true, line: 10, low: 0, high: 10, inner_increasing: false }));
+        assert!(e.contains(&Edge { vertical: true, line: 10, low: 10, high: 20, inner_increasing: true }));
     }
 }
