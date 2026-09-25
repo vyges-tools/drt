@@ -45,8 +45,8 @@ EXIT STATUS:
   2  vacuous   nothing to access: no routed instance terminal and no routed port. NOT a pass;
                nothing is written
   2  error     usage, unreadable input
-  3  refused   a step this engine does not model (among them a rect-only or multi-patterned
-               routing layer), a terminal with no access point, or a row with no pattern
+  3  refused   a step this engine does not model (among them a multi-patterned routing
+               layer), a terminal with no access point, or a row with no pattern
                combination — see `reason`
 ";
 
@@ -58,9 +58,9 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "status is one of written, vacuous, refused or error. VACUOUS IS NOT WRITTEN: the design has no routed instance terminal and no routed port. Exit status is 0 for written, 2 for vacuous and for error, 3 for refused.",
     "Correlated stage by stage against an instrumented reference router, and end to end on the database it writes (preferred points, point counts, port points, pin-access indices) on sky130hs designs, and stage by stage on Nangate45 and GF180 designs, 2026-09-25. The correlation harness is not part of this repository.",
-    "Design rules modelled in the access trials: shorts (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing, and LEF 5.4 end-of-line spacing (with or without a parallel edge). Other rules a technology may carry (LEF58 end-of-line forms, minimum step, corner spacing, spacing-table influence) are not checked.",
-    "REFUSED rather than approximated: a nearby-track cost round (a pin that no other round can reach); a unidirectional routing layer (rect-only or multi-patterned).",
-    "Taken as absent: a metal-width via map, right-way-on-grid-only layers, a net's non-default rule without auto-taper.",
+    "Design rules modelled in the access trials: shorts (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing, LEF 5.4 end-of-line spacing (with or without a parallel edge), minimum width, and rect-only layers (which are also unidirectional). Other rules a technology may carry (LEF58 end-of-line forms, minimum step, corner spacing, spacing-table influence) are not checked.",
+    "REFUSED rather than approximated: a nearby-track cost round (a pin that no other round can reach); a multi-patterned routing layer.",
+    "Taken as absent: a metal-width via map, right-way-on-grid-only layers.",
     "The router settings are its defaults: via-access layer 2, no via-in-pin range, three sparse points per pin, non-preferred tracks allowed; the top routing layer is the block's maximum routing layer, else the topmost."
   ],
   "invocation": {
@@ -213,9 +213,9 @@ fn run(a: &Args) -> Outcome {
         Ok(t) => t,
         Err(e) => return fail("error", 2, e.to_string()),
     };
-    // A unidirectional routing layer (rect-only or multi-patterned) changes which access points
-    // are valid; pin access does not model it.
-    let unidirectional: Vec<String> = vyges_drt::dr::db::unmodelled_rules(&db, &tech).into_iter().filter(|r| r.ends_with(": rect-only") || r.ends_with(": multi-patterned")).collect();
+    // A multi-patterned routing layer is unidirectional AND coloured; pin access does not model
+    // colouring.
+    let unidirectional: Vec<String> = vyges_drt::dr::db::unmodelled_rules(&db, &tech).into_iter().filter(|r| r.ends_with(": multi-patterned")).collect();
     if !unidirectional.is_empty() {
         return fail("refused", 3, format!("not modelled: {}", unidirectional.join("; ")));
     }

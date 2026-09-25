@@ -65,8 +65,9 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 
 ## Limits
 
-Refused: a nearby-track round (a pin no other round reaches). Not modelled, so a technology that
-has them is checked without them: LEF58 end-of-line forms, a metal-width via map, unidirectional or
-right-way-on-grid-only layers, non-default rules without auto-taper. The router settings are its
-defaults (via-access layer 2, three sparse points per pin, non-preferred tracks allowed); the top
-routing layer is the block's maximum routing layer.
+Refused: a nearby-track round (a pin no other round reaches); a multi-patterned routing layer.
+Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
+with the rect-only and minimum-width rules. Not modelled, so a technology that has them is checked
+without them: LEF58 end-of-line forms, a metal-width via map, right-way-on-grid-only layers. The
+router settings are its defaults (via-access layer 2, three sparse points per pin, non-preferred
+tracks allowed); the top routing layer is the block's maximum routing layer.

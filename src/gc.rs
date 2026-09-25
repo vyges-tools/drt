@@ -69,6 +69,10 @@ pub enum Rule {
     /// Left by the connectivity check between iterations where it removed or changed a net's
     /// shape: the next iteration re-checks the worker it falls in (it is not itself a violation).
     Recheck,
+    /// A slice of one owner's polygon narrower than the layer's minimum width.
+    MinWidth,
+    /// A polygon on a rect-only layer that is not one rectangle.
+    RectOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -264,6 +268,9 @@ struct Net {
     /// A non-default-rule net's route shapes, tapered or not, per layer.
     tapered: Vec<Vec<Rect>>,
     non_tapered: Vec<Vec<Rect>>,
+    /// After `init`: per layer, the owner's pins (connected pieces of its fixed and route shapes
+    /// merged), in the reference's order.
+    pins: Vec<Vec<Polygon90Set>>,
 }
 
 pub struct Worker<'a> {
@@ -570,6 +577,7 @@ impl<'a> Worker<'a> {
         net.fixed_slices = net.fixed.iter_mut().map(|s| s.rectangles()).collect();
         net.route_slices = net.route.iter_mut().map(|s| s.rectangles()).collect();
         net.fixed_max = net.fixed.iter_mut().map(|s| s.max_rectangles()).collect();
+        net.pins = vec![Vec::new(); n];
         for layer in 0..n {
             let net = &self.nets[i];
             let mut all = Polygon90Set::new();
@@ -589,7 +597,8 @@ impl<'a> Worker<'a> {
             }
             let mut new_shapes: Vec<Shape> = Vec::new();
             let mut pin_k: u32 = 0;
-            for mut pin in all.polygons() {
+            let pins = all.polygons();
+            for mut pin in pins.iter().cloned() {
                 let k = pin_k;
                 pin_k += 1;
                 for r in pin.max_rectangles() {
@@ -611,6 +620,9 @@ impl<'a> Worker<'a> {
                 let fixed = net.fixed_cuts[layer].contains(&r);
                 new_shapes.push(Shape { rect: r, net: i, fixed, tapered: false, pin: pin_k });
                 pin_k += 1;
+            }
+            if self.tech.layers[layer].kind == LayerKind::Routing {
+                self.nets[i].pins[layer] = pins;
             }
             for sh in new_shapes {
                 self.shapes[layer].push(sh);
@@ -672,12 +684,13 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Metal spacing, then end-of-line spacing, then cut spacing, over every owner's shapes; the
-    /// markers made.
+    /// Metal spacing, then metal shapes (minimum width, rect-only), then end-of-line spacing, then
+    /// cut spacing, over every owner's shapes; the markers made.
     pub fn run(&mut self) -> &[Marker] {
         self.markers.clear();
         self.seen.clear();
         self.check_metal_spacing();
+        self.check_metal_shape();
         self.check_metal_end_of_line();
         self.check_cut_spacing();
         normalize_marker_order(&mut self.markers);
@@ -713,6 +726,84 @@ impl<'a> Worker<'a> {
     /// Every standing shape on `layer` touching `r`, in the tree's order.
     fn query(&self, layer: usize, r: &Rect) -> Vec<usize> {
         self.rq[layer].query(r).into_iter().map(|(_, v)| v.1).collect()
+    }
+
+    // ---- metal shapes ----
+
+    /// Per routing layer (bottom up), per owner checked from, per pin: minimum width, then
+    /// rect-only.
+    fn check_metal_shape(&mut self) {
+        for layer in 0..self.tech.layers.len() {
+            if self.tech.layers[layer].kind != LayerKind::Routing {
+                continue;
+            }
+            for net in 0..self.nets.len() {
+                if !self.checks_from(net) || self.nets[net].pins.len() <= layer {
+                    continue;
+                }
+                for k in 0..self.nets[net].pins[layer].len() {
+                    let mut pin = self.nets[net].pins[layer][k].clone();
+                    self.metal_shape_of(layer, net, &mut pin);
+                }
+            }
+        }
+    }
+
+    fn metal_shape_of(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        // Minimum width: the pin sliced horizontally, each slice's x length; then sliced
+        // vertically, each slice's y length.
+        for r in pin.rectangles() {
+            self.min_width(layer, net, r, r.xh - r.xl);
+        }
+        for r in vertical_slices(pin) {
+            self.min_width(layer, net, r, r.yh - r.yl);
+        }
+        self.rect_only(layer, net, pin);
+    }
+
+    /// A slice narrower than the minimum width, unless the owner's fixed shapes cover it whole.
+    fn min_width(&mut self, layer: usize, net: usize, r: Rect, len: i32) {
+        if len >= self.tech.layers[layer].min_width {
+            return;
+        }
+        if area_in(&self.nets[net].fixed_slices[layer], &r) == area(&r) {
+            return;
+        }
+        self.add_marker(Rule::MinWidth, layer, r, net, net);
+    }
+
+    /// On a rect-only layer, a pin that is not one rectangle: around each concave corner (a right
+    /// turn from an edge into the next; the corner is the edge's end), the pin within the layer's
+    /// minimum width each way — unless the owner's fixed shapes cover all of that — gives a marker
+    /// per maximal rectangle.
+    fn rect_only(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        if !self.tech.layers[layer].rect_only {
+            return;
+        }
+        if pin.max_rectangles().len() == 1 {
+            return;
+        }
+        let w = self.tech.layers[layer].min_width;
+        let slices = pin.rectangles();
+        let mut segs = Vec::new();
+        polygon_segs(&mut segs, &slices, &BTreeSet::new(), net);
+        let corners: Vec<(i32, i32)> = segs.iter().filter(|e| orientation(e, &segs[e.next]) == -1).map(|e| e.to).collect();
+        for c in corners {
+            let window = Rect { xl: c.0 - w, yl: c.1 - w, xh: c.0 + w, yh: c.1 + w };
+            let inside: Vec<Rect> = slices.iter().filter_map(|s| overlap(s, &window)).collect();
+            let total: i64 = inside.iter().map(area).sum();
+            let fixed: i64 = inside.iter().map(|r| area_in(&self.nets[net].fixed_slices[layer], r)).sum();
+            if fixed == total {
+                continue;
+            }
+            let mut set = Polygon90Set::new();
+            for r in inside {
+                set.insert_rect(r);
+            }
+            for m in set.max_rectangles() {
+                self.add_marker(Rule::RectOnly, layer, m, net, net);
+            }
+        }
     }
 
     // ---- end-of-line spacing ----
@@ -1293,6 +1384,16 @@ impl<'a> Worker<'a> {
 
 /// A rectangle minus a set of rectangles, as the set's slices (the remainder merged, then cut
 /// into rectangles along the scan).
+/// The set sliced VERTICALLY (`get_rectangles(…, VERTICAL)`): sliced with x and y swapped, each
+/// slice swapped back.
+fn vertical_slices(set: &mut Polygon90Set) -> Vec<Rect> {
+    let mut t = Polygon90Set::new();
+    for r in set.rectangles() {
+        t.insert_rect(Rect { xl: r.yl, yl: r.xl, xh: r.yh, yh: r.xh });
+    }
+    t.rectangles().into_iter().map(|r| Rect { xl: r.yl, yl: r.xl, xh: r.yh, yh: r.xh }).collect()
+}
+
 fn subtract(r: &Rect, minus: &[Rect]) -> Vec<Rect> {
     let mut xs: Vec<i32> = vec![r.xl, r.xh];
     let mut ys: Vec<i32> = vec![r.yl, r.yh];
@@ -1355,9 +1456,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], min_area: 0 },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], min_area: 0, rect_only: false },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], min_area: 0 },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], min_area: 0, rect_only: false },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -1376,6 +1477,69 @@ pub(crate) mod tests {
 
     fn net(n: &str) -> Owner {
         Owner::Net(n.into())
+    }
+
+    fn markers_rect_only(shapes: &[(Owner, usize, Rect, bool)]) -> Vec<Marker> {
+        let mut t = tech();
+        t.layers[4].rect_only = true;
+        let mut w = Worker::new(&t);
+        for (o, l, r, f) in shapes {
+            w.add(o, *l, *r, *f);
+        }
+        w.init();
+        w.run().to_vec()
+    }
+
+    fn boxes(ms: &[Marker], rule: Rule) -> Vec<Rect> {
+        let mut v: Vec<Rect> = ms.iter().filter(|m| m.rule == rule).map(|m| m.bbox).collect();
+        v.sort();
+        v
+    }
+
+    /// Rule: on a rect-only layer a pin (one owner's merged polygon) that is not one rectangle is
+    /// marked at each CONCAVE corner: the polygon within the layer's minimum width (140) of the
+    /// corner each way, one marker per maximal rectangle of that piece. A fixed pin with a trial
+    /// arm sticking out east has concave corners (1000, 100) and (1000, 300).
+    #[test]
+    fn rect_only_marks_the_polygon_around_each_concave_corner() {
+        let m = markers_rect_only(&[(net("a"), 4, Rect::new(0, 0, 1000, 400), true), (net("a"), 4, Rect::new(900, 100, 1500, 300), false)]);
+        let want = vec![Rect::new(860, 0, 1000, 240), Rect::new(860, 100, 1140, 240), Rect::new(860, 160, 1000, 400), Rect::new(860, 160, 1140, 300)];
+        let mut w = want.clone();
+        w.sort();
+        assert_eq!(boxes(&m, Rule::RectOnly), w);
+        assert_eq!(m.len(), 4);
+        // Not rect-only: nothing.
+        assert!(markers(&[(net("a"), 4, Rect::new(0, 0, 1000, 400), true), (net("a"), 4, Rect::new(900, 100, 1500, 300), false)]).is_empty());
+    }
+
+    /// Rule: a concave corner whose surroundings are ALL the owner's fixed shapes is not marked —
+    /// a fixed L with a trial inside it stands.
+    #[test]
+    fn rect_only_skips_corners_the_fixed_shapes_cover() {
+        let m = markers_rect_only(&[(net("a"), 4, Rect::new(0, 0, 1000, 400), true), (net("a"), 4, Rect::new(1000, 100, 1500, 300), true), (net("a"), 4, Rect::new(100, 100, 300, 300), false)]);
+        assert!(m.is_empty(), "{m:?}");
+    }
+
+    /// Rule: minimum width is judged on the polygon's slices — sliced horizontally, each slice's
+    /// x length; sliced vertically, each slice's y length. A trial wire 100 tall (min 140) is one
+    /// marker, from the vertical slicing; a staircase whose horizontal slices include a 50-tall
+    /// sliver (0..1200 × 350..400, its neighbours of other x extents so it stays a slice of its
+    /// own) is none.
+    #[test]
+    fn min_width_is_judged_along_each_slicing() {
+        let m = markers(&[(net("a"), 4, Rect::new(0, 0, 1000, 100), false)]);
+        assert_eq!(boxes(&m, Rule::MinWidth), vec![Rect::new(0, 0, 1000, 100)]);
+        assert_eq!(m.len(), 1);
+        let m = markers(&[(net("a"), 4, Rect::new(0, 0, 1000, 400), false), (net("a"), 4, Rect::new(200, 350, 1200, 700), false)]);
+        assert!(m.is_empty(), "{m:?}");
+    }
+
+    /// Rule: a narrow slice the owner's fixed shapes cover whole is not marked (a pin narrower
+    /// than the minimum width stands), though its owner has a trial elsewhere.
+    #[test]
+    fn min_width_skips_slices_the_fixed_shapes_cover() {
+        let m = markers(&[(net("a"), 4, Rect::new(0, 0, 1000, 100), true), (net("a"), 4, Rect::new(5000, 0, 6000, 400), false)]);
+        assert!(m.is_empty(), "{m:?}");
     }
 
     /// Rule: special spacing rectangles live in a per-layer tree the reference keeps BY VALUE —

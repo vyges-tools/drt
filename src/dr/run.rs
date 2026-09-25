@@ -376,6 +376,7 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep) -> TaOut {
         tech: &p.tech,
         defaults: &p.defaults,
         eol: &p.rules.eol,
+        tables: &p.rules.layers,
         grid: &g.grid,
         die: d.die,
         tracks: &d.tracks,
@@ -723,7 +724,7 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     let nz = tech.layers.iter().filter(|l| l.kind == LayerKind::Routing).count();
     let max_ndr: Vec<i32> = (0..nz).map(|z| d.ndrs.iter().map(|n| n.spacings.get(z).copied().unwrap_or(0)).max().unwrap_or(0)).collect();
     let ndr_spacing = |i: usize| ndr_rule[i].map(|rr| rr.spacings.clone());
-    let mcfg = MazeCfg { tech, rules: &p.rules, drc_cost: args.drc_cost, marker_cost: args.marker_cost, fixed_cost: args.fixed_cost, iter: iter as i32, ripup_all };
+    let mcfg = MazeCfg { tech, rules: &p.rules, drc_cost: args.drc_cost, marker_cost: args.marker_cost, fixed_cost: args.fixed_cost, iter: iter as i32, bottom_routing_layer: d.bottom_layer, ripup_all };
     let q = QueueCtx {
         mcfg: &mcfg,
         route_box: r,

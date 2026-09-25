@@ -28,7 +28,7 @@
 use std::collections::BTreeSet;
 
 use crate::dr::guides::GCellGrid;
-use crate::dr::rules::{EolTable, NdrRule};
+use crate::dr::rules::{EolTable, LayerTables, NdrRule};
 use crate::polygon90::Rect;
 use crate::rtree::PackedRTree;
 use crate::tech::{LayerKind, Tech, TrackPattern};
@@ -123,6 +123,8 @@ pub struct TaInput<'a> {
     pub defaults: &'a [Option<usize>],
     /// The router's end-of-line rule, per routing-layer index.
     pub eol: &'a [EolTable],
+    /// The rule tables per routing-layer index (the via-to-via forbidden lengths).
+    pub tables: &'a [LayerTables],
     pub grid: &'a GCellGrid,
     pub die: Rect,
     pub tracks: &'a [TrackPattern],
@@ -356,10 +358,13 @@ impl<'s, 'a> Worker<'s, 'a> {
 
     // ---- init ----
 
+    /// Whether a track at `pt` is unusable: only on a unidirectional layer (or without
+    /// non-preferred tracks) — when neither default via at `pt`, the one above nor the one below,
+    /// fits inside the die. No via above the top layer counts as fitting (an empty box at the
+    /// origin); a missing default via as not fitting.
     fn out_of_die_via(&self, layer: usize, pt: P) -> bool {
         let tech = self.tech();
-        if self.cfg().use_nonpref_tracks {
-            // No layer is unidirectional here (no masks, no rect-only, none named).
+        if self.cfg().use_nonpref_tracks && !tech.layers[layer].is_unidirectional() {
             return false;
         }
         let die = self.st.input.die;
@@ -1001,11 +1006,29 @@ impl<'s, 'a> Worker<'s, 'a> {
 
     // ---- assignment ----
 
+    /// The tracks across the guide's first gcell (its top/right edge left out). On a
+    /// unidirectional layer the range shrinks so that a default via centred on the first or last
+    /// track stays inside the die: the via above the layer, or below it on the top layer; half its
+    /// box's extent across the tracks.
     fn assign_iroute_avail_tracks(&self, id: usize) -> (usize, i32, i32) {
         let g = &self.st.guides[self.iroutes[id].guide];
         let layer = g.layer;
         let gb = self.st.input.grid.gcell_box(self.st.input.grid.idx(g.begin));
-        let (lo, hi) = if self.horizontal { (gb.yl, gb.yh - 1) } else { (gb.xl, gb.xh - 1) };
+        let (mut lo, mut hi) = if self.horizontal { (gb.yl, gb.yh - 1) } else { (gb.xl, gb.xh - 1) };
+        if self.tech().layers[layer].is_unidirectional() {
+            let die = self.st.input.die;
+            let cut = if layer < self.top_layer() { layer + 1 } else { layer - 1 };
+            let vd = &self.tech().via_defs[self.default_via(cut as i64).expect("a default via beside a unidirectional layer")];
+            let (b1, b2) = (vd.layer1_bbox(), vd.layer2_bbox());
+            let test = Rect { xl: b1.xl.min(b2.xl), yl: b1.yl.min(b2.yl), xh: b1.xh.max(b2.xh), yh: b1.yh.max(b2.yh) };
+            let (diff_lo, diff_hi) = if self.horizontal { (die.yl - (lo - test.dy() / 2), hi + test.dy() / 2 - die.yh) } else { (die.xl - (lo - test.dx() / 2), hi + test.dx() / 2 - die.xh) };
+            if diff_lo > 0 {
+                lo += diff_lo;
+            }
+            if diff_hi > 0 {
+                hi -= diff_hi;
+            }
+        }
         let (i1, i2) = self.get_track_idx(lo, hi, layer);
         assert!(i2 >= i1, "no tracks in a gcell");
         (layer, i1, i2)
@@ -1027,9 +1050,28 @@ impl<'s, 'a> Worker<'s, 'a> {
         }
     }
 
+    /// The distance to the pin's coordinate; on a unidirectional layer, off the pin, plus the DRC
+    /// cost when neither the layer below nor the one above can bridge that offset: each is ruled
+    /// out by the via-to-via forbidden length (two vias down / two up, across a horizontal panel's
+    /// tracks as along y, a vertical one's as along x) or by lying outside the routing layers.
     fn get_pin_cost(&self, id: usize, track: i32) -> u32 {
-        // No layer is unidirectional here, so no via-to-via penalty.
-        self.iroutes[id].pin.map_or(0, |p| (track - p).unsigned_abs())
+        let Some(p) = self.iroutes[id].pin else {
+            return 0;
+        };
+        let mut sol = (track - p).unsigned_abs();
+        let layer = self.st.guides[self.iroutes[id].guide].layer;
+        if sol != 0 && self.tech().layers[layer].is_unidirectional() {
+            let z = layer / 2 - 1;
+            let dir_x = !self.horizontal;
+            let forbidden = |prev_down: bool, curr_down: bool| -> bool {
+                let k = usize::from(!prev_down) * 4 + usize::from(!curr_down) * 2 + usize::from(!dir_x);
+                self.st.input.tables.get(z).is_some_and(|t| t.via2via[k].iter().any(|&(lo, hi)| lo <= sol as i32 && sol as i32 <= hi))
+            };
+            if (forbidden(false, false) || (layer as i64) - 2 < self.cfg().bottom_routing_layer as i64) && (forbidden(true, true) || layer + 2 > self.top_layer()) {
+                sol += self.cfg().drc_cost;
+            }
+        }
+        sol
     }
 
     fn get_drc_cost_helper(&self, id: usize, bx: &Rect, layer: usize) -> u32 {
@@ -1521,7 +1563,7 @@ mod tests {
     }
 
     fn state(f: &Fixture, guides: Vec<TaGuide>) -> TaState<'_> {
-        let input = TaInput { tech: &f.tech, defaults: &f.defaults, eol: &f.eol, grid: &f.grid, die: f.grid.die, tracks: &f.tracks, nets: &f.nets, fixed: &f.fixed, terms: &[], gr_pins: &[], cfg: TaConfig::default() };
+        let input = TaInput { tech: &f.tech, defaults: &f.defaults, eol: &f.eol, tables: &[], grid: &f.grid, die: f.grid.die, tracks: &f.tracks, nets: &f.nets, fixed: &f.fixed, terms: &[], gr_pins: &[], cfg: TaConfig::default() };
         TaState::new(input, guides)
     }
 
@@ -1569,6 +1611,75 @@ mod tests {
         let seg = r(950, 250, 1050, 350);
         w.mod_min_spacing_cost_via(&seg, 2, Owner::Net(0), 0, true, true, true, &mut None);
         assert!(w.via_costs[3].query(&r(-100000, 500, 100000, 500)).count() > 0);
+    }
+
+    /// Layer 2 rect-only (so unidirectional).
+    fn rect_only(mut f: Fixture) -> Fixture {
+        f.tech.layers[2].rect_only = true;
+        f
+    }
+
+    // Rule: on a unidirectional layer a track is dropped where neither default via — the one
+    // above (here 300 tall, centred on the track) nor the one below (none: counted as leaving)
+    // — fits in the die. Track 100 goes (its via reaches y = −50); without rect-only it stays.
+    #[test]
+    fn a_unidirectional_layer_drops_tracks_whose_vias_leave_the_die() {
+        let f = rect_only(fixture());
+        let st = state(&f, vec![]);
+        let w = worker(&st, 0);
+        assert_eq!((w.track_locs[2][0], w.track_locs[2].last().copied()), (300, Some(9700)));
+        let f = fixture();
+        let st = state(&f, vec![]);
+        let w = worker(&st, 0);
+        assert_eq!((w.track_locs[2][0], w.track_locs[2].last().copied()), (100, Some(9900)));
+    }
+
+    // Rule: a guide's available tracks on a unidirectional layer stop half the via ABOVE's box
+    // (300 tall) inside the die, whatever the via below: here a tiny via below keeps track 100
+    // in the worker, yet the first gcell's range starts at 150, so its first track is 300.
+    #[test]
+    fn a_unidirectional_guide_keeps_its_tracks_half_a_via_inside_the_die() {
+        let mut f = rect_only(fixture());
+        f.tech.via_defs.push(ViaDef { name: "s".into(), is_default: true, layer1: 0, cut: 1, layer2: 2, layer1_figs: vec![r(-20, -20, 20, 20)], cut_figs: vec![r(-20, -20, 20, 20)], layer2_figs: vec![r(-20, -20, 20, 20)] });
+        f.defaults[1] = Some(1);
+        let st = state(&f, vec![TaGuide { net: 0, layer: 2, begin: (500, 500), end: (4500, 500), route: None }]);
+        let mut w = worker(&st, 0);
+        assert_eq!(w.track_locs[2][0], 100);
+        w.init_iroutes();
+        let (_, i1, _) = w.assign_iroute_avail_tracks(0);
+        assert_eq!(w.track_locs[2][i1 as usize], 300);
+        f.tech.layers[2].rect_only = false;
+        let st = state(&f, vec![TaGuide { net: 0, layer: 2, begin: (500, 500), end: (4500, 500), route: None }]);
+        let mut w = worker(&st, 0);
+        w.init_iroutes();
+        let (_, i1, _) = w.assign_iroute_avail_tracks(0);
+        assert_eq!(w.track_locs[2][i1 as usize], 100);
+    }
+
+    // Rule: off a boundary pin's coordinate on a unidirectional layer, the DRC cost is added
+    // when neither neighbour layer can bridge the offset: below is outside the routing layers
+    // (bottom routing layer 2), above by the via-to-via forbidden length (two vias up, across a
+    // horizontal panel's tracks = along y, the layer's OWN table): 1..=150 here. Offsets 0 and
+    // 200 cost their distance; 100 costs 100 + 32.
+    #[test]
+    fn a_unidirectional_pin_offset_no_layer_can_bridge_costs_the_drc_cost() {
+        let f = rect_only(fixture());
+        let mut tables = vec![crate::dr::rules::LayerTables::default(); 2];
+        tables[0].via2via[1] = vec![(1, 150)];
+        let input = TaInput { tech: &f.tech, defaults: &f.defaults, eol: &f.eol, tables: &tables, grid: &f.grid, die: f.grid.die, tracks: &f.tracks, nets: &f.nets, fixed: &f.fixed, terms: &[], gr_pins: &[], cfg: TaConfig::default() };
+        let st = TaState::new(input, vec![TaGuide { net: 0, layer: 2, begin: (500, 500), end: (4500, 500), route: None }]);
+        let mut w = worker(&st, 0);
+        w.init_iroutes();
+        w.iroutes[0].pin = Some(500);
+        assert_eq!((w.get_pin_cost(0, 500), w.get_pin_cost(0, 600), w.get_pin_cost(0, 700)), (0, 132, 200));
+        let mut f2 = fixture();
+        f2.tech.layers[2].rect_only = false;
+        let input = TaInput { tech: &f2.tech, defaults: &f2.defaults, eol: &f2.eol, tables: &tables, grid: &f2.grid, die: f2.grid.die, tracks: &f2.tracks, nets: &f2.nets, fixed: &f2.fixed, terms: &[], gr_pins: &[], cfg: TaConfig::default() };
+        let st = TaState::new(input, vec![TaGuide { net: 0, layer: 2, begin: (500, 500), end: (4500, 500), route: None }]);
+        let mut w = worker(&st, 0);
+        w.init_iroutes();
+        w.iroutes[0].pin = Some(500);
+        assert_eq!(w.get_pin_cost(0, 600), 100);
     }
 
     // Via costs count only within half a gcell of a wire's ends: one 700 in (beyond half of

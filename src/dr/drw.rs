@@ -966,7 +966,8 @@ pub type CoordMaps = BTreeMap<Option<usize>, BTreeMap<i32, bool>>;
 /// access point's coordinate across its layer on every layer from it to the next one routed
 /// across (clamped into the routing layers), the route and extended boxes' sides, then every
 /// routing layer's PREFERRED-direction tracks inside the extended box (low side included, high
-/// side not).
+/// side not). A unidirectional layer takes its tracks in BOTH directions (wrong-way coordinates
+/// join the grid, though no edge runs along them).
 pub fn grid_maps(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern], cfg: &GridConfig, route_box: &Rect, ext_box: &Rect, nets: &[DrNet]) -> (CoordMaps, CoordMaps, Vec<usize>) {
     let mut xm: CoordMaps = BTreeMap::new();
     let mut ym: CoordMaps = BTreeMap::new();
@@ -1043,9 +1044,10 @@ pub fn grid_maps(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern],
             continue;
         }
         for tp in tracks.iter().filter(|t| t.layer == l) {
-            // ⚠️ With non-preferred tracks allowed, only the preferred-direction patterns.
+            // ⚠️ With non-preferred tracks allowed, only the preferred-direction patterns — every
+            // pattern on a unidirectional layer.
             let pref = (tp.vertical_tracks && layer.dir == crate::tech::Dir::Vertical) || (!tp.vertical_tracks && layer.dir == crate::tech::Dir::Horizontal);
-            if !pref {
+            if !pref && !layer.is_unidirectional() {
                 continue;
             }
             let (lo, hi) = if tp.vertical_tracks { (ext_box.xl, ext_box.xh) } else { (ext_box.yl, ext_box.yh) };
@@ -1133,7 +1135,9 @@ impl GridGraph {
 /// coordinates and the route box's sides costed), up-vias where the layer two above has a
 /// coordinate (costed when either is off-track) unless the default via there would leave the
 /// die, and non-preferred edges along the coordinates of the layer routed across it (all
-/// costed). An edge exists only with both ends inside the ROUTE box.
+/// costed; none on a unidirectional layer). An edge exists only with both ends inside the ROUTE
+/// box. On a unidirectional layer a preferred edge is left out where the default via there leaves
+/// the die and so would the ones above and below, across the layer's direction.
 /// ⚠️ An off-track cost bit is set whether or not its edge was added (outside the route box it
 /// was not).
 #[allow(clippy::too_many_arguments)]
@@ -1154,6 +1158,33 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
         let b = Rect { xl: b1.xl.min(b2.xl) + px, yl: b1.yl.min(b2.yl) + py, xh: b1.xh.max(b2.xh) + px, yh: b1.yh.max(b2.yh) + py };
         !(die.xl <= b.xl && die.yl <= b.yl && b.xh <= die.xh && b.yh <= die.yh)
     };
+    // Whether neither the via above nor the one below would stay inside the die across the
+    // layer's direction (a missing via counts as leaving it; none above the top layer, as an
+    // empty box at the origin, as staying — unless the die does not reach the origin).
+    let has_out_of_die_viol = |g: &GridGraph, x: usize, y: usize, l: usize| -> bool {
+        if !tech.layers[l].is_unidirectional() {
+            return false;
+        }
+        let (px, py) = (g.xs[x], g.ys[y]);
+        let test = |cut: usize| -> Rect {
+            match defaults.get(cut).copied().flatten() {
+                Some(v) => {
+                    let vd = &tech.via_defs[v];
+                    let (b1, b2) = (vd.layer1_bbox(), vd.layer2_bbox());
+                    Rect { xl: b1.xl.min(b2.xl) + px, yl: b1.yl.min(b2.yl) + py, xh: b1.xh.max(b2.xh) + px, yh: b1.yh.max(b2.yh) + py }
+                }
+                None => Rect { xl: die.xl - 1, yl: die.yl - 1, xh: die.xh + 1, yh: die.yh + 1 },
+            }
+        };
+        let zero = Rect { xl: 0, yl: 0, xh: 0, yh: 0 };
+        let up = if l + 1 < tech.layers.len() { test(l + 1) } else { zero };
+        let down = if l >= 1 { test(l - 1) } else { zero };
+        if tech.layers[l].is_vertical() {
+            (up.xh > die.xh || up.xl < die.xl) && (down.xh > die.xh || down.xl < die.xl)
+        } else {
+            (up.yh > die.yh || up.yl < die.yl) && (down.yh > die.yh || down.yl < die.yl)
+        }
+    };
     let (nx, ny) = (g.xs.len(), g.ys.len());
     for (z, &l) in zs.iter().enumerate() {
         let non_pref = if l + 2 <= cfg.top_routing_layer { l + 2 } else if l >= 2 { l - 2 } else { l };
@@ -1168,8 +1199,7 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
             for i in 0..inner {
                 let (x, y) = if horizontal { (i, o) } else { (o, i) };
                 let ood = out_of_die_via(&g, x, y, l);
-                if in_range {
-                    // (Leaving the die only matters on a unidirectional layer, which is refused.)
+                if in_range && (!ood || !has_out_of_die_viol(&g, x, y, l)) {
                     let (x2, y2) = if horizontal { (x + 1, y) } else { (x, y + 1) };
                     let added = x2 < nx && y2 < ny && in_box((g.xs[x], g.ys[y])) && in_box((g.xs[x2], g.ys[y2]));
                     let border = if horizontal { oc == route_box.yl || oc == route_box.yh } else { oc == route_box.xl || oc == route_box.xh };
@@ -1193,7 +1223,7 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
             }
         }
         // Non-preferred edges along the coordinates of the layer routed across.
-        if in_range {
+        if in_range && !tech.layers[l].is_unidirectional() {
             for i in 0..inner {
                 let ic = if horizontal { g.xs[i] } else { g.ys[i] };
                 if !np.contains_key(&ic) {
@@ -1257,6 +1287,56 @@ pub fn localize_ext(tech: &crate::tech::Tech, g: &GridGraph, ext_box: &Rect, net
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tech::{Dir, Layer, LayerKind, Tech, TrackPattern, ViaDef};
+
+    /// 2 horizontal (tracks y = 100 + 200k, and a wrong-way pattern x = 50 + 200k), 3 cut (a
+    /// default via 300 × 300), 4 vertical (tracks x = 100 + 200k); die and boxes 0..1000.
+    fn uni(rect_only: bool) -> (Tech, Vec<TrackPattern>, Vec<Option<usize>>, GridConfig, Rect) {
+        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, rect_only, ..Default::default() };
+        let sq = Rect::new(-150, -150, 150, 150);
+        let mut t = Tech {
+            layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, ..Default::default() }, routing(Dir::Vertical)],
+            via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq], cut_figs: vec![sq], layer2_figs: vec![sq] }],
+            ..Default::default()
+        };
+        t.layers[4].rect_only = false;
+        let tracks = vec![
+            TrackPattern { layer: 2, vertical_tracks: false, start: 100, num: 5, spacing: 200 },
+            TrackPattern { layer: 2, vertical_tracks: true, start: 50, num: 5, spacing: 200 },
+            TrackPattern { layer: 4, vertical_tracks: true, start: 100, num: 5, spacing: 200 },
+        ];
+        (t, tracks, vec![None, None, None, Some(0), None], GridConfig { bottom_routing_layer: 2, top_routing_layer: 4 }, Rect::new(0, 0, 1000, 1000))
+    }
+
+    // Rule: a unidirectional layer takes its track patterns in BOTH directions into the grid —
+    // layer 2's wrong-way x = 50 joins the coordinates only when it is rect-only.
+    #[test]
+    fn a_unidirectional_layer_adds_its_wrong_way_tracks_to_the_grid() {
+        for ro in [true, false] {
+            let (t, tracks, _, cfg, b) = uni(ro);
+            let (xm, _, _) = grid_maps(&t, &tracks, &cfg, &b, &b, &[]);
+            assert_eq!(coords(&xm).contains(&50), ro);
+        }
+    }
+
+    // Rule: no non-preferred edges on a unidirectional layer (layer 2 is horizontal: no north
+    // edge along layer 4's x = 100 track), and a preferred edge is left out where the default
+    // via there leaves the die and so would the ones above and below (row y = 100: the via
+    // reaches y = −50; there is no via below).
+    #[test]
+    fn a_unidirectional_layer_has_no_wrong_way_edges_and_none_leaving_the_die() {
+        for ro in [true, false] {
+            let (t, tracks, defaults, cfg, b) = uni(ro);
+            let (xm, ym, zs) = grid_maps(&t, &tracks, &cfg, &b, &b, &[]);
+            let g = init_edges(&t, &defaults, &cfg, &xm, &ym, &zs, &b, &b);
+            let x = g.xs.iter().position(|&c| c == 100).unwrap();
+            let y1 = g.ys.iter().position(|&c| c == 100).unwrap();
+            let y3 = g.ys.iter().position(|&c| c == 300).unwrap();
+            assert_eq!(g.nodes[g.idx(x, y3, 0)].north, !ro);
+            assert_eq!(g.nodes[g.idx(x, y1, 0)].east, !ro);
+            assert!(g.nodes[g.idx(x, y3, 0)].east);
+        }
+    }
 
     fn wb(i: i32) -> WorkerBoxes {
         let r = Rect { xl: i, yl: 0, xh: i + 1, yh: 1 };

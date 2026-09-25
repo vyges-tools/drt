@@ -14,8 +14,9 @@ use crate::tech::{LayerKind, Master, Tech};
 /// The rule families and layer properties routing does not model, as `layer: family` for each
 /// layer that carries one — a design with any must be refused, not routed with the rule ignored.
 /// A cut layer may carry one plain spacing rule (more than one is refused too). Also refused: a
-/// routing layer that is rect-only or multi-patterned (both make it unidirectional, which changes
-/// access points and track assignment) and LEF 5.4 spacing limited to a width RANGE.
+/// multi-patterned routing layer (unidirectional, and coloured — colouring is not modelled) and
+/// LEF 5.4 spacing limited to a width RANGE. A rect-only layer is modelled (unidirectional, and the
+/// check's rect-only rule); its "except non-core pins" flag is never read.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
     for l in &tech.layers {
@@ -23,9 +24,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             continue;
         }
         if l.kind == LayerKind::Routing {
-            if db.layer_is_rect_only(&l.name) || db.layer_is_rect_only_except_non_core_pins(&l.name) {
-                out.push(format!("{}: rect-only", l.name));
-            }
             if db.layer_get_num_masks(&l.name) > 1 {
                 out.push(format!("{}: multi-patterned", l.name));
             }

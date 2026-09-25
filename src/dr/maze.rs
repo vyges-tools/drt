@@ -153,6 +153,7 @@ pub struct MazeCfg<'a> {
     pub marker_cost: u32,
     pub fixed_cost: u32,
     pub iter: i32,
+    pub bottom_routing_layer: usize,
     /// Everything ripped up at the start (the first reroute of a net gives back its via
     /// reservation).
     pub ripup_all: bool,
@@ -449,7 +450,27 @@ impl Maze<'_, '_, '_> {
         if mz != 0 && not(Dir6::U, Dir6::D) {
             bend += 1;
         }
-        (mx as u32).wrapping_add(my as u32).wrapping_add(mz as u32).wrapping_add(bend)
+        // On the destination's layer when it is unidirectional (and the destination spans one
+        // track across it): a step off that track by a gap neither the layer below nor the one
+        // above can bridge — each ruled out by the via-to-via forbidden length (two vias down /
+        // two up; the table of the layer below / above) or by lying outside the routing layers —
+        // costs twice the DRC cost (the marker cost from iteration 3) per unit of the edge.
+        let mut penalty: u32 = 0;
+        if d1.2 == d2.2 && n.2 == d1.2 {
+            let l = self.g.zs[n.2 as usize];
+            let layer = &self.cfg.tech.layers[l];
+            if layer.is_unidirectional() {
+                let h = layer.is_horizontal();
+                let gap = if h && d1.1 == d2.1 { (sp.1 - p1.1).abs() } else if !h && d1.0 == d2.0 { (sp.0 - p1.0).abs() } else { 0 };
+                let (below, above) = ((l as i64) - 2 < self.cfg.bottom_routing_layer as i64, l + 2 > self.cfg.tech.layers.len() - 1);
+                if gap != 0 && (below || self.via2via_forbidden(n.2 - 1, false, false, !h, gap)) && (above || self.via2via_forbidden(n.2 + 1, true, true, !h, gap)) {
+                    let len = d.map_or(0, |d| self.st.edge_len(self.g, src, d)) as u32;
+                    let w = if self.cfg.iter >= 3 { self.cfg.marker_cost } else { self.cfg.drc_cost };
+                    penalty = 2u32.wrapping_mul(w).wrapping_mul(len);
+                }
+            }
+        }
+        (mx as u32).wrapping_add(my as u32).wrapping_add(mz as u32).wrapping_add(bend).wrapping_add(penalty)
     }
 
     /// A non-default rule's costs apply outside the taper boxes of the source it came from and
@@ -734,6 +755,36 @@ mod tests {
         }
         let order: Vec<(u32, i32, i32, u32, i32)> = std::iter::from_fn(|| h.pop()).map(|g| (g.cost, g.dist, g.z, g.path_cost, g.x)).collect();
         assert_eq!(order, vec![(9, 9, 0, 0, 0), (10, 4, 1, 4, 0), (10, 4, 1, 4, 1), (10, 4, 1, 4, 2), (10, 4, 1, 3, 0), (10, 4, 0, 3, 0), (10, 5, 0, 3, 0)]);
+    }
+
+    // Rule: on the destination's layer, when it is unidirectional and the destination spans one
+    // track across it, a step off that track by a gap neither neighbour layer can bridge costs
+    // twice the DRC cost per unit of the edge in the estimate (the marker cost from iteration
+    // 3). Layer 4 (vertical) is the top: above cannot bridge; below by layer 2's two-vias-down
+    // forbidden length along x (1..=250). A step east to 200 short of the destination column:
+    // 200 + 2 × 8 × 100.
+    #[test]
+    fn a_unidirectional_destination_layer_penalises_an_unbridgeable_offset() {
+        use crate::dr::drw::{GridGraph, Node};
+        use crate::dr::rules::{LayerTables, RuleTables};
+        use crate::tech::{Dir, Layer, LayerKind};
+        let est = |rect_only: bool, iter: i32| {
+            let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, pitch: 100, ..Default::default() };
+            let mut tech = Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, ..Default::default() }, routing(Dir::Vertical)], ..Default::default() };
+            tech.layers[4].rect_only = rect_only;
+            let mut rules = RuleTables { layers: vec![LayerTables::default(); 2], ..Default::default() };
+            rules.layers[0].via2via[6] = vec![(1, 250)];
+            let cfg = MazeCfg { tech: &tech, rules: &rules, drc_cost: 8, marker_cost: 50, fixed_cost: 0, iter, bottom_routing_layer: 2, ripup_all: false };
+            let node = Node { east: true, north: true, up: true, ..Default::default() };
+            let g = GridGraph { xs: (0..10).map(|i| i * 100).collect(), ys: (0..10).map(|i| i * 100).collect(), zs: vec![2, 4], nodes: vec![node; 200] };
+            let mut st = MazeState::new(&tech, &g, crate::polygon90::Rect::new(0, 0, 900, 900));
+            let taper_at = std::collections::HashMap::new();
+            let m = Maze { cfg: &cfg, g: &g, st: &mut st, ndr: None, ndr_widths: None, tapers: &[], taper_at: &taper_at, dst_taper: None };
+            m.est_cost((2, 5, 1), (5, 0, 1), (5, 9, 1), Some(Dir6::E))
+        };
+        assert_eq!(est(true, 0), 200 + 2 * 8 * 100);
+        assert_eq!(est(true, 3), 200 + 2 * 50 * 100);
+        assert_eq!(est(false, 0), 200);
     }
 
     // Rule: the move buffer holds two moves; pushing a third returns the first.

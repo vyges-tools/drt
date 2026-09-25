@@ -33,8 +33,9 @@
 //!
 //! Not transcribed (a caller gets [`Unsupported`]): a nearby-track round (its points carry path
 //! segments). Taken as absent because the technologies here do not have them: the metal-width via
-//! map, unidirectional (multi-mask or rect-only) layers, right-way-on-grid-only layers, a net's
-//! non-default rule without auto-taper, stubborn terminals.
+//! map, multi-mask layers (refused before this runs), right-way-on-grid-only layers, stubborn
+//! terminals. A rect-only layer is unidirectional: no wrong-way planar access on it and no
+//! wrong-way segment leaving a via onto it.
 
 use std::collections::BTreeSet;
 
@@ -236,7 +237,8 @@ fn in_via_in_pin(cfg: &Config, layer: usize) -> bool {
 }
 
 /// A candidate's allowed accesses: every planar direction unless planar access is barred on the
-/// layer, wrong-way ones only with non-preferred tracks; vias always tried.
+/// layer, wrong-way ones only with non-preferred tracks and never on a unidirectional (rect-only)
+/// layer; vias always tried.
 pub fn create_access_point(pin: &Pin<'_>, point: (i32, i32), layer: usize, lower: ApType, upper: ApType) -> AccessPoint {
     let cfg = pin.cfg;
     let allow_planar = !(pin.kind == TermKind::StdCell && (in_via_in_pin(cfg, layer) || layer <= cfg.via_access_layer));
@@ -244,8 +246,9 @@ pub fn create_access_point(pin: &Pin<'_>, point: (i32, i32), layer: usize, lower
     for d in PLANAR {
         ap.set(d, allow_planar);
     }
-    if allow_planar && !cfg.use_nonpref_tracks {
-        match pin.cx.tech.layers[layer].dir {
+    let l = &pin.cx.tech.layers[layer];
+    if allow_planar && (l.is_unidirectional() || !cfg.use_nonpref_tracks) {
+        match l.dir {
             Dir::Horizontal => {
                 ap.set(Access::N, false);
                 ap.set(Access::S, false);
@@ -425,7 +428,7 @@ fn check_via_planar_access(pin: &Pin<'_>, sh: &Shapes, ap: &AccessPoint, v: usiz
 }
 
 /// The via, and a segment leaving it on its other layer in `d`: wrong-way only with non-preferred
-/// tracks; the end three of that layer's widths out.
+/// tracks and a layer that is not unidirectional; the end three of that layer's widths out.
 fn check_directional_via_access(pin: &Pin<'_>, sh: &Shapes, ap: &AccessPoint, v: usize, d: Access, trace: &mut Trace) -> bool {
     let tech = pin.cx.tech;
     let vd = &tech.via_defs[v];
@@ -433,7 +436,7 @@ fn check_directional_via_access(pin: &Pin<'_>, sh: &Shapes, ap: &AccessPoint, v:
     let tl = &tech.layers[target_layer];
     let vert = matches!(d, Access::S | Access::N);
     let wrong = (tl.is_horizontal() && vert) || (tl.is_vertical() && !vert);
-    if wrong && !pin.cfg.use_nonpref_tracks {
+    if wrong && (!pin.cfg.use_nonpref_tracks || tl.is_unidirectional()) {
         return false;
     }
     let end = gen_end_point(pin, &sh.rects[ap.layer], ap.point, target_layer, d);
@@ -656,6 +659,39 @@ mod tests {
         let c2 = cfg(true);
         let pin2 = Pin { cfg: &c2, ..pin };
         assert!(create_access_point(&pin2, (0, 0), 2, ApType::OnGrid, ApType::OnGrid).has(Access::E));
+    }
+
+    /// Rule: a rect-only layer is unidirectional — even with non-preferred tracks, planar access
+    /// runs only along it (l2 is vertical).
+    #[test]
+    fn a_rect_only_layer_takes_no_wrong_way_planar_access() {
+        let mut t = tech();
+        t.layers[2].rect_only = true;
+        let cx = Context::new(&t, &[]);
+        let (c, owner) = (cfg(true), Owner::Net("n".into()));
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let a = create_access_point(&pin, (0, 0), 2, ApType::OnGrid, ApType::OnGrid);
+        assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [true, true, false, false]);
+    }
+
+    /// Rule: a via's segment may leave it the wrong way on its other layer only when that layer
+    /// is not unidirectional: onto a rect-only l4 (horizontal) the northward trial is refused
+    /// untried, where otherwise it is checked.
+    #[test]
+    fn no_wrong_way_segment_leaves_a_via_onto_a_rect_only_layer() {
+        let trial = |rect_only: bool| {
+            let mut t = tech();
+            t.layers[4].rect_only = rect_only;
+            let cx = Context::new(&t, &[]);
+            let (c, owner) = (cfg(true), Owner::Net("n".into()));
+            let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+            let sh = shapes(&t, &[(2, Rect::new(-2000, -2000, 2000, 2000))]);
+            let mut trace = Some(Vec::new());
+            let ok = check_directional_via_access(&pin, &sh, &ap((0, 0), 2), 0, Access::N, &mut trace);
+            (ok, trace.unwrap().iter().any(|e| matches!(e, Event::Via { .. })))
+        };
+        assert_eq!(trial(true), (false, false));
+        assert!(trial(false).1);
     }
 
     /// A block's planar segment ends a pitch past the pin's extent, not three widths out.
