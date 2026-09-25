@@ -1112,6 +1112,121 @@ mod tests {
         f(&mut w)
     }
 
+    /// A two-layer technology with a cut between (layers 2 H, 3 cut, 4 V), a default via whose
+    /// metal is `via` (both layers) and cut 20 × 20, the routing layers `width` wide with a
+    /// two-column run-length spacing table: `near` under a 500 run, `far` over it.
+    fn tech_via(width: i32, via: Rect, min_area: i64, near: i32, far: i32, cut_spacing: Option<i32>) -> Tech {
+        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width, min_width: width, min_area, spacing: Some(SpacingTable { widths: vec![0], prls: vec![0, 500], values: vec![vec![near, far]] }), ..Default::default() };
+        let vd = crate::tech::ViaDef { name: "V".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![via], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![via] };
+        Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing, ..Default::default() }, routing(Dir::Vertical)], manufacturing_grid: 5, via_defs: vec![vd] }
+    }
+
+    fn with_defaults<R>(t: &Tech, g: &mut GridGraph, eol: &[EolTable], fixed: &[PackedRTree<Fixed>], f: impl FnOnce(&mut CostWorker<'_, '_>) -> R) -> R {
+        let shapes = |f: &Fixed| match f {
+            Fixed::InstTerm { .. } => vec![(2, Rect { xl: 400, yl: 400, xh: 500, yh: 1400 })],
+            _ => Vec::new(),
+        };
+        let aps = |_: usize| Vec::new();
+        let block = |_: usize| false;
+        let defaults = [None, None, None, Some(0), None];
+        let cx = CostCtx { tech: t, defaults: &defaults, eol, ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed, term_shapes: &shapes, port_aps: &aps, inst_is_block: &block };
+        let mut w = CostWorker { cx: &cx, g, ap_svia: BTreeMap::new() };
+        f(&mut w)
+    }
+
+    // Rule: a via's metal that is not wider than the wire (height ≤ width on a horizontal layer
+    // — "fat" is STRICTLY wider) counts the minimum-area patch in its run length; against a
+    // special-net wire (curr_ps) the run is the via's side stretched to the patch, which here
+    // crosses the spacing table's 500 column.
+    #[test]
+    fn a_non_fat_via_counts_the_min_area_patch_in_its_run() {
+        // Via metal 100 × 100 on a 100-wide layer: not fat. Patch: 100,000 / 100 → 1,000.
+        let t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 100_000, 100, 300, None);
+        let mut g = grid();
+        g.xs = (0..10).map(|i| i * 250).collect();
+        g.ys = (0..10).map(|i| i * 50).collect();
+        // A wire 0..2000 × 0..100; the via at (1000, 350): 200 from it — within 300, not 100.
+        with_defaults(&t, &mut g, &[], &[], |w| w.mod_min_spacing_cost_via(&Rect { xl: 0, yl: 0, xh: 2000, yh: 100 }, 0, ModCost::AddFixed, true, true, false, None));
+        assert_eq!(g.nodes[g.idx(4, 7, 0)].fixed_via, 1);
+    }
+
+    // Rule: at a special-via node the via's metal is the access point's own via, not the default.
+    #[test]
+    fn a_special_via_node_uses_the_access_points_via() {
+        let mut t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
+        // The access via: metal 130 each way.
+        t.via_defs.push(crate::tech::ViaDef { name: "AP".into(), is_default: false, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![Rect { xl: -130, yl: -130, xh: 130, yh: 130 }], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }] });
+        let mut g = grid();
+        g.xs = vec![0, 100, 200, 300, 430, 500, 600, 700, 800, 900];
+        g.ys = vec![0, 100, 200, 230, 300, 400, 500, 600, 700, 800];
+        // A wire 0..300 × 0..100; the node at (430, 230), diagonal: the default via's metal is 80
+        // and 80 away (113 > 100, clean), the access via's touches the wire.
+        let k = g.idx(4, 3, 0);
+        g.nodes[k].svia = true;
+        let mut g2 = g.clone();
+        with_defaults(&t, &mut g, &[], &[], |w| {
+            w.ap_svia.insert((4, 3, 0), 1);
+            w.mod_min_spacing_cost_via(&Rect { xl: 0, yl: 0, xh: 300, yh: 100 }, 0, ModCost::AddFixed, true, false, false, None)
+        });
+        assert_eq!(g.nodes[k].fixed_via, 1);
+        // Without the special via, the default metal is clean there.
+        g2.nodes[k].svia = false;
+        with_defaults(&t, &mut g2, &[], &[], |w| w.mod_min_spacing_cost_via(&Rect { xl: 0, yl: 0, xh: 300, yh: 100 }, 0, ModCost::AddFixed, true, false, false, None));
+        assert_eq!(g2.nodes[k].fixed_via, 0);
+    }
+
+    // Rule: an end is an end of line when its width is AT MOST the rule's width.
+    #[test]
+    fn an_end_exactly_the_eol_width_is_an_end_of_line() {
+        let t = tech(100);
+        let mut g = grid();
+        let eol = [EolTable { width: 100, space: 150, within: 0 }, EolTable::default()];
+        // A vertical wire 100 wide ending at y 300: the space above it (300..450) is costed.
+        with_defaults(&t, &mut g, &eol, &[], |w| w.mod_eol_spacing_rules_cost(&Rect { xl: 350, yl: 0, xh: 450, yh: 300 }, 0, ModCost::AddFixed, true, None, true, true));
+        assert_eq!(g.nodes[g.idx(4, 4, 0)].fixed_h, 1);
+    }
+
+    // Rule: cut spacing is violated only when STRICTLY closer than the rule. (Along an axis the
+    // candidate box already stops one short of the rule; exactly-at-the-rule happens diagonally.)
+    #[test]
+    fn a_cut_exactly_at_the_spacing_is_clean() {
+        let t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, Some(50));
+        let mut g = grid();
+        g.xs = vec![0, 100, 200, 300, 349, 350, 500, 600, 700, 800];
+        g.ys = vec![0, 100, 200, 300, 359, 360, 500, 600, 700, 800];
+        // A cut 290..310 square; the via cut at (350, 360) spans 340..360 × 350..370: 30 and 40
+        // away — 50 exactly. At (349, 359) it is closer.
+        with_defaults(&t, &mut g, &[], &[], |w| w.mod_cut_spacing_cost(&Rect { xl: 290, yl: 290, xh: 310, yh: 310 }, 0, ModCost::AddFixed, None));
+        assert_eq!(g.nodes[g.idx(5, 5, 0)].fixed_via, 0);
+        assert_eq!(g.nodes[g.idx(4, 4, 0)].fixed_via, 1);
+    }
+
+    // Rule: an instance pin UNBLOCKS the planar edges a blockage blocked under it (its access
+    // points then unblock the vias).
+    #[test]
+    fn a_pin_unblocks_the_planar_edges_under_it() {
+        let t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
+        let mut g = grid();
+        let blk = Rect { xl: 0, yl: 0, xh: 900, yh: 900 };
+        let pin = Rect { xl: 400, yl: 400, xh: 500, yh: 1400 };
+        let fixed: Vec<PackedRTree<Fixed>> = (0..5).map(|l| PackedRTree::new(if l == 2 { vec![(blk, Fixed::Blockage), (pin, Fixed::InstTerm { net: Some(0), inst: 0, term: 0 })] } else { Vec::new() })).collect();
+        with_defaults(&t, &mut g, &[], &fixed, |w| init_maze_cost(w, &[], &Rect { xl: 0, yl: 0, xh: 900, yh: 900 }).expect("modelled"));
+        assert!(!g.is_blocked(4, 5, 0, Dir6::E));
+        assert!(g.is_blocked(2, 2, 0, Dir6::E));
+    }
+
+    // Rule: a pin edge is an end of line only when SHORTER than the rule's width.
+    #[test]
+    fn a_pin_edge_exactly_the_eol_width_costs_no_route() {
+        let t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
+        let mut g = grid();
+        let pin = Rect { xl: 400, yl: 400, xh: 500, yh: 1400 };
+        let fixed: Vec<PackedRTree<Fixed>> = (0..5).map(|l| PackedRTree::new(if l == 2 { vec![(pin, Fixed::InstTerm { net: Some(0), inst: 0, term: 0 })] } else { Vec::new() })).collect();
+        let eol = [EolTable { width: 100, space: 150, within: 0 }, EolTable::default()];
+        with_defaults(&t, &mut g, &eol, &fixed, |w| mod_eol_costs_poly(w, 0, &Rect { xl: 0, yl: 0, xh: 900, yh: 900 }, ModCost::AddRoute));
+        assert!(g.nodes.iter().all(|n| n.route_planar == 0 && n.route_via == 0));
+    }
+
     // Rule: a cost is an 8-bit count — adding saturates at 255, subtracting floors at 0.
     #[test]
     fn costs_saturate_and_floor() {
