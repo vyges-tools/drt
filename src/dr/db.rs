@@ -11,14 +11,27 @@ use crate::pa::flow::{DesignInst, DesignPort, MasterClass};
 use crate::polygon90::Rect;
 use crate::tech::{LayerKind, Master, Tech};
 
-/// The rule families [`crate::dr::rules`] does not model, as `layer: family` for each layer that
-/// carries one — a technology with any must be refused, not routed with the rule ignored. A cut
-/// layer may carry one plain spacing rule (more than one is refused too).
+/// The rule families and layer properties routing does not model, as `layer: family` for each
+/// layer that carries one — a design with any must be refused, not routed with the rule ignored.
+/// A cut layer may carry one plain spacing rule (more than one is refused too). Also refused: a
+/// routing layer that is rect-only or multi-patterned (both make it unidirectional, which changes
+/// access points and track assignment) and LEF 5.4 spacing limited to a width RANGE.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
     for l in &tech.layers {
         if l.kind == LayerKind::Placeholder {
             continue;
+        }
+        if l.kind == LayerKind::Routing {
+            if db.layer_is_rect_only(&l.name) || db.layer_is_rect_only_except_non_core_pins(&l.name) {
+                out.push(format!("{}: rect-only", l.name));
+            }
+            if db.layer_get_num_masks(&l.name) > 1 {
+                out.push(format!("{}: multi-patterned", l.name));
+            }
+            if db.layer_v54_spacing_rules(&l.name).unwrap_or_default().iter().any(|r| r.1.is_some()) {
+                out.push(format!("{}: spacing with a width range", l.name));
+            }
         }
         for (family, n) in db.layer_rule_census(&l.name) {
             let modelled = match family.as_str() {

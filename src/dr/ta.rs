@@ -171,6 +171,45 @@ enum Con {
 
 type CostBox = (Rect, Owner, Con);
 
+/// Entries that each lie on one track (a line, or a point), kept per track coordinate across the
+/// panel's direction; a query visits only the tracks it spans. Order within is irrelevant here
+/// (costs are summed, pins collected into ordered sets).
+#[derive(Debug, Clone, Default)]
+struct TrackIndex<T> {
+    horizontal: bool,
+    by: std::collections::BTreeMap<i32, Vec<(Rect, T)>>,
+}
+
+impl<T: Copy + PartialEq> TrackIndex<T> {
+    fn new(horizontal: bool) -> TrackIndex<T> {
+        TrackIndex { horizontal, by: std::collections::BTreeMap::new() }
+    }
+    fn key(&self, r: &Rect) -> i32 {
+        debug_assert!(if self.horizontal { r.yl == r.yh } else { r.xl == r.xh }, "an entry off a track");
+        if self.horizontal {
+            r.yl
+        } else {
+            r.xl
+        }
+    }
+    fn push(&mut self, r: Rect, v: T) {
+        let k = self.key(&r);
+        self.by.entry(k).or_default().push((r, v));
+    }
+    fn remove_one(&mut self, r: Rect, v: T) {
+        let k = self.key(&r);
+        if let Some(b) = self.by.get_mut(&k) {
+            if let Some(i) = b.iter().position(|e| e.0 == r && e.1 == v) {
+                b.swap_remove(i);
+            }
+        }
+    }
+    fn query<'a>(&'a self, q: &'a Rect) -> impl Iterator<Item = &'a (Rect, T)> + 'a {
+        let (lo, hi) = if self.horizontal { (q.yl, q.yh) } else { (q.xl, q.xh) };
+        self.by.range(lo..=hi).flat_map(|(_, b)| b.iter()).filter(move |e| touches(&e.0, q))
+    }
+}
+
 fn touches(a: &Rect, b: &Rect) -> bool {
     a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh
 }
@@ -243,9 +282,9 @@ pub struct Worker<'s, 'a> {
     iroutes: Vec<Iroute>,
     /// Ids of the iroutes the panel assigns (the rest are fixed context).
     own: Vec<usize>,
-    shapes: Vec<Vec<(Rect, usize, usize)>>,
-    route_costs: Vec<Vec<CostBox>>,
-    via_costs: Vec<Vec<CostBox>>,
+    shapes: Vec<TrackIndex<(usize, usize)>>,
+    route_costs: Vec<TrackIndex<(Owner, Con)>>,
+    via_costs: Vec<TrackIndex<(Owner, Con)>>,
     reassign: BTreeSet<(std::cmp::Reverse<u32>, usize)>,
     pub trace: Option<Vec<TaEvent>>,
 }
@@ -355,15 +394,10 @@ impl<'s, 'a> Worker<'s, 'a> {
     }
 
     fn add_route_cost(&mut self, r: Rect, layer: usize, owner: Owner, con: Con) {
-        self.route_costs[layer].push((r, owner, con));
+        self.route_costs[layer].push(r, (owner, con));
     }
     fn add_via_cost(&mut self, r: Rect, layer: usize, owner: Owner, con: Con) {
-        self.via_costs[layer].push((r, owner, con));
-    }
-    fn remove_one(v: &mut Vec<CostBox>, e: CostBox) {
-        if let Some(i) = v.iter().position(|x| *x == e) {
-            v.remove(i);
-        }
+        self.via_costs[layer].push(r, (owner, con));
     }
 
     fn init_fixed_objs_helper(&mut self, bx: &Rect, bloat_dist: i32, layer: usize, net: Option<usize>, via: bool) {
@@ -744,19 +778,15 @@ impl<'s, 'a> Worker<'s, 'a> {
     }
     fn rq_add(&mut self, id: usize, k: usize) {
         let (l, b) = self.fig_box(&self.iroutes[id].figs[k]);
-        self.shapes[l].push((b, id, k));
+        self.shapes[l].push(b, (id, k));
     }
     fn rq_remove(&mut self, id: usize, k: usize) {
         let (l, b) = self.fig_box(&self.iroutes[id].figs[k]);
-        if let Some(i) = self.shapes[l].iter().position(|&e| e == (b, id, k)) {
-            self.shapes[l].remove(i);
-        }
+        self.shapes[l].remove_one(b, (id, k));
     }
     fn rq_query(&self, q: &Rect, layer: usize, out: &mut BTreeSet<usize>) {
-        for &(b, id, _) in &self.shapes[layer] {
-            if touches(&b, q) {
-                out.insert(id);
-            }
+        for (_, (id, _)) in self.shapes[layer].query(q) {
+            out.insert(*id);
         }
     }
 
@@ -775,9 +805,9 @@ impl<'s, 'a> Worker<'s, 'a> {
     fn put_cost(&mut self, via: bool, r: Rect, layer: usize, owner: Owner, con: Con, add: bool, pins: &mut Option<&mut BTreeSet<usize>>) {
         let v = if via { &mut self.via_costs[layer] } else { &mut self.route_costs[layer] };
         if add {
-            v.push((r, owner, con));
+            v.push(r, (owner, con));
         } else {
-            Self::remove_one(v, (r, owner, con));
+            v.remove_one(r, (owner, con));
         }
         if let Some(p) = pins {
             self.rq_query(&r, layer, p);
@@ -988,16 +1018,17 @@ impl<'s, 'a> Worker<'s, 'a> {
             let r = n.widths.get(layer / 2 - 1).copied().unwrap_or(0) / 2 + n.spacings.get(layer / 2 - 1).copied().unwrap_or(0);
             bx = bloat(&bx, r);
         }
-        let mut result: Vec<CostBox> = self.route_costs[layer].iter().filter(|e| touches(&e.0, &bx)).copied().collect();
+        let flat = |e: &(Rect, (Owner, Con))| (e.0, e.1 .0, e.1 .1);
+        let mut result: Vec<CostBox> = self.route_costs[layer].query(&bx).map(flat).collect();
         let is_cut = self.tech().layers[layer].kind == LayerKind::Cut;
         if is_cut {
-            result.extend(self.via_costs[layer].iter().filter(|e| touches(&e.0, &bx)).copied());
+            result.extend(self.via_costs[layer].query(&bx).map(flat));
         } else {
             let (add_h, add_v) = if self.tech().layers[layer].is_horizontal() { (self.st.input.grid.x.2 / 2, 0) } else { (0, self.st.input.grid.y.2 / 2) };
             let b1 = Rect { xl: bx.xl, yl: bx.yl, xh: bx.xh.min(bx.xl + add_h), yh: bx.yh.min(bx.yl + add_v) };
             let b2 = Rect { xl: bx.xl.max(bx.xh - add_h), yl: bx.yl.max(bx.yh - add_v), xh: bx.xh, yh: bx.yh };
-            result.extend(self.via_costs[layer].iter().filter(|e| touches(&e.0, &b1)).copied());
-            result.extend(self.via_costs[layer].iter().filter(|e| touches(&e.0, &b2)).copied());
+            result.extend(self.via_costs[layer].query(&b1).map(flat));
+            result.extend(self.via_costs[layer].query(&b2).map(flat));
         }
         let same: Vec<Rect> = result.iter().filter(|e| e.1 == Owner::Net(net)).map(|e| e.0).collect();
         let mut overlap: i64 = 0;
@@ -1309,9 +1340,10 @@ impl<'s, 'a> Worker<'s, 'a> {
 
     pub fn init(&mut self) {
         let n = self.tech().layers.len();
-        self.shapes = vec![Vec::new(); n];
-        self.route_costs = vec![Vec::new(); n];
-        self.via_costs = vec![Vec::new(); n];
+        let h = self.horizontal;
+        self.shapes = (0..n).map(|_| TrackIndex::new(h)).collect();
+        self.route_costs = (0..n).map(|_| TrackIndex::new(h)).collect();
+        self.via_costs = (0..n).map(|_| TrackIndex::new(h)).collect();
         self.init_tracks();
         self.init_fixed_objs();
         self.init_iroutes();
