@@ -730,6 +730,19 @@ pub enum DrFig {
 }
 
 impl DrFig {
+    /// The metal a route shape puts on routing layers, as the design-rule check merges it: a
+    /// wire's box, each of a via's enclosure rectangles, a patch's box.
+    pub fn metal(&self, tech: &Tech) -> Vec<(usize, Rect)> {
+        match *self {
+            DrFig::Seg { layer, begin, end, width, begin_ext, end_ext, .. } => vec![(layer, DrFig::seg_box(begin, end, width, begin_ext, end_ext))],
+            DrFig::Via { via, origin, .. } => {
+                let vd = &tech.via_defs[via];
+                vd.layer1_figs.iter().map(|f| (vd.layer1, shift(f, origin))).chain(vd.layer2_figs.iter().map(|f| (vd.layer2, shift(f, origin)))).collect()
+            }
+            DrFig::Patch { layer, origin, offset } => vec![(layer, shift(&offset, origin))],
+        }
+    }
+
     /// A wire's box: extended past its ends by their extensions, half its width to each side.
     pub fn seg_box(begin: P, end: P, width: i32, begin_ext: i32, end_ext: i32) -> Rect {
         let hw = width / 2;
@@ -843,6 +856,11 @@ fn init_maze_cost_conn_fig(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: 
 /// the fixed-shape query returns), merged per layer: every boundary edge shorter than the
 /// layer's end-of-line width.
 pub fn mod_eol_costs_poly(w: &mut CostWorker<'_, '_>, owner: usize, ext_box: &Rect, t: ModCost) {
+    mod_eol_costs_poly_with(w, owner, ext_box, &[], t);
+}
+
+/// As [`mod_eol_costs_poly`], the net's route shapes (layer, box) merged in too.
+pub fn mod_eol_costs_poly_with(w: &mut CostWorker<'_, '_>, owner: usize, ext_box: &Rect, routes: &[(usize, Rect)], t: ModCost) {
     let tech = w.cx.tech;
     for l in 0..tech.layers.len() {
         if tech.layers[l].kind != LayerKind::Routing {
@@ -858,6 +876,14 @@ pub fn mod_eol_costs_poly(w: &mut CostWorker<'_, '_>, owner: usize, ext_box: &Re
             if obj.term_net() == Some(Some(owner)) {
                 set.insert_rect(*b);
             }
+        }
+        for &(rl, b) in routes {
+            if rl == l {
+                set.insert_rect(b);
+            }
+        }
+        if set.is_empty() {
+            continue;
         }
         for e in set.boundary_edges() {
             if e.high - e.low >= eol.width {

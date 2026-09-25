@@ -282,6 +282,24 @@ pub fn route_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<
     (searches, figs)
 }
 
+/// A net's end: its pins' costs back (vias kept), its guides off, its access points costed for
+/// the nets after it.
+pub fn maze_net_end(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet, cx: &NetCtx<'_>) {
+    let terms: BTreeSet<usize> = net.pins.iter().filter_map(|p| p.term).collect();
+    for t in terms {
+        mod_term_cost(w, &(cx.term_fixed)(t), true, true);
+    }
+    init_maze_cost_guide_helper(w, st, cx.guides, false);
+    init_maze_cost_ap_helper(w, st, net, true, cx.is_macro_term, cx.is_port_term);
+}
+
+/// After the net's check: its end-of-line route costs from its pins and what it wrote, merged.
+pub fn after_check(w: &mut CostWorker<'_, '_>, net: &DrNet, figs: &[DrFig], ext_box: &Rect) {
+    let tech = w.cx.tech;
+    let metal: Vec<(usize, Rect)> = figs.iter().flat_map(|f| f.metal(tech)).collect();
+    crate::dr::cost::mod_eol_costs_poly_with(w, net.net, ext_box, &metal, ModCost::AddRoute);
+}
+
 fn maze_net_init(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet, cx: &NetCtx<'_>) {
     st.reset_status();
     let terms: BTreeSet<usize> = net.pins.iter().filter_map(|p| p.term).collect();
