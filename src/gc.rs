@@ -80,6 +80,23 @@ pub struct Marker {
     pub aggressor: (Owner, usize, Rect, bool),
 }
 
+/// The markers' final order: each run of consecutive markers alike in layer, rule, x extent and
+/// owners is stably sorted by bottom (ascending), then top (descending), then area (descending).
+/// (⚠️ A rule is its kind here: two end-of-line rules on one layer would share a run.)
+pub fn normalize_marker_order(markers: &mut [Marker]) {
+    let same_run = |a: &Marker, b: &Marker| a.layer == b.layer && a.rule == b.rule && a.bbox.xl == b.bbox.xl && a.bbox.xh == b.bbox.xh && a.owners == b.owners;
+    let area = |r: &Rect| i64::from(r.xh - r.xl) * i64::from(r.yh - r.yl);
+    let mut begin = 0;
+    while begin < markers.len() {
+        let mut end = begin + 1;
+        while end < markers.len() && same_run(&markers[begin], &markers[end]) {
+            end += 1;
+        }
+        markers[begin..end].sort_by(|a, b| a.bbox.yl.cmp(&b.bbox.yl).then(b.bbox.yh.cmp(&a.bbox.yh)).then(area(&b.bbox).cmp(&area(&a.bbox))));
+        begin = end;
+    }
+}
+
 /// A maximal rectangle of one owner on one layer.
 #[derive(Debug, Clone, Copy)]
 struct Shape {
@@ -629,6 +646,7 @@ impl<'a> Worker<'a> {
         self.check_metal_spacing();
         self.check_metal_end_of_line();
         self.check_cut_spacing();
+        normalize_marker_order(&mut self.markers);
         &self.markers
     }
 
@@ -1276,6 +1294,23 @@ fn subtract(r: &Rect, minus: &[Rect]) -> Vec<Rect> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    fn marker_at(yl: i32, yh: i32, xh: i32) -> Marker {
+        let o = Owner::Net("a".into());
+        let r = Rect { xl: 0, yl, xh, yh };
+        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: (o.clone(), 4, r, false), aggressor: (o, 4, r, false) }
+    }
+
+    /// Rule: a run of consecutive markers alike in layer, rule, x extent and owners is re-sorted by
+    /// bottom ascending, then top descending; a marker breaking the run starts a new one (the run
+    /// is consecutive, never merged across it).
+    #[test]
+    fn marker_runs_sort_by_bottom_then_top() {
+        let mut m = vec![marker_at(50, 60, 10), marker_at(20, 30, 10), marker_at(20, 40, 10), marker_at(0, 5, 99), marker_at(10, 15, 10)];
+        normalize_marker_order(&mut m);
+        let got: Vec<(i32, i32, i32)> = m.iter().map(|x| (x.bbox.yl, x.bbox.yh, x.bbox.xh)).collect();
+        assert_eq!(got, vec![(20, 40, 10), (20, 30, 10), (50, 60, 10), (0, 5, 99), (10, 15, 10)]);
+    }
     use crate::tech::{Dir, Layer, SpacingTable};
 
     /// li1-like routing layer 2 (width 170, spacing 170 at any width), a cut layer 3 (spacing
