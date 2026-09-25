@@ -286,8 +286,12 @@ pub struct Worker<'a> {
     pub check_ndrs: bool,
     /// Per z, the largest spacing of any non-default rule in the technology.
     pub max_ndr_spacing: Vec<i32>,
-    /// Per layer, the special spacing rectangles (after `init`).
+    /// Per layer, the special spacing rectangles (after `init`; by index, never reused), whether
+    /// each is still in its owner's list, and the layer's tree of them — which the reference
+    /// keeps by value: packed at `init`, a removal takes the first equal rectangle in tree order.
     spc: Vec<Vec<Shape>>,
+    spc_listed: Vec<Vec<bool>>,
+    spc_rq: Vec<DynRTree<usize>>,
     /// Per layer: whether each shape (by its index, never reused) still stands, its id in the
     /// layer's tree, and the tree — packed at `init`, then updated as the reference's is.
     alive: Vec<Vec<bool>>,
@@ -452,7 +456,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, max_ndr_spacing: Vec::new(), spc: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -550,11 +554,13 @@ impl<'a> Worker<'a> {
         self.edges = vec![Vec::new(); n];
         self.segs = vec![Vec::new(); n];
         self.spc = vec![Vec::new(); n];
+        self.spc_listed = vec![Vec::new(); n];
         for i in 0..self.nets.len() {
             self.build_net(i);
         }
         self.rq = (0..n).map(|l| DynRTree::new(self.shapes[l].iter().enumerate().map(|(k, s)| (s.rect, k)).collect())).collect();
         self.rq_id = (0..n).map(|l| (0..self.shapes[l].len()).collect()).collect();
+        self.spc_rq = (0..n).map(|l| DynRTree::new(self.spc[l].iter().enumerate().map(|(k, s)| (s.rect, k)).collect())).collect();
     }
 
     /// One owner's pins, maximal rectangles, edges and special spacing rectangles, appended.
@@ -594,6 +600,7 @@ impl<'a> Worker<'a> {
                         for nt in &net.non_tapered[layer] {
                             if touches(&r, nt) {
                                 self.spc[layer].push(Shape { rect: *nt, net: i, fixed: false, tapered: false, pin: 0 });
+                                self.spc_listed[layer].push(true);
                             }
                         }
                     }
@@ -620,6 +627,7 @@ impl<'a> Worker<'a> {
         let i = self.net(owner);
         let n = self.tech.layers.len();
         let old: Vec<usize> = self.shapes.iter().map(|v| v.len()).collect();
+        let old_spc: Vec<usize> = self.spc.iter().map(|v| v.len()).collect();
         for layer in 0..n {
             for k in 0..self.shapes[layer].len() {
                 if self.alive[layer][k] && self.shapes[layer][k].net == i {
@@ -629,7 +637,12 @@ impl<'a> Worker<'a> {
             }
             self.edges[layer].retain(|e| e.net != i);
             self.segs[layer].retain(|e| e.net != i);
-            self.spc[layer].retain(|e| e.net != i);
+            for k in 0..self.spc[layer].len() {
+                if self.spc_listed[layer][k] && self.spc[layer][k].net == i {
+                    self.spc_rq[layer].remove_eq(&self.spc[layer][k].rect);
+                    self.spc_listed[layer][k] = false;
+                }
+            }
         }
         {
             let net = &mut self.nets[i];
@@ -649,6 +662,12 @@ impl<'a> Worker<'a> {
             for k in from..self.shapes[layer].len() {
                 let r = self.shapes[layer][k].rect;
                 self.rq_id[layer][k] = self.rq[layer].insert(r, k);
+            }
+        }
+        for (layer, &from) in old_spc.iter().enumerate() {
+            for k in from..self.spc[layer].len() {
+                let r = self.spc[layer][k].rect;
+                self.spc_rq[layer].insert(r, k);
             }
         }
     }
@@ -918,7 +937,7 @@ impl<'a> Worker<'a> {
                 // The owner's special spacing rectangles (on any layer; markers are kept once).
                 if self.check_ndrs {
                     for sl in 0..self.spc.len() {
-                        let mine: Vec<Shape> = self.spc[sl].iter().filter(|s| s.net == net).copied().collect();
+                        let mine: Vec<Shape> = (0..self.spc[sl].len()).filter(|&k| self.spc_listed[sl][k] && self.spc[sl][k].net == net).map(|k| self.spc[sl][k]).collect();
                         for s in mine {
                             self.metal_spacing_of(sl, s, true);
                         }
@@ -940,7 +959,7 @@ impl<'a> Worker<'a> {
         });
         let q = bloat(&s.rect, max_spc);
         if self.check_ndrs {
-            let others: Vec<Shape> = self.spc[layer].iter().filter(|o| touches(&o.rect, &q)).copied().collect();
+            let others: Vec<Shape> = self.spc_rq[layer].query(&q).into_iter().map(|(_, v)| self.spc[layer][v.1]).collect();
             for o in others {
                 self.metal_spacing_pair(layer, s, o, is_spc, true);
             }
@@ -1357,6 +1376,28 @@ pub(crate) mod tests {
 
     fn net(n: &str) -> Owner {
         Owner::Net(n.into())
+    }
+
+    /// Rule: special spacing rectangles live in a per-layer tree the reference keeps BY VALUE —
+    /// bulk-loaded at init, an owner's taken out (the first equal rectangle in tree order, the
+    /// leaf's last entry moved into its place) and put back when its route is replaced. So the
+    /// order a check meets them in is the tree's, not the owners' — and with equal spacing the
+    /// first met is the marker's aggressor.
+    #[test]
+    fn special_spacing_rects_are_met_in_tree_order() {
+        let t = tech();
+        let mut w = Worker::new(&t);
+        let rect = |k: i32| Rect::new(k * 1000, 0, k * 1000 + 500, 140);
+        for k in 0..4 {
+            let o = net(&format!("n{k}"));
+            w.add(&o, 4, rect(k), false);
+            w.add_taper(&o, 4, rect(k), true);
+            w.add_taper(&o, 4, rect(k), false);
+        }
+        w.init();
+        w.replace_route(&net("n1"), &[(4, rect(1))], &[(4, rect(1), true), (4, rect(1), false)]);
+        let met: Vec<i32> = w.spc_rq[4].query(&Rect::new(-10000, -10000, 10000, 10000)).into_iter().map(|(_, v)| w.spc[4][v.1].rect.xl / 1000).collect();
+        assert_eq!(met, vec![0, 3, 2, 1]);
     }
 
     /// The table's row is the last width STRICTLY below: a width equal to a row's is the row

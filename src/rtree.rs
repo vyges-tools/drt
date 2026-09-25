@@ -536,17 +536,26 @@ impl<T> DynRTree<T> {
         if !self.alive[id] {
             return false;
         }
-        let Some(root) = self.root else { return false };
         let vbox = self.values[id].0;
-        let mut st = RemoveState { removed: false, underflow: false, underflowed: Vec::new() };
-        self.remove_visit(root, 0, None, id, &vbox, &mut st);
-        if st.removed {
-            self.alive[id] = false;
-        }
-        st.removed
+        self.remove_matching(&vbox, Some(id)).is_some()
     }
 
-    fn remove_visit(&mut self, node: usize, current_level: usize, parent: Option<(usize, usize)>, id: usize, vbox: &Rect, st: &mut RemoveState) {
+    /// Remove the first value (in the tree's order) whose box is `r` — a removal by value where
+    /// values compare by their box; the id removed.
+    pub fn remove_eq(&mut self, r: &Rect) -> Option<usize> {
+        self.remove_matching(r, None)
+    }
+
+    fn remove_matching(&mut self, vbox: &Rect, id: Option<usize>) -> Option<usize> {
+        let root = self.root?;
+        let mut st = RemoveState { removed: false, underflow: false, underflowed: Vec::new(), id: None };
+        self.remove_visit(root, 0, None, id, vbox, &mut st);
+        let gone = st.id.filter(|_| st.removed)?;
+        self.alive[gone] = false;
+        Some(gone)
+    }
+
+    fn remove_visit(&mut self, node: usize, current_level: usize, parent: Option<(usize, usize)>, id: Option<usize>, vbox: &Rect, st: &mut RemoveState) {
         match &self.nodes[node] {
             Node::Internal(_) => {
                 let mut idx = 0;
@@ -605,7 +614,8 @@ impl<T> DynRTree<T> {
                 }
             }
             Node::Leaf(v) => {
-                let Some(pos) = v.iter().position(|&i| i == id) else { return };
+                let Some(pos) = v.iter().position(|&i| id.map_or(self.values[i].0 == *vbox, |id| i == id)) else { return };
+                st.id = Some(v[pos]);
                 let Node::Leaf(v) = &mut self.nodes[node] else { unreachable!() };
                 let last = v.len() - 1;
                 v.swap(pos, last);
@@ -663,6 +673,8 @@ struct RemoveState {
     removed: bool,
     underflow: bool,
     underflowed: Vec<(usize, usize)>,
+    /// The value removed.
+    id: Option<usize>,
 }
 
 type Groups = (Vec<(Rect, usize)>, Vec<(Rect, usize)>, Rect, Rect);
@@ -795,6 +807,25 @@ mod tests {
         assert_eq!(got.len(), 20);
         // Touching counts as intersecting.
         assert_eq!(t.query(&r(190, 5, 200, 9)).len(), 1);
+    }
+
+    // A removal by value (the reference's special spacing rectangles are kept by value, and
+    // equal by their rectangle) takes the FIRST equal value in tree order, and the leaf's last
+    // entry moves into its place — so which of two equal copies goes decides the order after.
+    #[test]
+    fn remove_by_value_takes_the_first_equal_and_moves_the_last_in() {
+        let a = r(0, 0, 10, 10);
+        let mut t = DynRTree::new(vec![(a, 'x'), (r(20, 0, 30, 10), 'y'), (a, 'z'), (r(40, 0, 50, 10), 'w')]);
+        assert_eq!(t.remove_eq(&a), Some(0));
+        let got: Vec<char> = t.query(&r(-100, -100, 100, 100)).iter().map(|(_, v)| v.1).collect();
+        assert_eq!(got, vec!['w', 'y', 'z']);
+        assert_eq!(t.remove_eq(&a), Some(2));
+        assert_eq!(t.remove_eq(&a), None);
+        // By id, the named copy goes even when an equal one comes first.
+        let mut t = DynRTree::new(vec![(a, 'x'), (r(20, 0, 30, 10), 'y'), (a, 'z')]);
+        assert!(t.remove(2));
+        let got: Vec<char> = t.query(&r(-100, -100, 100, 100)).iter().map(|(_, v)| v.1).collect();
+        assert_eq!(got, vec!['x', 'y']);
     }
 
     #[test]
