@@ -87,6 +87,9 @@ pub struct DesignIn {
     pub die: Rect,
     /// Per net, its routing read from the database when it has a wire (an incremental run).
     pub initial: Vec<Option<crate::dr::db::InitialRouting>>,
+    /// Nets the global router gave antenna jumpers (`dbNet::hasJumpers`, read as `addNet` does):
+    /// routing them costs ten times more off their guides.
+    pub jumpers: HashSet<usize>,
 }
 
 /// The reader, then pin access.
@@ -120,7 +123,8 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
     // Non-default-rule nets without auto-taper: their routes are never tapered at the pins.
     let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial })
+    let jumpers: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| db.net_has_jumpers(&n.name)).map(|(i, _)| i).collect();
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers })
 }
 
 /// The non-default rules, the technology's then the block's (a name already read is skipped):
@@ -717,7 +721,7 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     let tf = |k: usize| t.term_fixed[k];
     let mt = |k: usize| t.macro_term[k];
     let ipt = |k: usize| t.dr_terms[k].is_port;
-    let net_ctx = |i: usize| NetCtx { ext_box: &e, guides: &guides[i], term_fixed: &tf, is_macro_term: &mt, pin_name: &pin_name, ndr: ndr_t[i], auto_taper: !d.no_taper.contains(&nets[i].net), is_port_term: &ipt, has_access_point: haps[i].as_ref(), ndr_rule: ndr_rule[i], route_box: r, ndr_cost: ndr_eol[i] };
+    let net_ctx = |i: usize| NetCtx { ext_box: &e, guides: &guides[i], term_fixed: &tf, is_macro_term: &mt, pin_name: &pin_name, ndr: ndr_t[i], auto_taper: !d.no_taper.contains(&nets[i].net), route_with_jumpers: d.jumpers.contains(&nets[i].net), is_port_term: &ipt, has_access_point: haps[i].as_ref(), ndr_rule: ndr_rule[i], route_box: r, ndr_cost: ndr_eol[i] };
     let ndr = |i: usize| ndr_eol[i];
     let max_avoids = |i: usize| if st_nets[nets[i].net].is_clock { 100 } else if st_nets[nets[i].net].ndr.is_some() { 3 } else { 0 };
     let is_supply = |n: &str| !d.design.net_index.contains_key(n);
@@ -736,6 +740,7 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     let q = QueueCtx {
         mcfg: &mcfg,
         route_box: r,
+        drc_box: w.drc,
         name: &name_of,
         net_ctx: &net_ctx,
         ndr: &ndr,

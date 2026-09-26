@@ -88,6 +88,9 @@ fn check(tech: &Tech, target: &[TargetShape], point: (i32, i32), ap_layer: usize
 pub(crate) fn check_in(tech: &Tech, target: &[TargetShape], win: Rect, trial: &[(&Owner, usize, Rect)], ignore_long_side_eol: bool) -> Vec<Marker> {
     let mut w = Worker::new(tech);
     w.ignore_long_side_eol = ignore_long_side_eol;
+    // Pin access checks without the minimum-area rule (`setIgnoreMinArea`, in all three of its
+    // checkers): an access trial's stub is short by construction.
+    w.ignore_min_area = true;
     for (o, layer, r) in target {
         if r.xl <= win.xh && win.xl <= r.xh && r.yl <= win.yh && win.yl <= r.yh {
             w.add(o, *layer, *r, true);

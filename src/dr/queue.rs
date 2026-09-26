@@ -65,6 +65,9 @@ pub enum Event {
 pub struct QueueCtx<'a> {
     pub mcfg: &'a MazeCfg<'a>,
     pub route_box: Rect,
+    /// The worker's check box (`getDrcBox`): the checker's `drc_box` (a minimum-area marker needs
+    /// its polygon wholly inside).
+    pub drc_box: Rect,
     /// Per worker net: its net's name, its routing context, its non-default rule.
     pub name: &'a dyn Fn(usize) -> String,
     pub net_ctx: &'a dyn Fn(usize) -> NetCtx<'a>,
@@ -420,6 +423,7 @@ fn owner_tag(o: &Owner) -> String {
 fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], mut dump: Option<&mut Vec<Event>>) -> Worker<'t> {
     let tech = q.mcfg.tech;
     let mut gw = Worker::new(tech);
+    gw.drc_box = Some(q.drc_box);
     for (o, l, b) in q.fixed {
         gw.add(o, *l, *b, true);
     }

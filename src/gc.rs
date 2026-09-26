@@ -73,6 +73,9 @@ pub enum Rule {
     MinWidth,
     /// A polygon on a rect-only layer that is not one rectangle.
     RectOnly,
+    /// One owner's polygon smaller than the layer's minimum area (`checkMetalShape_minArea`, the
+    /// marker pass): what the patch pass could not fix, or found where no net is the target.
+    MinArea,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -291,6 +294,11 @@ pub struct Worker<'a> {
     /// the search, a rule net's untapered route rectangles need its spacing, and each tapered
     /// rectangle's untapered neighbours are checked as special spacing rectangles.
     pub check_ndrs: bool,
+    /// Skip the minimum-area check (`setIgnoreMinArea`): pin access sets it for its trials.
+    pub ignore_min_area: bool,
+    /// The worker's check box (`drcBox_`): a minimum-area marker needs its polygon WHOLLY inside.
+    /// Unset: the whole design (the check between iterations).
+    pub drc_box: Option<Rect>,
     /// Per z, the largest spacing of any non-default rule in the technology.
     pub max_ndr_spacing: Vec<i32>,
     /// Per layer, the special spacing rectangles (after `init`; by index, never reused), whether
@@ -463,7 +471,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, drc_box: None, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -730,8 +738,8 @@ impl<'a> Worker<'a> {
 
     // ---- metal shapes ----
 
-    /// Per routing layer (bottom up), per owner checked from, per pin: minimum width, then
-    /// rect-only.
+    /// Per routing layer (bottom up), per owner checked from, per pin: minimum width, minimum area,
+    /// then rect-only — `checkMetalShape_main`'s order, less the checks not modelled.
     fn check_metal_shape(&mut self) {
         for layer in 0..self.tech.layers.len() {
             if self.tech.layers[layer].kind != LayerKind::Routing {
@@ -758,7 +766,40 @@ impl<'a> Worker<'a> {
         for r in vertical_slices(pin) {
             self.min_width(layer, net, r, r.yh - r.yl);
         }
+        self.min_area(layer, net, pin);
         self.rect_only(layer, net, pin);
+    }
+
+    /// `checkMetalShape_minArea`, the marker pass: a polygon below the layer's minimum area gives a
+    /// marker on its bounding box — unless the layer has no area rule, the check is ignored (pin
+    /// access), the box is not WHOLLY inside the worker's check box, or any of its edges is fixed
+    /// (on the owner's fixed shapes). The patch pass (`allow_patching`) is the router's write-out.
+    fn min_area(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        let required = self.tech.layers[layer].min_area;
+        if self.ignore_min_area || required == 0 {
+            return;
+        }
+        let slices = pin.rectangles();
+        if slices.iter().map(area).sum::<i64>() >= required {
+            return;
+        }
+        let bbox = slices.iter().skip(1).fold(slices[0], |b, r| Rect { xl: b.xl.min(r.xl), yl: b.yl.min(r.yl), xh: b.xh.max(r.xh), yh: b.yh.max(r.yh) });
+        if let Some(d) = self.drc_box {
+            if !(d.xl <= bbox.xl && d.yl <= bbox.yl && bbox.xh <= d.xh && bbox.yh <= d.yh) {
+                return;
+            }
+        }
+        let net_ref = &self.nets[net];
+        let mut fixed_edges: BTreeSet<EdgePoints> = boundary(&net_ref.fixed_slices[layer]).into_iter().collect();
+        for r in &net_ref.fixed_rects[layer] {
+            fixed_edges.extend([((r.xl, r.yl), (r.xh, r.yl)), ((r.xh, r.yl), (r.xh, r.yh)), ((r.xh, r.yh), (r.xl, r.yh)), ((r.xl, r.yh), (r.xl, r.yl))]);
+        }
+        let mut segs = Vec::new();
+        polygon_segs(&mut segs, &slices, &fixed_edges, net);
+        if segs.iter().any(|e| e.fixed) {
+            return;
+        }
+        self.add_marker(Rule::MinArea, layer, bbox, net, net);
     }
 
     /// A slice narrower than the minimum width, unless the owner's fixed shapes cover it whole.
@@ -1518,6 +1559,44 @@ pub(crate) mod tests {
     fn rect_only_skips_corners_the_fixed_shapes_cover() {
         let m = markers_rect_only(&[(net("a"), 4, Rect::new(0, 0, 1000, 400), true), (net("a"), 4, Rect::new(1000, 100, 1500, 300), true), (net("a"), 4, Rect::new(100, 100, 300, 300), false)]);
         assert!(m.is_empty(), "{m:?}");
+    }
+
+    /// `markers`, on `tech()` with layer 4's minimum area set, a check box, and the ignore flag.
+    fn markers_min_area(shapes: &[(Owner, usize, Rect, bool)], min_area: i64, drc: Option<Rect>, ignore: bool) -> Vec<Marker> {
+        let mut t = tech();
+        t.layers[4].min_area = min_area;
+        let mut w = Worker::new(&t);
+        w.drc_box = drc;
+        w.ignore_min_area = ignore;
+        for (o, l, r, f) in shapes {
+            w.add(o, *l, *r, *f);
+        }
+        w.init();
+        w.run().to_vec()
+    }
+
+    /// Rule (`checkMetalShape_minArea`, the marker pass): a polygon below the layer's minimum area
+    /// is a marker on its bounding box — here a 300 × 200 trial stub (60,000 < 100,000). None when
+    /// its box is not WHOLLY inside the check box (`drcBox_.contains`, a box it merely overlaps is
+    /// not enough), when one of its edges is on the owner's fixed shapes, when the layer has no
+    /// area rule, or when the check is ignored (pin access: `setIgnoreMinArea`).
+    #[test]
+    fn min_area_marks_a_small_polygon_wholly_inside_the_check_box() {
+        let stub = [(net("a"), 4, Rect::new(0, 0, 300, 200), false)];
+        let m = markers_min_area(&stub, 100_000, Some(Rect::new(-1000, -1000, 1000, 1000)), false);
+        assert_eq!(boxes(&m, Rule::MinArea), vec![Rect::new(0, 0, 300, 200)]);
+        // The check box ends inside the stub: no marker (overlap is not containment).
+        assert!(boxes(&markers_min_area(&stub, 100_000, Some(Rect::new(-1000, -1000, 150, 1000)), false), Rule::MinArea).is_empty());
+        // No check box: the whole design.
+        assert_eq!(boxes(&markers_min_area(&stub, 100_000, None, false), Rule::MinArea).len(), 1);
+        // At the minimum: none.
+        assert!(boxes(&markers_min_area(&stub, 60_000, None, false), Rule::MinArea).is_empty());
+        // No area rule, or ignored: none.
+        assert!(boxes(&markers_min_area(&stub, 0, None, false), Rule::MinArea).is_empty());
+        assert!(boxes(&markers_min_area(&stub, 100_000, None, true), Rule::MinArea).is_empty());
+        // Part of the polygon is the owner's fixed shape (a fixed edge): none.
+        let fixed = [(net("a"), 4, Rect::new(0, 0, 150, 200), true), (net("a"), 4, Rect::new(150, 0, 300, 200), false)];
+        assert!(boxes(&markers_min_area(&fixed, 100_000, None, false), Rule::MinArea).is_empty());
     }
 
     /// Rule: minimum width is judged on the polygon's slices — sliced horizontally, each slice's

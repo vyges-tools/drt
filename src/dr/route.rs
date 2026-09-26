@@ -106,6 +106,8 @@ pub struct NetCtx<'a> {
     /// The net's non-default rule: its tables and widths per z; and whether it tapers at pins.
     pub ndr: Option<(&'a crate::dr::rules::NdrTables, &'a [i32])>,
     pub auto_taper: bool,
+    /// The net has antenna jumpers (`routeNet`'s `route_with_jumpers`).
+    pub route_with_jumpers: bool,
     pub is_port_term: &'a dyn Fn(usize) -> bool,
     /// Whether a terminal of this net has an access point at the point on the layer.
     pub has_access_point: &'a dyn Fn((i32, i32), usize) -> bool,
@@ -477,7 +479,7 @@ fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeC
         let dk = pin_by_id[&next];
         let mut path = Vec::new();
         let found = {
-            let mut m = Maze { cfg: mcfg, g: w.g, st, ndr: cx.ndr.map(|n| n.0), ndr_widths: cx.ndr.map(|n| n.1), tapers: &tapers, taper_at: &taper_at, dst_taper };
+            let mut m = Maze { cfg: mcfg, g: w.g, st, ndr: cx.ndr.map(|n| n.0), ndr_widths: cx.ndr.map(|n| n.1), tapers: &tapers, taper_at: &taper_at, dst_taper, route_with_jumpers: cx.route_with_jumpers };
             m.search(&mut conn, &all_aps[dk], &mut path, &mut cc1, &mut cc2, center)
         };
         if !found {

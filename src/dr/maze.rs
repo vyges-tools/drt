@@ -269,6 +269,10 @@ pub struct Maze<'a, 'g, 's> {
     pub taper_at: &'a std::collections::HashMap<Idx, usize>,
     /// The destination pin's taper box.
     pub dst_taper: Option<usize>,
+    /// The net has antenna jumpers (`routeNet`: `getFrNet()->hasJumpers()`): an edge off its
+    /// guides costs `GUIDECOST * 10` instead of `GUIDECOST` (`getCostsImpl`'s `jumper_cost`), so
+    /// the route keeps to the jumper's guides rather than crossing the gap they bridge.
+    pub route_with_jumpers: bool,
 }
 
 /// A box of maze indices, z inclusive.
@@ -506,7 +510,8 @@ impl Maze<'_, '_, '_> {
             c = c.wrapping_add(BLOCK_COST.wrapping_mul(layer.min_width as u32).wrapping_mul(20));
         }
         if !self.has_guide(i, d) {
-            c = c.wrapping_add(GUIDE_COST.wrapping_mul(len));
+            let jumper_cost: u32 = if self.route_with_jumpers { 10 } else { 1 };
+            c = c.wrapping_add(GUIDE_COST.wrapping_mul(jumper_cost).wrapping_mul(len));
         }
         c
     }
@@ -779,7 +784,7 @@ mod tests {
             let g = GridGraph { xs: (0..10).map(|i| i * 100).collect(), ys: (0..10).map(|i| i * 100).collect(), zs: vec![2, 4], nodes: vec![node; 200] };
             let mut st = MazeState::new(&tech, &g, crate::polygon90::Rect::new(0, 0, 900, 900));
             let taper_at = std::collections::HashMap::new();
-            let m = Maze { cfg: &cfg, g: &g, st: &mut st, ndr: None, ndr_widths: None, tapers: &[], taper_at: &taper_at, dst_taper: None };
+            let m = Maze { cfg: &cfg, g: &g, st: &mut st, ndr: None, ndr_widths: None, tapers: &[], taper_at: &taper_at, dst_taper: None, route_with_jumpers: false };
             m.est_cost((2, 5, 1), (5, 0, 1), (5, 9, 1), Some(Dir6::E))
         };
         assert_eq!(est(true, 0), 200 + 2 * 8 * 100);
