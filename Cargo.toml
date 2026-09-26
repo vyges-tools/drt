@@ -20,6 +20,10 @@ odb = ["dep:vyges-opendb"]
 [dependencies]
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true, features = ["gen-write"] }
 
+[dev-dependencies]
+# The `--describe` contract tests parse the descriptor.
+serde_json = "1"
+
 [lib]
 name = "vyges_drt"
 path = "src/lib.rs"

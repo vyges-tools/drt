@@ -32,6 +32,47 @@ fn help_describe_and_version_exit_zero() {
     assert!(d.contains("\"name\": \"drt\"") && d.contains("\"schema\": \"vyges-tool-descriptor/1.1\""));
 }
 
+fn descriptor() -> serde_json::Value {
+    serde_json::from_slice(&bin().arg("--describe").output().unwrap().stdout).expect("--describe must be valid JSON")
+}
+
+/// ⛔ The pin the binary LINKS, not a typed one: the placeholder must not survive into the output.
+#[test]
+fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
+    let d = descriptor();
+    assert_eq!(d["openroad_pin"], vyges_opendb::OPENROAD_PIN);
+    assert_eq!(d["openroad_pin"].as_str().unwrap().len(), 40, "a full commit SHA");
+}
+
+/// Every assertion is `field` + `pass_when` with ONE predicate — the form the registry's schema
+/// accepts. ⚠️ An `equals` key (what this descriptor once carried) is not a usable assertion: the
+/// registry drops it and the verdict resolves `unknown`.
+#[test]
+fn every_assertion_is_a_pass_when_predicate() {
+    let d = descriptor();
+    let mut all = vec![d["assertion"].clone()];
+    all.extend(d["commands"].as_array().expect("commands").iter().map(|c| c["assertion"].clone()));
+    for a in all {
+        assert_eq!(a["field"], "status", "{a}");
+        assert_eq!(a["pass_when"]["eq"], "written", "{a}");
+        assert!(a.get("equals").is_none(), "{a}");
+    }
+}
+
+/// Both commands are described, and the primary invocation is `detailed_route` — the one a caller
+/// that reads only `invocation` runs. Each command's template names the command itself.
+#[test]
+fn both_commands_are_described_and_route_is_primary() {
+    let d = descriptor();
+    assert_eq!(d["invocation"]["args_template"][0], "detailed_route");
+    let names: Vec<&str> = d["commands"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["detailed_route", "pin_access"]);
+    for c in d["commands"].as_array().unwrap() {
+        assert_eq!(c["args_template"][0], c["name"], "{c}");
+    }
+    assert!(["discovered", "structured", "workflow-validated"].contains(&d["maturity"].as_str().unwrap()));
+}
+
 #[test]
 fn a_bad_invocation_exits_two() {
     assert_eq!(bin().output().unwrap().status.code(), Some(2));

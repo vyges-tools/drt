@@ -53,42 +53,81 @@ EXIT STATUS:
                combination — see `reason`
 ";
 
+/// The pin, inherited from the database crate this binary links.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// ⛔ The `openroad_pin` FIELD is this token, substituted at print time — a hand-typed pin
+/// reports what was typed, not what the binary links. A correlation claim in the prose names the
+/// date it was MEASURED and stays a literal.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
+/// ⚠️ **Two commands, one descriptor.** `invocation` is `detailed_route` — what a caller that
+/// reads only the primary invocation (the MCP registry) should run; `commands` lists both, each
+/// with its own assertion, as `vyges-dpl` does. ⚠️ `maturity` is `structured`: the correlation
+/// runs against the reference outside this repository, so the `workflow-validated` rung is not
+/// claimed.
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
   "name": "drt",
-  "summary": "pin access: every pin's access points and each routed instance terminal's preferred points, written into the design database",
+  "summary": "detailed routing on the design's route guides: pin access, track assignment and search-and-repair until no design-rule marker stands, the routes written as a DEF or a database; pin access alone is its own command",
   "maturity": "structured",
   "provenance_limitations": [
-    "status is one of written, vacuous, refused or error. VACUOUS IS NOT WRITTEN: the design has no routed instance terminal and no routed port. Exit status is 0 for written, 2 for vacuous and for error, 3 for refused.",
-    "Correlated stage by stage against an instrumented reference router, and end to end on the database it writes (preferred points, point counts, port points, pin-access indices) on sky130hs designs, and stage by stage on Nangate45 and GF180 designs, 2026-09-25. The correlation harness is not part of this repository.",
-    "Design rules modelled in the access trials: shorts (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing, LEF 5.4 end-of-line spacing (with or without a parallel edge), minimum width, and rect-only layers (which are also unidirectional). Other rules a technology may carry (LEF58 end-of-line forms, minimum step, corner spacing, spacing-table influence) are not checked.",
-    "REFUSED rather than approximated: a nearby-track cost round (a pin that no other round can reach); a multi-patterned routing layer.",
+    "detailed_route status is one of written, markers, refused or error: written is routed with no design-rule marker standing (exit 0); markers is routed and written with markers standing (exit 1, a finding, not a pass); error is exit 2; refused is exit 3.",
+    "pin_access status is one of written, vacuous, refused or error. VACUOUS IS NOT WRITTEN: the design has no routed instance terminal and no routed port, and nothing is written. Exit status is 0 for written, 2 for vacuous and for error, 3 for refused.",
+    "detailed_route is correlated end to end on the DEF it writes, compared WHOLE and byte for byte against a fresh reference run: 16 of 16 cases, 2026-09-25 -- 14 of the reference router's own regression scripts (the largest 16,880 nets over 5 search-and-repair iterations), its incremental-routing script, and one constructed incremental case. Each stage (guides, rule tables, track assignment, every worker of every iteration) is also correlated against an instrumented reference. The correlation harness is not part of this repository.",
+    "An incremental run's DEF cannot tell incremental rip-up from rerouting everything, which writes the same DEF: the report's routed_before and rerouted counts say which ran.",
+    "pin_access is correlated stage by stage against an instrumented reference router, and end to end on the database it writes (preferred points, point counts, port points, pin-access indices) on sky130hs designs, and stage by stage on Nangate45 and GF180 designs, 2026-09-25.",
+    "Design rules modelled: shorts (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing (with or without a parallel edge), minimum width, minimum area, and rect-only layers (which are also unidirectional).",
+    "REFUSED rather than approximated, by detailed_route: any other rule family a layer carries (LEF58 end-of-line forms, minimum step, corner spacing and the rest, named in the reason); a multi-patterned routing layer; LEF 5.4 spacing limited to a width range; a non-default rule with hard spacing, via generate rules or wire extension; FIXED wiring, a via or patch with no wire, or a routed net on a non-default rule already in the database; congested input guides; and a run still carrying markers at iteration 7, where the reference widens the clip of congested workers.",
+    "REFUSED rather than approximated, by pin_access: a nearby-track cost round (a pin that no other round can reach); a multi-patterned routing layer.",
     "Taken as absent: a metal-width via map, right-way-on-grid-only layers.",
-    "The router settings are its defaults: via-access layer 2, no via-in-pin range, three sparse points per pin, non-preferred tracks allowed; the top routing layer is the block's maximum routing layer, else the topmost."
+    "The router settings are its defaults: via-access layer the second routing layer (detailed_route takes --via-access-layer), no via-in-pin range, three sparse points per pin, non-preferred tracks allowed. detailed_route routes between the block's minimum and maximum routing layers as the database holds them, with the database's non-default rules; pin_access's top routing layer is the block's maximum routing layer, else the topmost."
   ],
   "invocation": {
-    "args_template": ["pin_access", "--db", "{db}", "--out", "{out}"],
-    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" } ],
+    "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
+    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" } ],
     "emits_json": true
   },
+  "commands": [
+    {
+      "name": "detailed_route",
+      "summary": "route the design on its route guides and write the routes (a .def or .odb out)",
+      "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" } ],
+      "assertion": { "id": "routed-clean", "field": "status", "pass_when": { "eq": "written" } }
+    },
+    {
+      "name": "pin_access",
+      "summary": "compute every pin's access points and write them into the database",
+      "args_template": ["pin_access", "--db", "{db}", "--out", "{out}"],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" } ],
+      "assertion": { "id": "pin-access-written", "field": "status", "pass_when": { "eq": "written" } }
+    }
+  ],
   "inputs": {
     "type": "object",
     "required": ["db", "out"],
     "properties": {
-      "db": { "type": "string", "description": "the design database to read" },
-      "out": { "type": "string", "description": "where to write the database with access points" },
-      "max_routing_layer": { "type": "string", "description": "the block's maximum routing layer, set first" },
+      "db": { "type": "string", "description": "the design database to read (detailed_route: placed, with route guides)" },
+      "out": { "type": "string", "description": "where to write the result: detailed_route writes a DEF if the name ends in .def, else a database; pin_access writes a database" },
+      "via_access_layer": { "type": "string", "description": "detailed_route: the via-access layer (default the second routing layer)" },
+      "max_routing_layer": { "type": "string", "description": "pin_access: the block's maximum routing layer, set first" },
       "report": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
     }
   },
-  "consumes": ["db"],
-  "artifacts": [ { "role": "db", "field": "out" } ],
+  "consumes": ["odb"],
+  "artifacts": [ { "role": "routed_design", "field": "out" } ],
   "assertion": {
-    "id": "pin-access-written",
+    "id": "routed-clean",
     "field": "status",
-    "equals": "written"
+    "pass_when": { "eq": "written" }
   },
-  "exit_codes": { "0": "written", "2": "vacuous or error", "3": "refused" }
+  "exit_codes": { "0": "written", "1": "markers (detailed_route)", "2": "vacuous or error", "3": "refused" }
 }"#;
 
 struct Args {
@@ -269,7 +308,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Some("--describe") => {
-            println!("{DESCRIBE}");
+            println!("{}", describe());
             return ExitCode::SUCCESS;
         }
         Some("--help") | Some("-h") => {

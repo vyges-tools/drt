@@ -1,11 +1,17 @@
-# vyges-drt — pin access
+# vyges-drt — detailed routing
+
+`vyges-drt` has two commands. `detailed_route` routes a placed design on its route guides and
+writes the wires. `pin_access` is its first stage on its own: the access points global routing
+reads. Pin access is described first because routing starts there.
+
+## Pin access
 
 Before a net can be routed in detail, each of its pins needs a point a wire can reach it at, and a
 direction or via to leave by. `vyges-drt pin_access` computes them for every pin of every cell and
 writes them into the design database; global routing reads each terminal's preferred point from
 there.
 
-## What it does
+### What it does
 
 **Unique classes.** Instances of the same master, in the same orientation and at the same offset
 from each preferred-direction track pattern (within the layers the master's signal pins reach),
@@ -46,7 +52,7 @@ boundary vias. A lone instance takes its class's first pattern.
 **Write-back.** Every master pin's points (per class), every instance's class index, each routed
 instance terminal's preferred point per pin, and each single-pin port's points.
 
-## Run it
+### Run it
 
 ```sh
 vyges-drt pin_access --lef tech.lef --lef cells.lef --def design.def \
@@ -63,7 +69,7 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 `status` is `written`, `vacuous` (nothing to access — not a pass), `refused` or `error`; see the
 [CLI reference](./reference/vyges-drt.md).
 
-## Limits
+### Limits
 
 Refused: a nearby-track round (a pin no other round reaches); a multi-patterned routing layer.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
@@ -71,3 +77,38 @@ with the rect-only and minimum-width rules. Not modelled, so a technology that h
 without them: LEF58 end-of-line forms, a metal-width via map, right-way-on-grid-only layers. The
 router settings are its defaults (via-access layer 2, three sparse points per pin, non-preferred
 tracks allowed); the top routing layer is the block's maximum routing layer.
+
+## Detailed routing
+
+`detailed_route` reads a placed database that carries route guides (what global routing writes)
+and runs the router's stages in order: pin access, guide processing, track assignment, then
+search-and-repair iterations. Each iteration routes the design in worker tiles, checks the result
+against the design rules, and rips up and reroutes around the markers it finds, until none stand.
+The routes are written as a DEF or a database.
+
+```sh
+vyges-drt detailed_route --db placed_with_guides.odb --out routed.def
+```
+
+The JSON report carries `status`, `out`, `iterations` (search-and-repair iterations run),
+`markers` (design-rule markers standing at the end), `nets_written`, `routed_before` and
+`rerouted`.
+
+`status` is `written` (routed with no marker standing, exit 0), `markers` (routed and written, but
+markers remain: exit 1, a finding rather than a pass), `refused` (exit 3) or `error` (exit 2).
+
+The routing layers are the block's minimum and maximum routing layers as the database holds them,
+and the non-default rules are the database's. **Incremental routing:** nets that already have wires
+in the database are kept. Their wires are read, the first three iterations reroute only the other
+nets, and the report counts both (`routed_before`, `rerouted`). A DEF alone cannot show which mode
+ran, because rerouting everything writes the same DEF; the counts can.
+
+### Limits
+
+Design rules modelled: shorts, non-sufficient metal, parallel-run spacing, cut spacing (one plain
+rule per cut layer), LEF 5.4 end-of-line spacing, minimum width, minimum area, and rect-only layers.
+Refused rather than approximated: any other rule family a layer carries (named in the report's
+`reason`); a multi-patterned routing layer; spacing limited to a width range; a non-default rule
+with hard spacing, via generate rules or wire extension; FIXED wiring, or a routed net on a
+non-default rule, already in the database; congested input guides; and a run that still has
+markers at iteration 7, where congestion-driven clip growth begins.
