@@ -1,6 +1,6 @@
 [package]
 name = "vyges-drt"
-version = "0.1.0"
+version = "0.1.37"
 edition = "2021"
 description = "Detailed routing: pin access first — each pin's access points, reproducible bit for bit."
 license = "Apache-2.0"
