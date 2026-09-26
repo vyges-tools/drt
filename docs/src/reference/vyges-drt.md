@@ -35,6 +35,7 @@ OPTIONS:
                               routing layer)
   --out OUT.odb               write the database here
   -o FILE                     write the JSON report to FILE instead of stdout
+  --json                      accepted; the report is JSON either way
   --describe                  print a machine-readable JSON description of the command
 
 EXIT STATUS:

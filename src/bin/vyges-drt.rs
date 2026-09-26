@@ -40,6 +40,7 @@ OPTIONS:
                               routing layer)
   --out OUT.odb               write the database here
   -o FILE                     write the JSON report to FILE instead of stdout
+  --json                      accepted; the report is JSON either way
   --describe                  print a machine-readable JSON description of the command
 
 EXIT STATUS:
@@ -144,6 +145,11 @@ fn parse(args: &[String]) -> Option<Args> {
     let mut a = Args { lefs: Vec::new(), def: None, db: None, out: None, report: None, max_layer: None, via_access: None };
     let mut it = args.iter();
     while let Some(k) = it.next() {
+        // ⚠️ Accepted and ignored — the report is JSON either way. The descriptor says
+        // `emits_json`, so a registry caller appends `--json`; rejecting it failed every such call.
+        if k == "--json" {
+            continue;
+        }
         let v = it.next()?.clone();
         match k.as_str() {
             "--lef" => a.lefs.push(v),

@@ -73,6 +73,16 @@ fn both_commands_are_described_and_route_is_primary() {
     assert!(["discovered", "structured", "workflow-validated"].contains(&d["maturity"].as_str().unwrap()));
 }
 
+/// `--json` is accepted anywhere and changes nothing: a registry caller appends it because the
+/// descriptor declares `emits_json`, and rejecting it failed every such call with a usage error.
+#[test]
+fn json_is_accepted_and_changes_nothing() {
+    let out = tmp("json.odb");
+    let o = bin().args(["pin_access", "--json", "--lef", &data("tiny.lef"), "--def", &data("tiny.def"), "--out", out.to_str().unwrap(), "--json"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8(o.stdout).unwrap().contains("\"status\":\"written\""));
+}
+
 #[test]
 fn a_bad_invocation_exits_two() {
     assert_eq!(bin().output().unwrap().status.code(), Some(2));
