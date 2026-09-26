@@ -203,8 +203,11 @@ impl Polygon90Set {
     }
 
     /// `get` into polygons (with holes): the set's connected pieces — slices sharing an edge of
-    /// some length — each as its own set, in the order the reference emits them: by the top y,
-    /// then the x of the leftmost vertex on that top edge.
+    /// some length — each as its own set, in the order the reference emits them: a piece is
+    /// output when the scan closes it, at its top y and the RIGHT end of its top edges there. So:
+    /// by the top y, then the largest x on that top line (pieces tied on the top line cannot
+    /// interleave there, so the right end orders them). Not the leftmost x: a rail with stubs
+    /// (top edges at x 515 .. 7245) and a bar beside it (2195 .. 5565) come out bar first.
     pub fn polygons(&mut self) -> Vec<Polygon90Set> {
         let rects = self.rectangles();
         let n = rects.len();
@@ -244,8 +247,8 @@ impl Polygon90Set {
             .into_values()
             .map(|rs| {
                 let top = rs.iter().map(|r| r.yh).max().expect("a slice");
-                let left = rs.iter().filter(|r| r.yh == top).map(|r| r.xl).min().expect("a slice");
-                ((top, left), rs)
+                let right = rs.iter().filter(|r| r.yh == top).map(|r| r.xh).max().expect("a slice");
+                ((top, right), rs)
             })
             .collect();
         keyed.sort_by_key(|k| k.0);
@@ -817,5 +820,31 @@ mod boundary_tests {
         let e = s.boundary_edges();
         assert!(e.contains(&Edge { vertical: true, line: 10, low: 0, high: 10, inner_increasing: false }));
         assert!(e.contains(&Edge { vertical: true, line: 10, low: 10, high: 20, inner_increasing: true }));
+    }
+
+    /// Pieces come out in the order the reference's `get` closes them: the top y, then the RIGHT
+    /// end of the piece's top edges. Each case's order was printed by a driver built against the
+    /// reference's own polygon library (200k random sets agreed with this key, 14k of them tied
+    /// on the top y). The first is sky130 a31oi_4's obstruction layer: rail + stubs, and a bar
+    /// with the same top — the bar ends first on the top line, so it comes first.
+    #[test]
+    fn pieces_come_out_by_top_then_right_end() {
+        let bbox = |mut p: Polygon90Set| {
+            let r = p.rectangles();
+            r.iter().skip(1).fold(r[0], |b, r| Rect { xl: b.xl.min(r.xl), yl: b.yl.min(r.yl), xh: b.xh.max(r.xh), yh: b.yh.max(r.yh) })
+        };
+        let order = |rects: &[Rect]| {
+            let mut s = Polygon90Set::new();
+            for &r in rects {
+                s.insert_rect(r);
+            }
+            s.polygons().into_iter().map(bbox).collect::<Vec<_>>()
+        };
+        let rail = [Rect::new(0, -85, 7820, 85), Rect::new(515, -85, 845, 465), Rect::new(1355, -85, 1685, 465), Rect::new(6075, -85, 6405, 465), Rect::new(6915, -85, 7245, 465), Rect::new(2195, 295, 5565, 465)];
+        assert_eq!(order(&rail), vec![Rect::new(2195, 295, 5565, 465), Rect::new(0, -85, 7820, 465)]);
+        let low_first = [Rect::new(0, 50, 100, 200), Rect::new(200, 0, 300, 100)];
+        assert_eq!(order(&low_first), vec![Rect::new(200, 0, 300, 100), Rect::new(0, 50, 100, 200)]);
+        let tied = [Rect::new(0, 0, 1000, 100), Rect::new(200, 200, 300, 500), Rect::new(400, 300, 500, 500)];
+        assert_eq!(order(&tied), vec![Rect::new(0, 0, 1000, 100), Rect::new(200, 200, 300, 500), Rect::new(400, 300, 500, 500)]);
     }
 }

@@ -652,39 +652,62 @@ fn ext_boundary_points(rb: &Rect, ext: &[crate::dr::cost::DrFig]) -> BTreeSet<(P
 /// leave the route box, length × width; plus half the box of a via of the net (a patch's whole
 /// box) found AT THE POINT whose origin is the wire's far end (⛔ the reference searches the
 /// shapes at the point, not at the far end — so this adds only when the far end is the point).
+/// The FIRST such via or patch counts, in the worker region query's order: a via and a patch
+/// both at the far end give different areas, and the reference's query returns the patch first
+/// on overlapping_edges (its trace; ext order would take the via).
 fn init_nets_boundary_area(tech: &crate::tech::Tech, rb: &Rect, nets: &mut [DrNet]) {
     use crate::dr::cost::DrFig;
-    for net in nets.iter_mut() {
-        let ext = net.ext.clone();
-        for pin in net.pins.iter_mut() {
+    let layers: BTreeSet<usize> = nets.iter().flat_map(|n| n.pins.iter().filter(|p| p.term.is_none()).flat_map(|p| p.patterns.iter().map(|a| a.layer))).collect();
+    if layers.is_empty() {
+        return;
+    }
+    // A fig's boxes on layer `l` as the worker region query stores them: a shape's box; a via's
+    // figs on that layer, each its own entry.
+    let fig_boxes = |f: &DrFig, l: usize| -> Vec<Rect> {
+        match f {
+            DrFig::Via { via, origin, .. } => {
+                let vd = &tech.via_defs[*via];
+                let figs = if vd.layer1 == l { &vd.layer1_figs } else if vd.layer2 == l { &vd.layer2_figs } else if vd.cut == l { &vd.cut_figs } else { return Vec::new() };
+                figs.iter().map(|r| Rect { xl: r.xl + origin.0, yl: r.yl + origin.1, xh: r.xh + origin.0, yh: r.yh + origin.1 }).collect()
+            }
+            _ => {
+                let (fl, b) = crate::dr::design::stored_box(tech, f);
+                if fl == l { vec![b] } else { Vec::new() }
+            }
+        }
+    };
+    // `FlexDRWorkerRegionQuery::init` on those layers: every net in order, its route figs then
+    // its ext figs, bulk-loaded. Values: (net, ext?, fig).
+    let trees: BTreeMap<usize, PackedRTree<(usize, bool, usize)>> = layers
+        .iter()
+        .map(|&l| {
+            let mut v = Vec::new();
+            for (ni, net) in nets.iter().enumerate() {
+                for (is_ext, figs) in [(false, &net.route), (true, &net.ext)] {
+                    for (k, f) in figs.iter().enumerate() {
+                        v.extend(fig_boxes(f, l).into_iter().map(|b| (b, (ni, is_ext, k))));
+                    }
+                }
+            }
+            (l, PackedRTree::new(v))
+        })
+        .collect();
+    let mut areas: Vec<(usize, usize, usize, i64)> = Vec::new();
+    for (ni, net) in nets.iter().enumerate() {
+        for (pi, pin) in net.pins.iter().enumerate() {
             if pin.term.is_some() {
                 continue;
             }
-            for ap in pin.patterns.iter_mut() {
+            for (ai, ap) in pin.patterns.iter().enumerate() {
                 let (bp, l) = (ap.point, ap.layer);
                 let q = Rect { xl: bp.0, yl: bp.1, xh: bp.0, yh: bp.1 };
-                // The net's shapes at the point on the layer, with their boxes there.
-                let mut here: Vec<(&DrFig, Rect)> = Vec::new();
-                for f in &ext {
-                    match f {
-                        DrFig::Via { via, origin, .. } => {
-                            let vd = &tech.via_defs[*via];
-                            let figs = if vd.layer1 == l { &vd.layer1_figs } else if vd.layer2 == l { &vd.layer2_figs } else if vd.cut == l { &vd.cut_figs } else { continue };
-                            for r in figs {
-                                let b = Rect { xl: r.xl + origin.0, yl: r.yl + origin.1, xh: r.xh + origin.0, yh: r.yh + origin.1 };
-                                if touches(&b, &q) {
-                                    here.push((f, b));
-                                }
-                            }
-                        }
-                        _ => {
-                            let (fl, b) = crate::dr::design::stored_box(tech, f);
-                            if fl == l && touches(&b, &q) {
-                                here.push((f, b));
-                            }
-                        }
-                    }
-                }
+                // The net's shapes at the point on the layer, in the query's order, with their boxes.
+                let here: Vec<(&DrFig, Rect)> = trees[&l]
+                    .query(&q)
+                    .into_iter()
+                    .filter(|(_, (n, _, _))| *n == ni)
+                    .map(|(b, (_, is_ext, k))| (if *is_ext { &net.ext[*k] } else { &net.route[*k] }, *b))
+                    .collect();
                 let mut area: i64 = 0;
                 for &(f, _) in &here {
                     let DrFig::Seg { begin: psb, end: pse, width, .. } = *f else { continue };
@@ -712,9 +735,12 @@ fn init_nets_boundary_area(tech: &crate::tech::Tech, rb: &Rect, nets: &mut [DrNe
                         }
                     }
                 }
-                ap.begin_area = area;
+                areas.push((ni, pi, ai, area));
             }
         }
+    }
+    for (ni, pi, ai, area) in areas {
+        nets[ni].pins[pi].patterns[ai].begin_area = area;
     }
 }
 
@@ -1414,5 +1440,33 @@ mod tests {
         let groups = vec![(0..5).map(wb).collect::<Vec<_>>(), vec![wb(9)]];
         let starts: Vec<Vec<i32>> = worker_batches(groups, 2).iter().map(|b| b.iter().map(|w| w.start.0).collect()).collect();
         assert_eq!(starts, vec![vec![0, 1], vec![2, 3], vec![4], vec![9]]);
+    }
+
+    // Rule (`initNets_boundaryArea`): a boundary point's area counts the FIRST via or patch at the
+    // wire's far end in the worker region query's order (route figs then ext figs per net,
+    // bulk-loaded) — not in the net's storage order. overlapping_edges' trace: a via and a patch
+    // at one far end, the reference takes the patch (39900, not 37550). Here: a 30-long wire
+    // (4200), a patch 255 × 140 (35700) and a via 300 × 300 (half: 45000). Alone, the one-leaf
+    // tree keeps the storage order (via first); with another net's 15 shapes on the layer the
+    // pack returns the patch first.
+    #[test]
+    fn a_boundary_area_takes_the_first_via_or_patch_in_query_order() {
+        use crate::dr::cost::DrFig;
+        let (t, _, _, _, rb) = uni(false);
+        let via = DrFig::Via { via: 0, origin: (500, -30), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false };
+        let patch = DrFig::Patch { layer: 4, origin: (500, -30), offset: Rect::new(0, -70, 255, 70) };
+        let seg = DrFig::Seg { layer: 4, begin: (500, -30), end: (500, 0), width: 140, begin_ext: 70, end_ext: 70, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false };
+        let fill = [(810, -485, -159), (1656, -438, 212), (1002, 225, 808), (-1542, -1828, -1609), (-1308, -1941, -1704), (-1292, -1923, -1476), (505, -393, 250), (1669, -889, -128), (-681, 143, 379), (1119, -1187, -792), (1847, 859, 1601), (-1662, -1918, -1742), (239, 1934, 2413), (-734, -691, -151), (-162, -409, 187)];
+        let area = |filled: bool| {
+            let pin = DrPin { term: None, id: 0, patterns: vec![DrAccessPattern { point: (500, 0), layer: 4, begin_area: 0, pin_cost: 0, ap: None }] };
+            let net = |id, pins, ext| DrNet { id, net: id, pins, num_pins_in: 0, pin_box: rb, ext, route: Vec::new() };
+            let mut nets = vec![net(0, vec![pin], vec![via.clone(), patch.clone(), seg.clone()])];
+            if filled {
+                nets.push(net(1, Vec::new(), fill.iter().map(|&(x, yl, yh)| DrFig::Patch { layer: 4, origin: (x, yl), offset: Rect::new(0, 0, 140, yh - yl) }).collect()));
+            }
+            init_nets_boundary_area(&t, &rb, &mut nets);
+            nets[0].pins[0].patterns[0].begin_area
+        };
+        assert_eq!((area(false), area(true)), (4200 + 45000, 4200 + 35700));
     }
 }
