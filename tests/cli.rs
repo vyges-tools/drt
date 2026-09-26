@@ -123,3 +123,20 @@ fn the_tiny_design_is_written() {
     assert_eq!(db.bpin_access_points("in", 0).unwrap(), vec![(1100, 2300, 2)]);
     let _ = std::fs::remove_file(&out);
 }
+
+/// A DEF whose cells no LEF defines fails with a reason a user can act on: the file, the generic
+/// error, its cause (the cell and instance) and what to do — not libodb's bare `ODB-0421`.
+#[test]
+fn a_def_with_undefined_cells_names_the_file_the_cause_and_the_fix() {
+    let lef = std::fs::read_to_string(data("tiny.lef")).unwrap();
+    let tech = tmp("tech.lef");
+    std::fs::write(&tech, format!("{}\nEND LIBRARY\n", &lef[..lef.find("\nMACRO").unwrap()])).unwrap();
+    let out = tmp("undefined.odb");
+    let o = bin().args(["pin_access", "--lef", tech.to_str().unwrap(), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
+    let reason = r["reason"].as_str().unwrap();
+    assert!(reason.starts_with(&format!("{}: ODB-0421: DEF parser returns an error!", data("tiny.def"))), "{reason}");
+    assert!(reason.contains("caused by ODB-0092: unknown library cell referenced (BUF) for instance (u1)"), "{reason}");
+    assert!(reason.contains("a LEF defining that cell was not read"), "{reason}");
+}

@@ -226,7 +226,7 @@ fn route(a: &Args) -> Outcome {
     let Some(p) = &a.db else { return fail("error", 2, "detailed_route reads a database (--db)".into()) };
     let mut db = match Db::open(p) {
         Ok(d) => d,
-        Err(e) => return fail("error", 2, e.to_string()),
+        Err(e) => return fail("error", 2, format!("{p}: {e}")),
     };
     let tech = match read::tech(&db) {
         Ok(t) => t,
@@ -259,17 +259,18 @@ fn run(a: &Args) -> Outcome {
     let mut db = if let Some(p) = &a.db {
         match Db::open(p) {
             Ok(d) => d,
-            Err(e) => return fail("error", 2, e.to_string()),
+            Err(e) => return fail("error", 2, format!("{p}: {e}")),
         }
     } else {
         let mut db = Db::new();
         for l in &a.lefs {
             if let Err(e) = db.read_lef(l) {
-                return fail("error", 2, e.to_string());
+                return fail("error", 2, format!("{l}: {e}"));
             }
         }
-        if let Err(e) = db.read_def(a.def.as_ref().expect("a DEF"), "default") {
-            return fail("error", 2, e.to_string());
+        let def = a.def.as_ref().expect("a DEF");
+        if let Err(e) = db.read_def(def, "default") {
+            return fail("error", 2, format!("{def}: {e}"));
         }
         db
     };
