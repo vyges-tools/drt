@@ -50,6 +50,9 @@ pub struct Layer {
     pub eol: Vec<EolRule>,
     /// A routing layer's own minimum AREA (square database units; 0 without one).
     pub min_area: i64,
+    /// MINENCLOSEDAREA rules without a width (`frMinEnclosedAreaConstraint`): each rule's area,
+    /// narrowed to `frCoord` (a 32-bit int) as `io::Parser` stores it.
+    pub min_enclosed_areas: Vec<i32>,
     /// A rect-only routing layer: every polygon of a net on it must be one rectangle (where its
     /// own fixed shapes do not already break that), and it is UNIDIRECTIONAL.
     pub rect_only: bool,
@@ -333,10 +336,12 @@ pub mod read {
                         .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }) })
                         .collect();
                     let min_area = db.layer_get_area(&name).unwrap_or(0);
+                    // ⚠️ `frCoord minEnclosedArea = _minEnclosedArea`: an int64 narrowed to int.
+                    let min_enclosed_areas: Vec<i32> = db.layer_min_enclosed_areas(&name).into_iter().map(|a| a as i32).collect();
                     // Only the plain flag makes the constraint; "except non-core pins" alone is
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, min_area, rect_only });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, min_area, min_enclosed_areas, rect_only });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;

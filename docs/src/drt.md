@@ -106,7 +106,10 @@ ran, because rerouting everything writes the same DEF; the counts can.
 ### Limits
 
 Design rules modelled: shorts, non-sufficient metal, parallel-run spacing, cut spacing (one plain
-rule per cut layer), LEF 5.4 end-of-line spacing, minimum width, minimum area, and rect-only layers.
+rule per cut layer), LEF 5.4 end-of-line spacing, minimum width, minimum area (patched, or reported
+where a patch cannot fix it), minimum enclosed area (`MINENCLOSEDAREA` without a width), and
+rect-only layers. A net the global router gave antenna jumpers is kept to its guides: off them it
+costs ten times as much.
 Refused rather than approximated: any other rule family a layer carries (named in the report's
 `reason`); a multi-patterned routing layer; spacing limited to a width range; a non-default rule
 with hard spacing, via generate rules or wire extension; FIXED wiring, or a routed net on a

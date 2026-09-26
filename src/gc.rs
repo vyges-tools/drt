@@ -76,6 +76,9 @@ pub enum Rule {
     /// One owner's polygon smaller than the layer's minimum area (`checkMetalShape_minArea`, the
     /// marker pass): what the patch pass could not fix, or found where no net is the target.
     MinArea,
+    /// A hole in one owner's polygon smaller than a MINENCLOSEDAREA rule
+    /// (`checkMetalShape_minEnclosedArea`).
+    MinEnclosedArea,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -768,6 +771,34 @@ impl<'a> Worker<'a> {
         }
         self.min_area(layer, net, pin);
         self.rect_only(layer, net, pin);
+        self.min_enclosed_area(layer, net, pin);
+    }
+
+    /// `checkMetalShape_minEnclosedArea`: per hole of the polygon, per MINENCLOSEDAREA rule, a hole
+    /// smaller than the rule is a marker on the hole's extents — when the polygon holds any of the
+    /// owner's ROUTE shapes (`net->getPolygons(layer, false) & poly` not empty: a hole wholly among
+    /// fixed shapes is not the router's to fix). No ignore flag: pin access checks it too.
+    fn min_enclosed_area(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        if self.tech.layers[layer].min_enclosed_areas.is_empty() {
+            return;
+        }
+        let holes = pin.holes();
+        if holes.is_empty() {
+            return;
+        }
+        let slices = pin.rectangles();
+        let routed = self.nets[net].route_slices[layer].iter().any(|r| slices.iter().any(|p| overlap(r, p).is_some()));
+        if !routed {
+            return;
+        }
+        let rules = self.tech.layers[layer].min_enclosed_areas.clone();
+        for (area, bbox) in holes {
+            for &req in &rules {
+                if area < i64::from(req) {
+                    self.add_marker(Rule::MinEnclosedArea, layer, bbox, net, net);
+                }
+            }
+        }
     }
 
     /// `checkMetalShape_minArea`, the marker pass: a polygon below the layer's minimum area gives a
@@ -1497,9 +1528,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], min_area: 0, rect_only: false },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], min_area: 0, rect_only: false },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -1597,6 +1628,33 @@ pub(crate) mod tests {
         // Part of the polygon is the owner's fixed shape (a fixed edge): none.
         let fixed = [(net("a"), 4, Rect::new(0, 0, 150, 200), true), (net("a"), 4, Rect::new(150, 0, 300, 200), false)];
         assert!(boxes(&markers_min_area(&fixed, 100_000, None, false), Rule::MinArea).is_empty());
+    }
+
+    /// Rule (`checkMetalShape_minEnclosedArea`): a hole smaller than a MINENCLOSEDAREA rule is a
+    /// marker on the hole's extents — here a ring of 200-wide trial wires round a 200 × 200 hole
+    /// (40,000 < 50,000). None when the ring is all fixed shapes (no route shape in the polygon),
+    /// or when the hole meets the rule.
+    #[test]
+    fn min_enclosed_area_marks_a_small_hole_of_a_routed_polygon() {
+        let ring = |fixed: bool| vec![
+            (net("a"), 4, Rect::new(0, 0, 600, 200), fixed),
+            (net("a"), 4, Rect::new(0, 400, 600, 600), fixed),
+            (net("a"), 4, Rect::new(0, 200, 200, 400), fixed),
+            (net("a"), 4, Rect::new(400, 200, 600, 400), fixed),
+        ];
+        let run = |shapes: &[(Owner, usize, Rect, bool)], req: i32| {
+            let mut t = tech();
+            t.layers[4].min_enclosed_areas = vec![req];
+            let mut w = Worker::new(&t);
+            for (o, l, r, f) in shapes {
+                w.add(o, *l, *r, *f);
+            }
+            w.init();
+            w.run().to_vec()
+        };
+        assert_eq!(boxes(&run(&ring(false), 50_000), Rule::MinEnclosedArea), vec![Rect::new(200, 200, 400, 400)]);
+        assert!(boxes(&run(&ring(true), 50_000), Rule::MinEnclosedArea).is_empty());
+        assert!(boxes(&run(&ring(false), 40_000), Rule::MinEnclosedArea).is_empty());
     }
 
     /// Rule: minimum width is judged on the polygon's slices — sliced horizontally, each slice's

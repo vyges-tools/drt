@@ -162,6 +162,46 @@ impl Polygon90Set {
         out
     }
 
+    /// The holes of the set's polygons, each as (area, bounding box): the pieces of the set's
+    /// complement inside its bounding box that do not reach that box's border — what boost's
+    /// `begin_holes()` walks, and `gtl::area` / `gtl::extents` measure, per hole.
+    pub fn holes(&mut self) -> Vec<(i64, Rect)> {
+        let rects = self.rectangles();
+        if rects.is_empty() {
+            return Vec::new();
+        }
+        let bb = rects.iter().skip(1).fold(rects[0], |b, r| Rect { xl: b.xl.min(r.xl), yl: b.yl.min(r.yl), xh: b.xh.max(r.xh), yh: b.yh.max(r.yh) });
+        let mut ys: Vec<i32> = rects.iter().flat_map(|r| [r.yl, r.yh]).collect();
+        ys.sort_unstable();
+        ys.dedup();
+        let mut gaps = Polygon90Set::new();
+        for w in ys.windows(2) {
+            let (y0, y1) = (w[0], w[1]);
+            let mut cover: Vec<(i32, i32)> = rects.iter().filter(|r| r.yl <= y0 && r.yh >= y1).map(|r| (r.xl, r.xh)).collect();
+            cover.sort_unstable();
+            let mut x = bb.xl;
+            for (a, b) in cover {
+                if a > x {
+                    gaps.insert_rect(Rect { xl: x, yl: y0, xh: a, yh: y1 });
+                }
+                x = x.max(b);
+            }
+            if x < bb.xh {
+                gaps.insert_rect(Rect { xl: x, yl: y0, xh: bb.xh, yh: y1 });
+            }
+        }
+        let mut out = Vec::new();
+        for mut piece in gaps.polygons() {
+            let pr = piece.rectangles();
+            let pb = pr.iter().skip(1).fold(pr[0], |b, r| Rect { xl: b.xl.min(r.xl), yl: b.yl.min(r.yl), xh: b.xh.max(r.xh), yh: b.yh.max(r.yh) });
+            if pb.xl == bb.xl || pb.yl == bb.yl || pb.xh == bb.xh || pb.yh == bb.yh {
+                continue;
+            }
+            out.push((pr.iter().map(|r| i64::from(r.dx()) * i64::from(r.dy())).sum(), pb));
+        }
+        out
+    }
+
     /// `get` into polygons (with holes): the set's connected pieces — slices sharing an edge of
     /// some length — each as its own set, in the order the reference emits them: by the top y,
     /// then the x of the leftmost vertex on that top edge.
@@ -751,6 +791,21 @@ mod boundary_tests {
         assert_eq!(e.len(), 8);
         assert!(e.contains(&Edge { vertical: true, line: 10, low: 10, high: 20, inner_increasing: false }));
         assert!(e.contains(&Edge { vertical: false, line: 20, low: 10, high: 20, inner_increasing: true }));
+    }
+
+    // A ring's hole: its area and extents; a C shape (open to the border) has none.
+    #[test]
+    fn a_ring_has_one_hole_and_a_c_shape_none() {
+        let mut s = Polygon90Set::new();
+        for r in [Rect::new(0, 0, 30, 10), Rect::new(0, 20, 30, 30), Rect::new(0, 10, 10, 20), Rect::new(20, 10, 30, 20)] {
+            s.insert_rect(r);
+        }
+        assert_eq!(s.holes(), vec![(100, Rect::new(10, 10, 20, 20))]);
+        let mut c = Polygon90Set::new();
+        for r in [Rect::new(0, 0, 30, 10), Rect::new(0, 20, 30, 30), Rect::new(0, 10, 10, 20)] {
+            c.insert_rect(r);
+        }
+        assert!(c.holes().is_empty());
     }
 
     // Corner-touching squares: the shared line carries two edges, one per side.
