@@ -131,6 +131,35 @@ const DESCRIBE: &str = r#"{
   "exit_codes": { "0": "written", "1": "markers (detailed_route)", "2": "vacuous or error", "3": "refused" }
 }"#;
 
+/// The `vyges-events` causal trail: every event goes to STDERR, the report to stdout (or `-o`), so
+/// a caller can parse one without the other. Codes name a situation, not a message:
+///
+/// | code | meaning |
+/// |---|---|
+/// | `DRT-DONE` | the run finished; a census of what it did (detailed_route: iterations, markers, nets written, routed before, rerouted; pin_access: unique classes, preferred points, port points). `warn` when the status is not the pass word |
+/// | `DRT-REFUSED` | a step this engine does not model; the reason names it |
+/// | `DRT-ERROR` | usage, unreadable input, or a failed write |
+mod events {
+    use vyges_events::{emit, Event, Severity};
+
+    const TOOL: &str = "vyges-drt";
+
+    /// One event for the run's outcome, from its status word and the report's own fields.
+    pub fn outcome(status: &str, pass: &str, reason: Option<&str>, census: &str) {
+        let (code, severity) = match status {
+            "refused" => ("DRT-REFUSED", Severity::Error),
+            "error" => ("DRT-ERROR", Severity::Error),
+            s if s == pass => ("DRT-DONE", Severity::Info),
+            _ => ("DRT-DONE", Severity::Warn),
+        };
+        let text = match reason {
+            Some(r) => format!("{status}: {r}"),
+            None => format!("{status}: {census}"),
+        };
+        emit(&Event::new(TOOL, severity, text).with_code(code));
+    }
+}
+
 struct Args {
     lefs: Vec<String>,
     def: Option<String>,
@@ -327,6 +356,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    // ⛔ Before any database exists: libodb then logs to the events trail (stderr) only, and
+    // stdout carries nothing but the JSON report a caller parses.
+    vyges_opendb::init_events_logging();
     let Some(a) = parse(&args[1..]) else {
         eprint!("{USAGE}");
         return ExitCode::from(2);
@@ -337,6 +369,9 @@ fn main() -> ExitCode {
         report.push_str(&format!(",\"{k}\":{v}"));
     }
     report.push_str("}\n");
+    let census: Vec<String> = o.fields.iter().filter(|(k, _)| *k != "reason").map(|(k, v)| format!("{k}={}", v.trim_matches('"'))).collect();
+    let reason = o.fields.iter().find(|(k, _)| *k == "reason").map(|(_, v)| v.trim_matches('"').to_string());
+    events::outcome(o.status, "written", reason.as_deref(), &census.join(" "));
     match &a.report {
         Some(p) => {
             if let Err(e) = std::fs::write(p, &report) {

@@ -15,9 +15,10 @@ categories = ["science", "command-line-utilities"]
 [features]
 # The design database reader. OFF by default: the geometry and the access-point rules build and
 # test with no C++ dependency.
-odb = ["dep:vyges-opendb"]
+odb = ["dep:vyges-opendb", "dep:vyges-events"]
 
 [dependencies]
+vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true, features = ["gen-write"] }
 
 [dev-dependencies]
