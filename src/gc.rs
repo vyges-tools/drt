@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{CornerSpacing, EolKeepOut, EolRule, LayerKind, ParallelEdge, Tech};
+use crate::tech::{CornerSpacing, CutSpacingTable, EolKeepOut, EolRule, LayerKind, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -87,6 +87,8 @@ pub enum Rule {
     /// A convex corner closer to another owner's corner than a LEF58 corner spacing rule allows
     /// (`checkMetalCornerSpacing`).
     CornerSpacing,
+    /// Two cuts closer than a LEF58 cut spacing table allows (`checkLef58CutSpacingTbl`).
+    Lef58CutSpacingTable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1797,19 +1799,142 @@ impl<'a> Worker<'a> {
     fn check_cut_spacing(&mut self) {
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            let Some(spc) = l.cut_spacing.filter(|_| l.kind == LayerKind::Cut) else { continue };
+            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none()) {
+                continue;
+            }
+            let table = l.cut_table.clone();
             for net in 0..self.nets.len() {
                 if !self.checks_from(net) {
                     continue;
                 }
                 let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).collect();
+                // `checkCutSpacing_main(rect)`: per cut, the plain rule, then the LEF58 table.
                 for k in mine {
-                    let q = bloat(&self.shapes[layer][k].rect, spc);
-                    for o in self.query(layer, &q) {
-                        self.cut_pair(layer, k, o, spc);
+                    if let Some(spc) = self.tech.layers[layer].cut_spacing {
+                        let q = bloat(&self.shapes[layer][k].rect, spc);
+                        for o in self.query(layer, &q) {
+                            self.cut_pair(layer, k, o, spc);
+                        }
+                    }
+                    if let Some(t) = &table {
+                        self.cut_spacing_table(layer, k, t);
                     }
                 }
             }
+        }
+    }
+
+    /// `checkLef58CutSpacingTbl` (a different-net table on the cut's own layer): every other pin's
+    /// cut within the largest spacing the cut's class can need — its END spacing for a square cut,
+    /// the larger of END and SIDE otherwise — not both fixed.
+    fn cut_spacing_table(&mut self, layer: usize, k: usize, t: &CutSpacingTable) {
+        let v = self.shapes[layer][k];
+        let (w, l) = (v.rect.dx().min(v.rect.dy()), v.rect.dx().max(v.rect.dy()));
+        let c = self.tech.layers[layer].cut_class_of(w, l);
+        let max_spc = if w == l { t.max_spacing[c][0] } else { t.max_spacing[c][0].max(t.max_spacing[c][1]) };
+        for o in self.query(layer, &bloat(&v.rect, max_spc)) {
+            let p = self.shapes[layer][o];
+            if (p.fixed && v.fixed) || (p.net, p.pin) == (v.net, v.pin) {
+                continue;
+            }
+            self.cut_spacing_table_pair(layer, k, o, t);
+        }
+    }
+
+    /// `checkLef58CutSpacingTbl_main` for a different-net table on one layer. Same-owner cuts are
+    /// checked too (the layer has no same-net or same-metal table to hand them to). Overlapping
+    /// cuts are a cut SHORT (unless the classes' largest spacing is 0); apart, each direction the
+    /// second cut lies in is judged by `helper`.
+    fn cut_spacing_table_pair(&mut self, layer: usize, k1: usize, k2: usize, t: &CutSpacingTable) {
+        let (v1, v2) = (self.shapes[layer][k1], self.shapes[layer][k2]);
+        let (r1, r2) = (v1.rect, v2.rect);
+        let class = |r: &Rect| self.tech.layers[layer].cut_class_of(r.dx().min(r.dy()), r.dx().max(r.dy()));
+        let (c1, c2) = (class(&r1), class(&r2));
+        let marker = generalized_intersect(&r1, &r2);
+        let (dx, dy) = (gap((r1.xl, r1.xh), (r2.xl, r2.xh)), gap((r1.yl, r1.yh), (r2.yl, r2.yh)));
+        let dist2 = i64::from(dx).pow(2) + i64::from(dy).pow(2);
+        if dist2 == 0 {
+            if t.max_pair_spacing(c1, c2) == 0 {
+                return;
+            }
+            // `checkCutSpacing_short`.
+            if !(v1.fixed && v2.fixed) {
+                self.add_marker_of(Rule::Short, layer, marker, (v1.net, r1, v1.fixed), (v2.net, r2, v2.fixed));
+            }
+        }
+        let center = |r: &Rect| (i64::from((r.xl + r.xh) / 2), i64::from((r.yl + r.yh) / 2));
+        let ((x1, y1), (x2, y2)) = (center(&r1), center(&r2));
+        let c2c2 = (x1 - x2).pow(2) + (y1 - y2).pow(2);
+        let (right, left, up, down) = (r2.xl > r1.xh, r2.xh < r1.xl, r2.yl > r1.yh, r2.yh < r1.yl);
+        // `checkLef58CutSpacingTbl_prlValid`: a run past the classes' PRL on either axis.
+        let req_prl = t.prl_entry[t.pair(c1, c2)];
+        let prl_x = if dx != 0 { -(marker.xh - marker.xl) } else { marker.xh - marker.xl };
+        let prl_y = if dy != 0 { -(marker.yh - marker.yl) } else { marker.yh - marker.yl };
+        let prl_valid = prl_x > req_prl || prl_y > req_prl;
+        let prl = if prl_valid { prl_x.max(prl_y) } else { -1 };
+        let mut viol = false;
+        if up || down {
+            viol = self.cut_table_helper(layer, (&r1, &r2), (c1, c2), if up { EdgeDir::N } else { EdgeDir::S }, (dist2, c2c2), (prl_valid, prl), t);
+        }
+        if !viol && (right || left) {
+            viol = self.cut_table_helper(layer, (&r1, &r2), (c1, c2), if right { EdgeDir::E } else { EdgeDir::W }, (dist2, c2c2), (prl_valid, prl), t);
+        }
+        if viol {
+            // ⚠️ The reference records each side's rectangle with its x-high as its y-high too.
+            let side = |r: &Rect| Rect::new(r.xl, r.yl, r.xh, r.xh);
+            self.add_marker_of(Rule::Lef58CutSpacingTable, layer, marker, (v1.net, side(&r1), v1.fixed), (v2.net, side(&r2), v2.fixed));
+        }
+    }
+
+    /// `checkLef58CutSpacingTbl_helper`: whether the pair is too close with the second cut in
+    /// direction `dir`. Each cut's facing edge is a SIDE when it is the cut's long edge. NOPRL with
+    /// CENTERANDEDGE: centre to centre below the larger spacing, or edge to edge below the smaller;
+    /// the same class, exactly aligned (run equal to the cut's own width across `dir`, unless the
+    /// table is limited to that direction), with an EXACTALIGNED spacing: edge to edge below it;
+    /// otherwise the table's first value, or its second where the run is valid (back to the first
+    /// under PRLFORALIGNEDCUT when no metal edge above lies on the second cut's facing edge), centre
+    /// to centre for CENTERTOCENTER (or CENTERANDEDGE where it is the larger value), else edge to
+    /// edge.
+    #[allow(clippy::too_many_arguments)]
+    fn cut_table_helper(&self, layer: usize, (r1, r2): (&Rect, &Rect), (c1, c2): (usize, usize), dir: EdgeDir, (dist2, c2c2): (i64, i64), (prl_valid, prl): (bool, i32), t: &CutSpacingTable) -> bool {
+        let (h1, v1, h2, v2) = (r1.dx(), r1.dy(), r2.dx(), r2.dy());
+        let ns = matches!(dir, EdgeDir::N | EdgeDir::S);
+        let (side1, side2) = if ns { (h1 > v1, h2 > v2) } else { (v1 > h1, v2 > h2) };
+        let pair = t.pair(c1, c2);
+        let sq = |v: i32| i64::from(v) * i64::from(v);
+        if t.no_prl && t.center_and_edge[pair] {
+            let (f, s) = t.get(c1, side1, c2, side2);
+            if c2c2 < sq(f.max(s)) {
+                return true;
+            }
+            return dist2 < sq(f.min(s));
+        }
+        if c1 == c2 {
+            let aligned = if ns { prl == h1 && !t.horizontal } else { prl == v1 && !t.vertical };
+            let ex = t.exact_aligned[c1];
+            if aligned && ex != -1 {
+                return dist2 < sq(ex);
+            }
+        }
+        let mut second = prl_valid;
+        if prl_valid && t.prl_aligned[pair] {
+            let e = match dir {
+                EdgeDir::S => Rect::new(r2.xl, r2.yh, r2.xh, r2.yh),
+                EdgeDir::N => Rect::new(r2.xl, r2.yl, r2.xh, r2.yl),
+                EdgeDir::E => Rect::new(r2.xl, r2.yl, r2.xl, r2.yh),
+                EdgeDir::W => Rect::new(r2.xh, r2.yl, r2.xh, r2.yh),
+            };
+            if layer + 1 >= self.segs.len() || self.query_segs(layer + 1, &e).is_empty() {
+                second = false;
+            }
+        }
+        let (f, s) = t.get(c1, side1, c2, side2);
+        let req = if second { s } else { f };
+        let center = t.center_to_center[pair] || (t.center_and_edge[pair] && req == f.max(s));
+        if center {
+            c2c2 < sq(req)
+        } else {
+            dist2 < sq(req)
         }
     }
 
@@ -1929,9 +2054,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -2293,6 +2418,55 @@ pub(crate) mod tests {
         let mut e = boundary(&[Rect::new(0, 0, 10, 10)]);
         e.sort();
         assert_eq!(e, vec![((0, 0), (10, 0)), ((0, 10), (0, 0)), ((10, 0), (10, 10)), ((10, 10), (0, 10))]);
+    }
+}
+
+#[cfg(test)]
+mod cut_table_tests {
+    //! A LEF58 different-net cut spacing table on constructed geometry: cut layer 3 of
+    //! `tests::tech()` without its plain rule, no cut classes, every lookup 34 (the table's
+    //! DEFAULT, as asap7's all-"-" tables give).
+    use super::*;
+
+    fn table(prl: i32) -> CutSpacingTable {
+        CutSpacingTable { n: 1, spacing: vec![(34, 34); 4], max_spacing: vec![[34, 34]], prl_entry: vec![prl], center_to_center: vec![false], center_and_edge: vec![false], prl_aligned: vec![false], exact_aligned: vec![-1], ..Default::default() }
+    }
+
+    fn check(cuts: &[(&str, Rect, bool)]) -> Vec<(Rule, Rect)> {
+        let mut t = tests::tech();
+        t.layers[3].cut_spacing = None;
+        t.layers[3].cut_table = Some(table(0));
+        let mut w = Worker::new(&t);
+        for (o, r, f) in cuts {
+            w.add(&Owner::Net((*o).into()), 3, *r, *f);
+        }
+        w.init();
+        let mut v: Vec<(Rule, Rect)> = w.run().iter().filter(|m| m.layer == 3).map(|m| (m.rule, m.bbox)).collect();
+        v.dedup();
+        v
+    }
+
+    // Rule (`checkLef58CutSpacingTbl_main` / `_helper`): edge to edge below the table's spacing is
+    // a violation — for cuts of ONE net too, where the layer has no same-net table; overlapping
+    // cuts are a cut short; both fixed, nothing.
+    #[test]
+    fn two_cuts_closer_than_the_table_spacing() {
+        let a = Rect::new(0, 0, 18, 24);
+        let b = Rect::new(38, 0, 56, 24);
+        assert_eq!(check(&[("a", a, false), ("b", b, false)]), vec![(Rule::Lef58CutSpacingTable, Rect::new(18, 0, 38, 24))]);
+        assert!(check(&[("a", a, false), ("b", Rect::new(52, 0, 70, 24), false)]).is_empty(), "34 apart is not below 34");
+        assert_eq!(check(&[("a", a, false), ("a", b, false)]).len(), 1, "one net, two pins");
+        assert!(check(&[("a", a, true), ("b", b, true)]).is_empty(), "both fixed");
+        assert_eq!(check(&[("a", a, false), ("b", Rect::new(9, 0, 27, 24), false)]), vec![(Rule::Short, Rect::new(9, 0, 18, 24))]);
+    }
+
+    // Rule (`getCutClassIdx`): the LAST class of exactly the cut's size — width the shorter side.
+    #[test]
+    fn a_cut_takes_the_last_class_of_its_size() {
+        let class = |name: &str| crate::tech::CutClass { name: name.into(), width: 18, length: 24 };
+        let l = crate::tech::Layer { cut_classes: vec![class("A"), class("B")], ..Default::default() };
+        assert_eq!(l.cut_class_of(18, 24), 2);
+        assert_eq!(l.cut_class_of(24, 24), 0);
     }
 }
 

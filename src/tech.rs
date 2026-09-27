@@ -46,6 +46,10 @@ pub struct Layer {
     pub spacing: Option<SpacingTable>,
     /// A cut layer's minimum spacing, edge to edge.
     pub cut_spacing: Option<i32>,
+    /// A cut layer's LEF58 cut classes, in the technology's order.
+    pub cut_classes: Vec<CutClass>,
+    /// A cut layer's LEF58 different-net cut spacing table (the only kind modelled).
+    pub cut_table: Option<CutSpacingTable>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line SPACING rules, in the technology's order (the
@@ -128,6 +132,61 @@ impl CornerSpacing {
     /// `fr1DLookupTbl::findMax`: the LAST row's pair (not the largest).
     pub fn find_max(&self) -> (i32, i32) {
         self.spacings[self.spacings.len() - 1]
+    }
+}
+
+/// A LEF58 cut class (`frLef58CutClass`): a cut `width` by `length` (the width when the class
+/// gives no length).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CutClass {
+    pub name: String,
+    pub width: i32,
+    pub length: i32,
+}
+
+impl Layer {
+    /// `frLayer::getCutClassIdx(width, length)`: the LAST class of exactly that size (no early
+    /// break), as a class index of the layer's cut spacing table (0: no class).
+    pub fn cut_class_of(&self, width: i32, length: i32) -> usize {
+        self.cut_classes.iter().rposition(|c| c.width == width && c.length == length).map_or(0, |i| i + 1)
+    }
+}
+
+/// A LEF58 different-net cut spacing table (`frLef58CutSpacingTableConstraint`), its lookups —
+/// the database rule's own `getSpacing`, `getMaxSpacing`, `getPrlEntry`, … — evaluated when the
+/// technology is read for every pair of the layer's classes, class 0 being "no class" (the
+/// empty name, which falls to the table's default). Indices: class `c`, side `s` (0 END, 1 SIDE).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CutSpacingTable {
+    /// The number of classes, "no class" included.
+    pub n: usize,
+    /// `getSpacing(c1, s1, c2, s2, FIRST / SECOND)`.
+    pub spacing: Vec<(i32, i32)>,
+    /// `getMaxSpacing(c, SIDE)` per class: [END, SIDE].
+    pub max_spacing: Vec<[i32; 2]>,
+    /// Per class pair: `getPrlEntry`, `isCenterToCenter`, `isCenterAndEdge`,
+    /// `isPrlForAlignedCutClasses`.
+    pub prl_entry: Vec<i32>,
+    pub center_to_center: Vec<bool>,
+    pub center_and_edge: Vec<bool>,
+    pub prl_aligned: Vec<bool>,
+    /// `getExactAlignedSpacing(c)` per class (-1: none).
+    pub exact_aligned: Vec<i32>,
+    pub no_prl: bool,
+    pub horizontal: bool,
+    pub vertical: bool,
+}
+
+impl CutSpacingTable {
+    pub fn get(&self, c1: usize, side1: bool, c2: usize, side2: bool) -> (i32, i32) {
+        self.spacing[((c1 * 2 + usize::from(side1)) * self.n + c2) * 2 + usize::from(side2)]
+    }
+    pub fn pair(&self, c1: usize, c2: usize) -> usize {
+        c1 * self.n + c2
+    }
+    /// `getMaxSpacing(c1, c2, MAX)`: the largest of the four side combinations' larger value.
+    pub fn max_pair_spacing(&self, c1: usize, c2: usize) -> i32 {
+        [(true, true), (true, false), (false, true), (false, false)].iter().map(|&(a, b)| { let (f, s) = self.get(c1, a, c2, b); f.max(s) }).max().unwrap_or(0)
     }
 }
 
@@ -353,6 +412,60 @@ pub mod read {
 
     type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+    /// A cut layer's LEF58 cut classes, as `io::Parser` reads them.
+    pub fn cut_classes(db: &Db, layer: &str) -> Vec<CutClass> {
+        db.layer_get_tech_layer_cut_class_rules(layer)
+            .into_iter()
+            .enumerate()
+            .map(|(k, name)| {
+                let width = db.cutclassrule_get_width(layer, k);
+                let length = if db.cutclassrule_is_length_valid(layer, k) { db.cutclassrule_get_length(layer, k) } else { width };
+                CutClass { name, width, length }
+            })
+            .collect()
+    }
+
+    /// A cut layer's LEF58 cut spacing table rules as `io::Parser` keeps them (it skips a SAMEMASK
+    /// rule, and a LAYER rule on the first layer), or the first kind outside the modelled one — a
+    /// different-net table on the layer itself (no LAYER, SAMENET or SAMEMETAL). Several such
+    /// rules: the LAST is the one set, as io sets it.
+    pub fn cut_spacing_table(db: &Db, layer: &str, classes: &[CutClass]) -> Result<Option<CutSpacingTable>, &'static str> {
+        let mut out = None;
+        for k in 0..db.num_layer_get_tech_layer_cut_spacing_table_def_rules(layer) {
+            if db.cutspacingtablerule_is_same_mask(layer, k) {
+                continue;
+            }
+            if db.cutspacingtablerule_is_layer_valid(layer, k) {
+                return Err("a LAYER (inter-layer) cut spacing table");
+            }
+            if db.cutspacingtablerule_is_same_net(layer, k) || db.cutspacingtablerule_is_same_metal(layer, k) {
+                return Err("a SAMENET or SAMEMETAL cut spacing table");
+            }
+            let names: Vec<&str> = std::iter::once("").chain(classes.iter().map(|c| c.name.as_str())).collect();
+            let n = names.len();
+            let mut t = CutSpacingTable { n, no_prl: db.cutspacingtablerule_is_no_prl(layer, k), horizontal: db.cutspacingtablerule_is_horizontal(layer, k), vertical: db.cutspacingtablerule_is_vertical(layer, k), ..Default::default() };
+            for &c1 in &names {
+                for s1 in [false, true] {
+                    for &c2 in &names {
+                        for s2 in [false, true] {
+                            t.spacing.push((db.cutspacingtablerule_get_spacing(layer, k, c1, s1, c2, s2, "FIRST"), db.cutspacingtablerule_get_spacing(layer, k, c1, s1, c2, s2, "SECOND")));
+                        }
+                    }
+                }
+                t.max_spacing.push([db.cutspacingtablerule_get_max_spacing_cut_class_side(layer, k, c1, false), db.cutspacingtablerule_get_max_spacing_cut_class_side(layer, k, c1, true)]);
+                t.exact_aligned.push(db.cutspacingtablerule_get_exact_aligned_spacing(layer, k, c1));
+                for &c2 in &names {
+                    t.prl_entry.push(db.cutspacingtablerule_get_prl_entry(layer, k, c1, c2));
+                    t.center_to_center.push(db.cutspacingtablerule_is_center_to_center(layer, k, c1, c2));
+                    t.center_and_edge.push(db.cutspacingtablerule_is_center_and_edge(layer, k, c1, c2));
+                    t.prl_aligned.push(db.cutspacingtablerule_is_prl_for_aligned_cut_classes(layer, k, c1, c2));
+                }
+            }
+            out = Some(t);
+        }
+        Ok(out)
+    }
+
     /// LEF58 corner spacing rule `k` of `layer`, as `io::Parser` translates it, or the first clause
     /// outside the modelled subset (CONVEXCORNER with its width table, CORNERONLY, CORNERTOCORNER;
     /// not CONCAVECORNER, SAMEMASK or EXCEPTEOL) — or an empty table, which the reference would
@@ -492,12 +605,14 @@ pub mod read {
                     // Only the plain flag makes the constraint; "except non-core pins" alone is
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;
                     let cut_spacing = Some(db.layer_get_spacing(&name)).filter(|&s| s > 0);
-                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, ..Layer::default() });
+                    let cut_classes = cut_classes(db, &name);
+                    let cut_table = cut_spacing_table(db, &name, &cut_classes).ok().flatten();
+                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, ..Layer::default() });
                 }
                 _ => {}
             }
