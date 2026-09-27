@@ -37,6 +37,7 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             let modelled = match family.as_str() {
                 "cut_spacing" => n <= 1,
                 "v55_influence" => true,
+                "lef58_eol_keepout" => true,
                 _ => false,
             };
             if !modelled {

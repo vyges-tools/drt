@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{EolRule, LayerKind, ParallelEdge, Tech};
+use crate::tech::{EolKeepOut, EolRule, LayerKind, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -79,6 +79,8 @@ pub enum Rule {
     /// A hole in one owner's polygon smaller than a MINENCLOSEDAREA rule
     /// (`checkMetalShape_minEnclosedArea`).
     MinEnclosedArea,
+    /// Other metal inside a LEF58 end-of-line keep-out box (`checkMetalEOLkeepout_main`).
+    Lef58EolKeepOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -255,6 +257,27 @@ fn polygon_segs(out: &mut Vec<Seg>, slices: &[Rect], fixed_edges: &BTreeSet<Edge
     }
 }
 
+/// Drop net `net`'s edges and renumber the survivors' `prev` / `next`. They are absolute indices
+/// into the list, so a plain `retain` left every edge after a removed one pointing at the wrong
+/// neighbours — and the end-of-line checks, which read them, judged the wrong corners on every
+/// net updated after an earlier one. A survivor's links stay within its own polygon, so they
+/// always survive too.
+fn retain_segs(segs: &mut Vec<Seg>, net: usize) {
+    let mut new_idx = vec![usize::MAX; segs.len()];
+    let mut n = 0;
+    for (k, e) in segs.iter().enumerate() {
+        if e.net != net {
+            new_idx[k] = n;
+            n += 1;
+        }
+    }
+    segs.retain(|e| e.net != net);
+    for e in segs.iter_mut() {
+        e.prev = new_idx[e.prev];
+        e.next = new_idx[e.next];
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct Net {
     owner: Option<Owner>,
@@ -358,6 +381,37 @@ fn gap(a: (i32, i32), b: (i32, i32)) -> i32 {
 }
 
 /// Per axis the overlap of the two rectangles, or, where they are apart, the gap between them.
+/// `gtl::intersects(a, b, false)`: both extents overlap with a length (touching does not count).
+fn strictly_intersects(a: &Rect, b: &Rect) -> bool {
+    a.xl < b.xh && b.xl < a.xh && a.yl < b.yh && b.yl < a.yh
+}
+
+/// `getEolKeepOutQueryBox`, by the line end's direction (polygon edges run counter-clockwise).
+fn eol_keepout_box(e: &Seg, ko: &EolKeepOut) -> Rect {
+    let (lo, hi) = (e.from, e.to);
+    let (f, b, s) = (ko.forward, ko.backward, ko.side);
+    match e.dir() {
+        EdgeDir::S => Rect { xl: hi.0 - f, yl: hi.1 - s, xh: lo.0 + b, yh: lo.1 + s },
+        EdgeDir::N => Rect { xl: lo.0 - b, yl: lo.1 - s, xh: hi.0 + f, yh: hi.1 + s },
+        EdgeDir::E => Rect { xl: lo.0 - s, yl: lo.1 - f, xh: hi.0 + s, yh: hi.1 + b },
+        EdgeDir::W => Rect { xl: hi.0 - s, yl: hi.1 - b, xh: lo.0 + s, yh: lo.1 + f },
+    }
+}
+
+/// `getEolKeepOutExceptWithinRects`: the two side windows `within_low..within_high` off the line
+/// end's two corners.
+fn eol_keepout_except_rects(e: &Seg, ko: &EolKeepOut) -> (Rect, Rect) {
+    let (lo, hi) = (e.from, e.to);
+    let (f, b, wl, wh) = (ko.forward, ko.backward, ko.within_low, ko.within_high);
+    let r = |xl: i32, yl: i32, xh: i32, yh: i32| Rect::new(xl.min(xh), yl.min(yh), xl.max(xh), yl.max(yh));
+    match e.dir() {
+        EdgeDir::S => (r(lo.0 - f, lo.1 + wl, lo.0 + b, lo.1 + wh), r(hi.0 - f, hi.1 - wh, hi.0 + b, hi.1 - wl)),
+        EdgeDir::N => (r(lo.0 - b, lo.1 - wh, lo.0 + f, lo.1 - wl), r(hi.0 - b, hi.1 + wl, hi.0 + f, hi.1 + wh)),
+        EdgeDir::E => (r(lo.0 - wh, lo.1 - f, lo.0 - wl, lo.1 + b), r(hi.0 + wl, hi.1 - f, hi.0 + wh, hi.1 + b)),
+        EdgeDir::W => (r(lo.0 + wl, lo.1 - b, lo.0 + wh, lo.1 + f), r(hi.0 - wh, hi.1 - b, hi.0 - wl, hi.1 + f)),
+    }
+}
+
 fn generalized_intersect(a: &Rect, b: &Rect) -> Rect {
     let axis = |al: i32, ah: i32, bl: i32, bh: i32| {
         let (lo, hi) = (al.max(bl), ah.min(bh));
@@ -659,7 +713,7 @@ impl<'a> Worker<'a> {
                 }
             }
             self.edges[layer].retain(|e| e.net != i);
-            self.segs[layer].retain(|e| e.net != i);
+            retain_segs(&mut self.segs[layer], i);
             for k in 0..self.spc[layer].len() {
                 if self.spc_listed[layer][k] && self.spc[layer][k].net == i {
                     self.spc_rq[layer].remove_eq(&self.spc[layer][k].rect);
@@ -885,11 +939,12 @@ impl<'a> Worker<'a> {
     fn check_metal_end_of_line(&mut self) {
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            if l.kind != LayerKind::Routing || l.eol.is_empty() {
+            if l.kind != LayerKind::Routing || (l.eol.is_empty() && l.eol_keepout.is_empty()) {
                 continue;
             }
             let vertical = l.is_vertical();
             let rules = l.eol.clone();
+            let keepouts = l.eol_keepout.clone();
             for net in 0..self.nets.len() {
                 if !self.checks_from(net) {
                     continue;
@@ -908,8 +963,13 @@ impl<'a> Worker<'a> {
                             continue;
                         }
                     }
+                    // checkMetalEndOfLine_main: the EOL rules, then (LEF58 EOL spacing, not modelled)
+                    // the keep-out rules, per edge.
                     for r in &rules {
                         self.check_eol(layer, k, r);
+                    }
+                    for ko in &keepouts {
+                        self.check_eol_keepout(layer, k, ko);
                     }
                 }
             }
@@ -1055,6 +1115,69 @@ impl<'a> Worker<'a> {
             return;
         }
         self.eol_has_eol_helper(layer, &e, &ptr);
+    }
+
+    // ---- LEF58 end-of-line keep-out ----
+
+    /// `checkMetalEOLkeepout_main`: a line end (shorter than the rule's width, convex at both
+    /// ends) keeps other pins' metal out of its keep-out box — `forward` beyond the end, `backward`
+    /// behind it, `side` past each side. CORNER ONLY asks the box for polygon EDGES (so concave
+    /// corners are caught), each tried as a rectangle; otherwise the maximal rectangles.
+    fn check_eol_keepout(&mut self, layer: usize, k: usize, ko: &EolKeepOut) {
+        let e = self.segs[layer][k];
+        if e.len() >= ko.width || !(orientation(&self.segs[layer][e.prev], &e) == 1 && orientation(&e, &self.segs[layer][e.next]) == 1) {
+            return;
+        }
+        let q = eol_keepout_box(&e, ko);
+        if ko.corner_only {
+            for i in self.query_segs(layer, &q) {
+                let s = self.segs[layer][i];
+                let r = Rect::new(s.from.0.min(s.to.0), s.from.1.min(s.to.1), s.from.0.max(s.to.0), s.from.1.max(s.to.1));
+                self.eol_keepout_helper(layer, &e, (r, s.net, s.pin, s.fixed), &q, ko);
+            }
+        } else {
+            // `queryMaxRectangle`: every pin's maximal rectangles on the layer — `shapes`, not the
+            // tapered-spacing list `spc` (which is empty without a non-default rule). ⚠️ asap7's
+            // keep-out rules are all CORNER ONLY, so the corpus never reaches this branch; the unit
+            // test does.
+            let found: Vec<Shape> = self.query(layer, &q).into_iter().map(|k| self.shapes[layer][k]).collect();
+            for sh in found {
+                self.eol_keepout_helper(layer, &e, (sh.rect, sh.net, sh.pin as usize, sh.fixed), &q, ko);
+            }
+        }
+    }
+
+    /// `checkMetalEOLkeepout_helper`: `(rect, net, pin, fixed)` against the edge's keep-out box `q`.
+    /// Not its own pin, not both fixed, overlapping the box with an area (not merely touching). A
+    /// corner-only rule reduces the rectangle to its corner(s) strictly inside the box (none: no
+    /// violation); except-within excuses a rectangle meeting either side window. The marker is the
+    /// line end generalized-intersected with the box's part of the rectangle.
+    fn eol_keepout_helper(&mut self, layer: usize, e: &Seg, (mut r, net, pin, fixed): (Rect, usize, usize, bool), q: &Rect, ko: &EolKeepOut) {
+        if (net, pin) == (e.net, e.pin) || (e.fixed && fixed) || !strictly_intersects(q, &r) {
+            return;
+        }
+        if ko.corner_only {
+            let inside = |x: i32, y: i32| q.xl < x && x < q.xh && q.yl < y && y < q.yh;
+            if inside(r.xl, r.yl) {
+                if !inside(r.xh, r.yh) {
+                    r = Rect::new(r.xl, r.yl, r.xl, r.yl);
+                }
+            } else if inside(r.xh, r.yh) {
+                r = Rect::new(r.xh, r.yh, r.xh, r.yh);
+            } else {
+                return;
+            }
+        }
+        if ko.except_within {
+            let (w1, w2) = eol_keepout_except_rects(e, ko);
+            if strictly_intersects(&w1, &r) || strictly_intersects(&w2, &r) {
+                return;
+            }
+        }
+        let end = Rect::new(e.from.0.min(e.to.0), e.from.1.min(e.to.1), e.from.0.max(e.to.0), e.from.1.max(e.to.1));
+        let part = Rect::new(q.xl.max(r.xl), q.yl.max(r.yl), q.xh.min(r.xh), q.yh.min(r.yh));
+        let marker = generalized_intersect(&end, &part);
+        self.add_marker_of(Rule::Lef58EolKeepOut, layer, marker, (e.net, end, e.fixed), (net, part, fixed));
     }
 
     /// The marker between the two edges — unless a shape already fills it.
@@ -1500,6 +1623,23 @@ fn subtract(r: &Rect, minus: &[Rect]) -> Vec<Rect> {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    // Rule: removing a net's polygon edges must renumber the survivors' prev / next — they are
+    // indices into the same list, and the end-of-line checks walk them to judge a corner.
+    #[test]
+    fn removing_a_nets_edges_keeps_the_others_linked() {
+        let mut segs = Vec::new();
+        polygon_segs(&mut segs, &[Rect::new(0, 0, 100, 100)], &BTreeSet::new(), 0);
+        polygon_segs(&mut segs, &[Rect::new(200, 0, 300, 100), Rect::new(200, 100, 250, 200)], &BTreeSet::new(), 1);
+        let before: Vec<_> = segs.iter().filter(|e| e.net == 1).map(|e| (e.from, segs[e.prev].from, segs[e.next].from)).collect();
+        retain_segs(&mut segs, 0);
+        assert!(segs.iter().all(|e| e.net == 1 && e.prev < segs.len() && e.next < segs.len()));
+        for (k, e) in segs.iter().enumerate() {
+            assert_eq!((segs[e.next].prev, segs[e.prev].next), (k, k), "links stay mutual");
+        }
+        let after: Vec<_> = segs.iter().map(|e| (e.from, segs[e.prev].from, segs[e.next].from)).collect();
+        assert_eq!(before, after, "each survivor keeps the SAME neighbours");
+    }
     use super::*;
 
     fn marker_at(yl: i32, yh: i32, xh: i32) -> Marker {
@@ -1528,9 +1668,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], eol_keepout: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], eol_keepout: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -1926,6 +2066,45 @@ mod eol_tests {
         }
         w.init();
         w.run().iter().filter(|m| m.rule == Rule::EolSpacing).map(|m| m.bbox).collect()
+    }
+
+    /// A layer-4 technology with one LEF58 end-of-line keep-out rule.
+    fn keepout(ko: EolKeepOut, shapes: &[(&str, Rect, bool)]) -> Vec<Rect> {
+        let mut t = tests::tech();
+        t.layers[4].eol_keepout = vec![ko];
+        let mut w = Worker::new(&t);
+        for (o, r, f) in shapes {
+            w.add(&net(o), 4, *r, *f);
+        }
+        w.init();
+        w.run().iter().filter(|m| m.rule == Rule::Lef58EolKeepOut).map(|m| m.bbox).collect()
+    }
+
+    // Rule (`checkMetalEOLkeepout_main` / `_helper`): WIRE's east end (length 140 < width 200) keeps
+    // other metal out of 950..1100 x -20..160 (backward 50, forward 100, side 20). The marker is the
+    // line end generalized-intersected with the box's part of the metal; except-within excuses metal
+    // meeting a side window; corner-only reduces the metal to its corner strictly inside the box.
+    #[test]
+    fn a_line_end_keeps_other_metal_out_of_its_keep_out_box() {
+        let ko = EolKeepOut { width: 200, backward: 50, forward: 100, side: 20, ..Default::default() };
+        let inside = Rect::new(1050, 50, 1200, 100);
+        assert_eq!(keepout(ko, &[("a", WIRE, false), ("b", inside, false)]), vec![Rect::new(1000, 50, 1050, 100)]);
+        assert!(keepout(ko, &[("a", WIRE, false), ("b", Rect::new(1150, 50, 1200, 100), false)]).is_empty(), "outside the box");
+        assert!(keepout(ko, &[("a", WIRE, true), ("b", inside, true)]).is_empty(), "both fixed");
+        // A rule width of 140 makes WIRE's end (140 long) no end; the other metal is made with sides
+        // of 200 and more, so it has no line end of its own either.
+        let tall = Rect::new(1050, 50, 1250, 300);
+        assert!(!keepout(ko, &[("a", WIRE, false), ("b", tall, false)]).is_empty());
+        assert!(keepout(EolKeepOut { width: 140, ..ko }, &[("a", WIRE, false), ("b", tall, false)]).is_empty(), "an end as wide as the rule is no end");
+        // Except-within 0..60: the window above the end is 950..1100 x 140..200; metal meeting it is
+        // excused, metal not meeting it is not.
+        let near_top = Rect::new(1050, 120, 1080, 150);
+        let ew = EolKeepOut { except_within: true, within_low: 0, within_high: 60, ..ko };
+        assert!(keepout(ew, &[("a", WIRE, false), ("b", near_top, false)]).is_empty());
+        assert!(!keepout(ko, &[("a", WIRE, false), ("b", near_top, false)]).is_empty());
+        // Corner-only: only the metal's lower-left corner (1080, 100) is strictly inside the box.
+        let co = EolKeepOut { corner_only: true, ..ko };
+        assert_eq!(keepout(co, &[("a", WIRE, false), ("b", Rect::new(1080, 100, 1300, 300), false)]), vec![Rect::new(1000, 100, 1080, 100)]);
     }
 
     const WIRE: Rect = Rect { xl: 0, yl: 0, xh: 1000, yh: 140 };

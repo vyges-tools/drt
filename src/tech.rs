@@ -48,6 +48,8 @@ pub struct Layer {
     pub cut_spacing: Option<i32>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
+    /// A routing layer's LEF58 end-of-line KEEP-OUT rules, in the technology's order.
+    pub eol_keepout: Vec<EolKeepOut>,
     /// A routing layer's own minimum AREA (square database units; 0 without one).
     pub min_area: i64,
     /// MINENCLOSEDAREA rules without a width (`frMinEnclosedAreaConstraint`): each rule's area,
@@ -67,6 +69,23 @@ pub struct EolRule {
     pub width: i32,
     pub within: i32,
     pub parallel: Option<ParallelEdge>,
+}
+
+/// A LEF58 end-of-line keep-out rule (`frLef58EolKeepOutConstraint`, as `io::Parser` reads it —
+/// the class name is not read): a line end narrower than `width` keeps other metal out of a box
+/// `forward` beyond it, `backward` behind it and `side` past each side; `corner_only` looks only
+/// for other polygons' corners there; `except_within` excuses metal in the side windows
+/// `within_low..within_high` from the line end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EolKeepOut {
+    pub width: i32,
+    pub backward: i32,
+    pub forward: i32,
+    pub side: i32,
+    pub corner_only: bool,
+    pub except_within: bool,
+    pub within_low: i32,
+    pub within_high: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,13 +354,25 @@ pub mod read {
                         .into_iter()
                         .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }) })
                         .collect();
+                    let eol_keepout: Vec<EolKeepOut> = (0..db.num_layer_get_tech_layer_eol_keep_out_rules(&name))
+                        .map(|k| EolKeepOut {
+                            width: db.eolkeepoutrule_get_eol_width(&name, k),
+                            backward: db.eolkeepoutrule_get_backward_ext(&name, k),
+                            forward: db.eolkeepoutrule_get_forward_ext(&name, k),
+                            side: db.eolkeepoutrule_get_side_ext(&name, k),
+                            corner_only: db.eolkeepoutrule_is_corner_only(&name, k),
+                            except_within: db.eolkeepoutrule_is_except_within(&name, k),
+                            within_low: db.eolkeepoutrule_get_within_low(&name, k),
+                            within_high: db.eolkeepoutrule_get_within_high(&name, k),
+                        })
+                        .collect();
                     let min_area = db.layer_get_area(&name).unwrap_or(0);
                     // ⚠️ `frCoord minEnclosedArea = _minEnclosedArea`: an int64 narrowed to int.
                     let min_enclosed_areas: Vec<i32> = db.layer_min_enclosed_areas(&name).into_iter().map(|a| a as i32).collect();
                     // Only the plain flag makes the constraint; "except non-core pins" alone is
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, min_area, min_enclosed_areas, rect_only });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, eol_keepout, min_area, min_enclosed_areas, rect_only });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;
