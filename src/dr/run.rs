@@ -40,6 +40,11 @@ type NetGuides = (Vec<(usize, P, P)>, Vec<(String, P)>);
 pub struct Options {
     /// The via-access layer (default: the second routing layer).
     pub via_access_layer: Option<usize>,
+    /// ⛔ MEASUREMENT ONLY — route past the rule census, ignoring the families it would refuse.
+    /// The correlation harness sets it to make layouts that break those rules, so the design-rule
+    /// check can be scored against the reference's on them. The CLI never sets it: a user's run
+    /// must refuse a rule it does not model, never route as if it were absent.
+    pub unchecked_rules: bool,
 }
 
 /// What routing did.
@@ -95,7 +100,7 @@ pub struct DesignIn {
 /// The reader, then pin access.
 pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
     let unmodelled = crate::dr::db::unmodelled_rules(db, tech);
-    if !unmodelled.is_empty() {
+    if !unmodelled.is_empty() && !opts.unchecked_rules {
         return Err(format!("rule families not modelled: {}", unmodelled.join("; ")));
     }
     let tracks = read::tracks(db, tech).map_err(|e| e.to_string())?;
