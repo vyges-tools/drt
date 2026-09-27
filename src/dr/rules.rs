@@ -374,21 +374,33 @@ impl Ctx<'_> {
 
     // ---- end of line ----
 
-    /// The narrowest end-of-line width less one, not below `min_width`; none, `min_width`.
+    /// `getMinEol`: the narrowest end-of-line width — over the EOL, LEF58 EOL spacing and LEF58
+    /// keep-out rules — less one, not below `min_width`; none, `min_width`.
     fn min_eol(&self, l: usize, min_width: i32) -> i32 {
-        match self.tech.layers[l].eol.iter().map(|e| e.width).min() {
+        let t = &self.tech.layers[l];
+        match t.eol.iter().chain(&t.lef58_eol).map(|e| e.width).chain(t.eol_keepout.iter().map(|k| k.width)).min() {
             None => min_width,
             Some(e) => (e - 1).max(min_width),
         }
     }
 
+    /// `prep_eolForbiddenLen_helper`, over every rule wider than the table's width: EOL (space,
+    /// within), LEF58 EOL spacing (space, within, and its END-TO-END space into the space), then
+    /// LEF58 keep-out (FORWARD extension into the space, SIDE extension into the within).
     fn eol_table(&self, l: usize, min_width: i32) -> EolTable {
         let width = self.min_eol(l, min_width);
+        let t = &self.tech.layers[l];
         let (mut space, mut within) = (0, 0);
-        for e in &self.tech.layers[l].eol {
+        for e in t.eol.iter().chain(&t.lef58_eol) {
             if width < e.width {
-                space = space.max(e.space);
+                space = space.max(e.space).max(e.end_to_end.unwrap_or(0));
                 within = within.max(e.within);
+            }
+        }
+        for k in &t.eol_keepout {
+            if width < k.width {
+                space = space.max(k.forward);
+                within = within.max(k.side);
             }
         }
         EolTable { width, space, within }
@@ -440,7 +452,7 @@ pub fn rule_tables(tech: &Tech, defaults: &[Option<usize>], ndrs: &[NdrRule], cf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tech::{EolRule, Layer};
+    use crate::tech::{EolKeepOut, EolRule, Layer};
 
     fn r(xl: i32, yl: i32, xh: i32, yh: i32) -> Rect {
         Rect { xl, yl, xh, yh }
@@ -511,7 +523,7 @@ mod tests {
     #[test]
     fn the_eol_rule_is_the_narrowest_less_one() {
         let mut t = tech(vec![]);
-        t.layers[2].eol = vec![EolRule { space: 60, width: 140, within: 20, parallel: None }, EolRule { space: 90, width: 180, within: 10, parallel: None }];
+        t.layers[2].eol = vec![EolRule { space: 60, width: 140, within: 20, parallel: None, end_to_end: None }, EolRule { space: 90, width: 180, within: 10, parallel: None, end_to_end: None }];
         let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
         assert_eq!(c.eol_table(2, 100), EolTable { width: 139, space: 90, within: 20 });
         assert_eq!(c.eol_table(2, 150), EolTable { width: 150, space: 90, within: 10 });
@@ -520,6 +532,21 @@ mod tests {
         t.layers[2].eol.clear();
         let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
         assert_eq!(c.eol_table(2, 100), EolTable { width: 100, space: 0, within: 0 });
+    }
+
+    // `getMinEol` / `prep_eolForbiddenLen_helper` read the LEF58 rules too: a LEF58 EOL rule's
+    // end-to-end space counts as its space, and a keep-out's forward and side extensions as space
+    // and within (asap7 M2: SPACING 18 ENDOFLINE 25 WITHIN 20 ENDTOEND 31, keep-out 25 / 0 12.5 31).
+    #[test]
+    fn the_eol_table_reads_the_lef58_eol_and_keep_out_rules() {
+        let mut t = tech(vec![]);
+        t.layers[2].lef58_eol = vec![EolRule { space: 72, width: 100, within: 80, parallel: None, end_to_end: Some(124) }];
+        t.layers[2].eol_keepout = vec![EolKeepOut { width: 90, backward: 0, forward: 50, side: 124, corner_only: true, ..Default::default() }];
+        let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
+        // Narrowest 90 less one; both rules wider: space max(72, 124, 50), within max(80, 124).
+        assert_eq!(c.eol_table(2, 40), EolTable { width: 89, space: 124, within: 124 });
+        // 95 is not below the keep-out's 90: the LEF58 EOL rule alone.
+        assert_eq!(c.eol_table(2, 95), EolTable { width: 95, space: 124, within: 80 });
     }
 
     // A via-turn range only for a via wider than the wire across the turn (or under a

@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{EolKeepOut, EolRule, LayerKind, ParallelEdge, Tech};
+use crate::tech::{CornerSpacing, EolKeepOut, EolRule, LayerKind, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,6 +81,12 @@ pub enum Rule {
     MinEnclosedArea,
     /// Other metal inside a LEF58 end-of-line keep-out box (`checkMetalEOLkeepout_main`).
     Lef58EolKeepOut,
+    /// A line end closer than a LEF58 end-of-line spacing rule allows (`checkMetalEndOfLine_eol`
+    /// with an `frLef58SpacingEndOfLineConstraint`).
+    Lef58SpacingEndOfLine,
+    /// A convex corner closer to another owner's corner than a LEF58 corner spacing rule allows
+    /// (`checkMetalCornerSpacing`).
+    CornerSpacing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -322,6 +328,8 @@ pub struct Worker<'a> {
     pub check_ndrs: bool,
     /// Skip the minimum-area check (`setIgnoreMinArea`): pin access sets it for its trials.
     pub ignore_min_area: bool,
+    /// Skip the corner spacing check (`setIgnoreCornerSpacing`): pin access sets it too.
+    pub ignore_corner_spacing: bool,
     /// The worker's check box (`drcBox_`): a minimum-area marker needs its polygon WHOLLY inside.
     /// Unset: the whole design (the check between iterations).
     pub drc_box: Option<Rect>,
@@ -420,6 +428,54 @@ fn generalized_intersect(a: &Rect, b: &Rect) -> Rect {
     let (xl, xh) = axis(a.xl, a.xh, b.xl, b.xh);
     let (yl, yh) = axis(a.yl, a.yh, b.yl, b.yh);
     Rect { xl, yl, xh, yh }
+}
+
+/// A polygon corner (`gcCorner`): the vertex before an edge.
+#[derive(Debug, Clone, Copy)]
+struct Corner {
+    x: i32,
+    y: i32,
+    convex: bool,
+    dir: CornerDir,
+    net: usize,
+    fixed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CornerDir {
+    NE,
+    SE,
+    SW,
+    NW,
+}
+
+/// `isCornerOverlap`: the corner is the rectangle's own corner on the corner's side.
+fn corner_overlaps(c: &Corner, r: &Rect) -> bool {
+    match c.dir {
+        CornerDir::NE => (c.x, c.y) == (r.xh, r.yh),
+        CornerDir::SE => (c.x, c.y) == (r.xh, r.yl),
+        CornerDir::SW => (c.x, c.y) == (r.xl, r.yl),
+        CornerDir::NW => (c.x, c.y) == (r.xl, r.yh),
+    }
+}
+
+/// `isPolygonCorner`: `p` is a vertex of the region the disjoint `slices` cover — its four unit
+/// quadrants neither all alike nor split into two halves side by side.
+fn is_polygon_vertex(slices: &[Rect], (x, y): (i32, i32)) -> bool {
+    let has = |xl: bool, yl: bool| {
+        slices.iter().any(|s| {
+            let in_x = if xl { s.xl < x && x <= s.xh } else { s.xl <= x && x < s.xh };
+            let in_y = if yl { s.yl < y && y <= s.yh } else { s.yl <= y && y < s.yh };
+            in_x && in_y
+        })
+    };
+    let (sw, se, nw, ne) = (has(true, true), has(false, true), has(true, false), has(false, false));
+    let n = [sw, se, nw, ne].iter().filter(|&&b| b).count();
+    match n {
+        1 | 3 => true,
+        2 => sw == ne,
+        _ => false,
+    }
 }
 
 /// A one-unit strip just inside an edge, along its length.
@@ -528,7 +584,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, drc_box: None, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, ignore_corner_spacing: false, drc_box: None, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -754,6 +810,7 @@ impl<'a> Worker<'a> {
     pub fn run(&mut self) -> &[Marker] {
         self.markers.clear();
         self.seen.clear();
+        self.check_metal_corner_spacing();
         self.check_metal_spacing();
         self.check_metal_shape();
         self.check_metal_end_of_line();
@@ -939,11 +996,12 @@ impl<'a> Worker<'a> {
     fn check_metal_end_of_line(&mut self) {
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            if l.kind != LayerKind::Routing || (l.eol.is_empty() && l.eol_keepout.is_empty()) {
+            if l.kind != LayerKind::Routing || (l.eol.is_empty() && l.lef58_eol.is_empty() && l.eol_keepout.is_empty()) {
                 continue;
             }
             let vertical = l.is_vertical();
             let rules = l.eol.clone();
+            let lef58 = l.lef58_eol.clone();
             let keepouts = l.eol_keepout.clone();
             for net in 0..self.nets.len() {
                 if !self.checks_from(net) {
@@ -963,10 +1021,13 @@ impl<'a> Worker<'a> {
                             continue;
                         }
                     }
-                    // checkMetalEndOfLine_main: the EOL rules, then (LEF58 EOL spacing, not modelled)
-                    // the keep-out rules, per edge.
+                    // checkMetalEndOfLine_main: the EOL rules, the LEF58 EOL spacing rules, then the
+                    // keep-out rules, per edge.
                     for r in &rules {
-                        self.check_eol(layer, k, r);
+                        self.check_eol(layer, k, r, Rule::EolSpacing);
+                    }
+                    for r in &lef58 {
+                        self.check_eol(layer, k, r, Rule::Lef58SpacingEndOfLine);
                     }
                     for ko in &keepouts {
                         self.check_eol_keepout(layer, k, ko);
@@ -976,12 +1037,14 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn check_eol(&mut self, layer: usize, k: usize, r: &EolRule) {
+    /// `checkMetalEndOfLine_eol`; `rule` is the marker's (`EolSpacing` or `Lef58SpacingEndOfLine`,
+    /// which also gates each pair on `endToEndHelper`).
+    fn check_eol(&mut self, layer: usize, k: usize, r: &EolRule, rule: Rule) {
         if !self.is_eol_edge(layer, k, r) {
             return;
         }
         if let Some(has_route) = self.qualifies_as_eol(layer, k, r) {
-            self.eol_has_eol(layer, k, r, has_route);
+            self.eol_has_eol(layer, k, r, has_route, rule);
         }
     }
 
@@ -1070,9 +1133,10 @@ impl<'a> Worker<'a> {
         sol
     }
 
-    /// The window beyond a line end: `space` out, `within` past each side.
+    /// The window beyond a line end: `space` out (at least the END-TO-END space), `within` past
+    /// each side.
     fn eol_query_rect(e: &Seg, r: &EolRule) -> Rect {
-        let (w, sp) = (r.within, r.space);
+        let (w, sp) = (r.within, r.space.max(r.end_to_end.unwrap_or(0)));
         let (lo, hi) = (e.from, e.to);
         match e.dir() {
             EdgeDir::E => Rect { xl: lo.0 - w, yl: lo.1 - sp, xh: hi.0 + w, yh: hi.1 },
@@ -1082,15 +1146,15 @@ impl<'a> Worker<'a> {
         }
     }
 
-    fn eol_has_eol(&mut self, layer: usize, k: usize, r: &EolRule, has_route: bool) {
+    fn eol_has_eol(&mut self, layer: usize, k: usize, r: &EolRule, has_route: bool, rule: Rule) {
         let e = self.segs[layer][k];
         let q = Self::eol_query_rect(&e, r);
         for i in self.query_segs(layer, &q) {
-            self.eol_has_eol_check(layer, k, i, &q, has_route);
+            self.eol_has_eol_check(layer, (k, i), &q, has_route, (r, rule));
         }
     }
 
-    fn eol_has_eol_check(&mut self, layer: usize, k: usize, i: usize, q: &Rect, mut has_route: bool) {
+    fn eol_has_eol_check(&mut self, layer: usize, (k, i): (usize, usize), q: &Rect, mut has_route: bool, (r, rule): (&EolRule, Rule)) {
         let (e, ptr) = (self.segs[layer][k], self.segs[layer][i]);
         if (ptr.net, ptr.pin) == (e.net, e.pin) {
             return;
@@ -1114,7 +1178,42 @@ impl<'a> Worker<'a> {
         if !has_route {
             return;
         }
-        self.eol_has_eol_helper(layer, &e, &ptr);
+        if rule == Rule::Lef58SpacingEndOfLine && !self.eol_end_to_end(layer, (k, i), r) {
+            return;
+        }
+        self.eol_has_eol_helper(layer, &e, &ptr, rule);
+    }
+
+    /// `checkMetalEndOfLine_eol_hasEol_endToEndHelper` (LEF58 rules only): the two edges as
+    /// rectangles; a facing line end takes the END-TO-END space, anything else the rule's space with
+    /// the line end widened by `within` along itself. A violation needs a run (positive projection
+    /// on the axis where they overlap) and the larger axis gap below that space; touching (no gap
+    /// on either axis) is a short, handled elsewhere.
+    fn eol_end_to_end(&self, layer: usize, (k, i): (usize, usize), r: &EolRule) -> bool {
+        let (e1, e2) = (self.segs[layer][k], self.segs[layer][i]);
+        let rect = |s: &Seg| Rect::new(s.from.0.min(s.to.0), s.from.1.min(s.to.1), s.from.0.max(s.to.0), s.from.1.max(s.to.1));
+        let (mut r1, r2) = (rect(&e1), rect(&e2));
+        let space = match r.end_to_end {
+            Some(ete) if self.is_eol_edge(layer, i, r) => ete,
+            _ => {
+                if e1.from.1 == e1.to.1 {
+                    r1.xl -= r.within;
+                    r1.xh += r.within;
+                } else {
+                    r1.yl -= r.within;
+                    r1.yh += r.within;
+                }
+                r.space
+            }
+        };
+        let m = generalized_intersect(&r1, &r2);
+        let (dist_x, dist_y) = ((r2.xl - r1.xh).max(r1.xl - r2.xh).max(0), (r2.yl - r1.yh).max(r1.yl - r2.yh).max(0));
+        if dist_x == 0 && dist_y == 0 {
+            return false;
+        }
+        let prl_x = if dist_x != 0 { -(m.xh - m.xl) } else { m.xh - m.xl };
+        let prl_y = if dist_y != 0 { -(m.yh - m.yl) } else { m.yh - m.yl };
+        prl_x.max(prl_y) > 0 && dist_x.max(dist_y) < space
     }
 
     // ---- LEF58 end-of-line keep-out ----
@@ -1181,7 +1280,7 @@ impl<'a> Worker<'a> {
     }
 
     /// The marker between the two edges — unless a shape already fills it.
-    fn eol_has_eol_helper(&mut self, layer: usize, e1: &Seg, e2: &Seg) {
+    fn eol_has_eol_helper(&mut self, layer: usize, e1: &Seg, e2: &Seg, rule: Rule) {
         let marker = generalized_intersect(&parallel_edge_rect(e1), &parallel_edge_rect(e2));
         let mut probe = marker;
         if area(&marker) == 0 {
@@ -1199,7 +1298,169 @@ impl<'a> Worker<'a> {
         if self.query(layer, &probe).iter().any(|&s| overlap(&probe, &self.shapes[layer][s].rect).is_some()) {
             return;
         }
-        self.add_marker(Rule::EolSpacing, layer, marker, e1.net, e2.net);
+        self.add_marker(rule, layer, marker, e1.net, e2.net);
+    }
+
+    // ---- LEF58 corner spacing ----
+
+    /// `checkMetalCornerSpacing`: per routing layer with corner spacing rules, per owner, per
+    /// polygon corner (the corner BEFORE each edge, in ring order): the maximal rectangles in the
+    /// box reaching the rules' largest (last-row) spacing out from the corner, each against each
+    /// rule.
+    fn check_metal_corner_spacing(&mut self) {
+        if self.ignore_corner_spacing {
+            return;
+        }
+        for layer in 0..self.tech.layers.len() {
+            let l = &self.tech.layers[layer];
+            if l.kind != LayerKind::Routing || l.corner_spacing.is_empty() {
+                continue;
+            }
+            let rules = l.corner_spacing.clone();
+            let (mx, my) = rules.iter().fold((0, 0), |(x, y), r| (x.max(r.find_max().0), y.max(r.find_max().1)));
+            for net in 0..self.nets.len() {
+                if !self.checks_from(net) {
+                    continue;
+                }
+                for k in 0..self.segs[layer].len() {
+                    if self.segs[layer][k].net != net {
+                        continue;
+                    }
+                    let Some(c) = self.corner(layer, k) else { continue };
+                    let (x, y) = (c.x, c.y);
+                    let q = match c.dir {
+                        CornerDir::NE => Rect::new(x, y, x + mx, y + my),
+                        CornerDir::SE => Rect::new(x, y - my, x + mx, y),
+                        CornerDir::SW => Rect::new(x - mx, y - my, x, y),
+                        CornerDir::NW => Rect::new(x - mx, y, x, y + my),
+                    };
+                    for s in self.query(layer, &q) {
+                        for r in &rules {
+                            self.corner_spacing_helper(layer, &c, s, r);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The corner before edge `k` (`initNet_pins_polygonCorners_helper`): its type from the turn,
+    /// its direction from the two edges, fixed when it is a vertex of the owner's FIXED shapes.
+    /// `None` for a straight joint (no type or direction).
+    fn corner(&self, layer: usize, k: usize) -> Option<Corner> {
+        let next = self.segs[layer][k];
+        let prev = self.segs[layer][next.prev];
+        let convex = match orientation(&prev, &next) {
+            1 => true,
+            -1 => false,
+            _ => return None,
+        };
+        use EdgeDir::*;
+        let dir = match (prev.dir(), next.dir()) {
+            (N, W) | (W, N) => CornerDir::NE,
+            (W, S) | (S, W) => CornerDir::NW,
+            (S, E) | (E, S) => CornerDir::SW,
+            (E, N) | (N, E) => CornerDir::SE,
+            _ => return None,
+        };
+        let (x, y) = next.from;
+        Some(Corner { x, y, convex, dir, net: next.net, fixed: is_polygon_vertex(&self.nets[next.net].fixed_slices[layer], (x, y)) })
+    }
+
+    /// `checkMetalCornerSpacing_main(corner, rect, con)` for the asap7 subset (convex rules, no
+    /// EXCEPTEOL): only a real corner-to-corner case — the rectangle wholly off one diagonal of the
+    /// corner, facing it, with a polygon corner of ITS owner at the facing corner. Then the corner's
+    /// own maximal rectangles (those with it as their corner) set the required spacing by their
+    /// width; closer than that (larger axis gap, or Euclidean with CORNERTOCORNER), not both
+    /// rectangles fixed, and one side's width box not all fixed metal: one marker, and done.
+    fn corner_spacing_helper(&mut self, layer: usize, c: &Corner, s: usize, r: &CornerSpacing) {
+        if !c.convex {
+            return;
+        }
+        let rect = self.shapes[layer][s];
+        let rr = rect.rect;
+        let (x, y) = (c.x, c.y);
+        if rr.contains(x, y) {
+            return;
+        }
+        let (cand_x, cand_y);
+        if x >= rr.xh {
+            cand_x = rr.xh;
+            if y >= rr.yh {
+                cand_y = rr.yh;
+                if c.dir != CornerDir::SW {
+                    return;
+                }
+            } else if y <= rr.yl {
+                cand_y = rr.yl;
+                if c.dir != CornerDir::NW {
+                    return;
+                }
+            } else {
+                return;
+            }
+        } else if x <= rr.xl {
+            cand_x = rr.xl;
+            if y >= rr.yh {
+                cand_y = rr.yh;
+                if c.dir != CornerDir::SE {
+                    return;
+                }
+            } else if y <= rr.yl {
+                cand_y = rr.yl;
+                if c.dir != CornerDir::NE {
+                    return;
+                }
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+        // `hasPolyCornerAt`: any corner of the rectangle owner's polygons on the layer.
+        if !self.segs[layer].iter().any(|e| e.net == rect.net && e.from == (cand_x, cand_y)) {
+            return;
+        }
+        let pt = Rect::new(x, y, x, y);
+        for o in self.query(layer, &pt) {
+            let obj = self.shapes[layer][o];
+            if obj.net != c.net || !corner_overlaps(c, &obj.rect) {
+                continue;
+            }
+            let marker = generalized_intersect(&pt, &rr);
+            let max_xy = marker.dx().max(marker.dy());
+            if !r.same_xy {
+                continue;
+            }
+            let req = r.find(obj.rect.dx().min(obj.rect.dy())).0;
+            if r.corner_to_corner {
+                let (dx, dy) = (i64::from((rr.xl - x).max(x - rr.xh).max(0)), i64::from((rr.yl - y).max(y - rr.yh).max(0)));
+                if dx * dx + dy * dy >= i64::from(req) * i64::from(req) {
+                    continue;
+                }
+            } else if max_xy >= req {
+                continue;
+            }
+            if rect.fixed && obj.fixed {
+                continue;
+            }
+            // "No violation if width is not contributed by route obj": the marker bloated by a
+            // rectangle's width, cut to that rectangle, must not be all its owner's fixed metal —
+            // the corner's rectangle first, then the other.
+            let routed = |w: &Worker, sh: &Shape| {
+                let wd = sh.rect.dx().min(sh.rect.dy());
+                let big = Rect::new(marker.xl - wd, marker.yl - wd, marker.xh + wd, marker.yh + wd);
+                match overlap(&big, &sh.rect) {
+                    Some(t) => area_in(&w.nets[sh.net].fixed_slices[layer], &t) < area(&t),
+                    None => false,
+                }
+            };
+            if !routed(self, &obj) && !routed(self, &rect) {
+                continue;
+            }
+            self.add_marker_of(Rule::CornerSpacing, layer, marker, (c.net, pt, c.fixed), (rect.net, rr, rect.fixed));
+            return;
+        }
     }
 
     // ---- metal spacing ----
@@ -1668,9 +1929,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], eol_keepout: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], eol_keepout: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -2036,6 +2297,61 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
+mod corner_tests {
+    //! LEF58 corner spacing on constructed geometry: layer 4 of `tests::tech()`, net `a`'s square
+    //! (0, 0)–(100, 100) and a square of net `b` off its north-east corner.
+    use super::*;
+
+    fn rule(widths: Vec<i32>, spacings: Vec<i32>) -> CornerSpacing {
+        CornerSpacing { widths, spacings: spacings.iter().map(|&v| (v, v)).collect(), same_xy: true, corner_to_corner: false }
+    }
+
+    fn corners(r: CornerSpacing, b: Rect, pa: bool) -> Vec<Rect> {
+        let mut t = tests::tech();
+        t.layers[4].corner_spacing = vec![r];
+        let mut w = Worker::new(&t);
+        w.ignore_corner_spacing = pa;
+        w.add(&Owner::Net("a".into()), 4, Rect::new(0, 0, 100, 100), false);
+        w.add(&Owner::Net("b".into()), 4, b, false);
+        w.init();
+        let mut v: Vec<Rect> = w.run().iter().filter(|m| m.rule == Rule::CornerSpacing).map(|m| m.bbox).collect();
+        v.dedup();
+        v
+    }
+
+    // Rule (`checkMetalCornerSpacing_main`): a convex corner facing another owner's corner
+    // diagonally, closer (larger axis gap) than the spacing its own rectangle's width selects; a
+    // rectangle overlapping the corner's x or y range is not a corner-to-corner case at all.
+    #[test]
+    fn a_convex_corner_keeps_a_diagonal_corner_at_its_spacing() {
+        let r = rule(vec![0], vec![200]);
+        assert_eq!(corners(r.clone(), Rect::new(150, 160, 250, 260), false), vec![Rect::new(100, 100, 150, 160)]);
+        assert!(corners(r.clone(), Rect::new(300, 160, 400, 260), false).is_empty(), "the larger gap (200) is not below 200");
+        assert!(corners(r.clone(), Rect::new(50, 160, 250, 260), false).is_empty(), "overlaps the corner's x range");
+        assert!(corners(r.clone(), Rect::new(150, 160, 250, 260), true).is_empty(), "pin access ignores it");
+        // CORNERTOCORNER measures Euclidean: 150 x 160 apart is 219, not below 200 — though the
+        // larger axis gap (160) is.
+        let far = Rect::new(250, 260, 350, 360);
+        assert_eq!(corners(r.clone(), far, false).len(), 1);
+        let c2c = CornerSpacing { corner_to_corner: true, ..r };
+        assert_eq!(corners(c2c.clone(), Rect::new(150, 160, 250, 260), false).len(), 1);
+        assert!(corners(c2c, far, false).is_empty());
+    }
+
+    // Rule (`fr1DLookupTbl::find`, lower-bound mode): the width 100 of `a`'s square EQUALS the
+    // second row, and takes the row before it (50); past the last row, the last (300).
+    #[test]
+    fn a_width_equal_to_a_row_takes_the_row_before() {
+        let r = rule(vec![0, 100], vec![50, 300]);
+        assert_eq!(r.find(100), (50, 50));
+        assert_eq!(r.find(150), (300, 300));
+        assert_eq!(r.find(-5), (50, 50));
+        assert_eq!(r.find_max(), (300, 300));
+        assert!(corners(r, Rect::new(160, 160, 260, 260), false).is_empty(), "60 is not below 50");
+    }
+}
+
+#[cfg(test)]
 mod eol_tests {
     //! End-of-line spacing on constructed geometry: layer 4 (horizontal, width 140, spacing 140)
     //! with an end-of-line rule — space 200, width 150, within 30 — unless a test says otherwise.
@@ -2050,7 +2366,7 @@ mod eol_tests {
     }
 
     fn rule() -> EolRule {
-        EolRule { space: 200, width: 150, within: 30, parallel: None }
+        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None }
     }
 
     fn net(n: &str) -> Owner {
@@ -2105,6 +2421,35 @@ mod eol_tests {
         // Corner-only: only the metal's lower-left corner (1080, 100) is strictly inside the box.
         let co = EolKeepOut { corner_only: true, ..ko };
         assert_eq!(keepout(co, &[("a", WIRE, false), ("b", Rect::new(1080, 100, 1300, 300), false)]), vec![Rect::new(1000, 100, 1080, 100)]);
+    }
+
+    /// A layer-4 technology with one LEF58 end-of-line spacing rule: its markers' boxes, deduplicated.
+    fn lef58(r: EolRule, shapes: &[(&str, Rect, bool)]) -> Vec<Rect> {
+        let mut t = tests::tech();
+        t.layers[4].lef58_eol = vec![r];
+        let mut w = Worker::new(&t);
+        for (o, r, f) in shapes {
+            w.add(&net(o), 4, *r, *f);
+        }
+        w.init();
+        let mut v: Vec<Rect> = w.run().iter().filter(|m| m.rule == Rule::Lef58SpacingEndOfLine).map(|m| m.bbox).collect();
+        v.dedup();
+        v
+    }
+
+    // Rule (`checkMetalEndOfLine_eol_hasEol_getQueryBox` / `_endToEndHelper`, asap7's
+    // SPACING ENDOFLINE WITHIN ENDTOEND): the window reaches the END-TO-END space (260 here), but
+    // only a facing LINE END is held to it; any other edge is held to the rule's space (200).
+    #[test]
+    fn a_lef58_line_end_holds_another_line_end_to_the_end_to_end_space() {
+        let r = EolRule { end_to_end: Some(260), ..rule() };
+        assert_eq!(lef58(r, &[("a", WIRE, false), ("b", BLOCK, true)]), vec![GAP], "a long edge within space");
+        let block_220 = Rect::new(1220, -500, 1500, 500);
+        assert!(lef58(r, &[("a", WIRE, false), ("b", block_220, true)]).is_empty(), "a long edge past space, inside end-to-end");
+        let end_220 = Rect::new(1220, 0, 2200, 140);
+        assert_eq!(lef58(r, &[("a", WIRE, false), ("b", end_220, false)]), vec![Rect::new(1000, 0, 1220, 140)], "a line end inside end-to-end");
+        assert!(lef58(rule(), &[("a", WIRE, false), ("b", end_220, false)]).is_empty(), "no end-to-end clause: the space alone");
+        assert!(lef58(r, &[("a", WIRE, false), ("b", Rect::new(1270, 0, 2200, 140), false)]).is_empty(), "a line end past end-to-end");
     }
 
     const WIRE: Rect = Rect { xl: 0, yl: 0, xh: 1000, yh: 140 };

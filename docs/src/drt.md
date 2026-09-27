@@ -76,7 +76,7 @@ property detailed routing refuses, since the access points are judged by the sam
 check.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
 with the rect-only and minimum-width rules. Not modelled, so a technology that has them is checked
-without them: LEF58 end-of-line forms, a metal-width via map, right-way-on-grid-only layers. The
+without them: a metal-width via map. The
 router settings are its defaults (via-access layer 2, three sparse points per pin, non-preferred
 tracks allowed); the top routing layer is the block's maximum routing layer.
 

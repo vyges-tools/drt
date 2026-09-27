@@ -48,8 +48,13 @@ pub struct Layer {
     pub cut_spacing: Option<i32>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
+    /// A routing layer's LEF58 end-of-line SPACING rules, in the technology's order (the
+    /// modelled subset — `lef58_eol_rule`; the census refuses the rest).
+    pub lef58_eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line KEEP-OUT rules, in the technology's order.
     pub eol_keepout: Vec<EolKeepOut>,
+    /// A routing layer's LEF58 CONVEX corner spacing rules, in the technology's order.
+    pub corner_spacing: Vec<CornerSpacing>,
     /// A routing layer's own minimum AREA (square database units; 0 without one).
     pub min_area: i64,
     /// MINENCLOSEDAREA rules without a width (`frMinEnclosedAreaConstraint`): each rule's area,
@@ -63,13 +68,16 @@ pub struct Layer {
 /// An end-of-line spacing rule: a line end narrower than `width` needs `space` to a facing edge
 /// within `within` beyond its sides; with a parallel edge, only when a parallel edge lies within
 /// `par_space` of a side (on both sides with `two_edges`), up to `par_within` behind the end.
+/// `end_to_end` (LEF58 only): the spacing when the facing edge is itself a line end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EolRule {
     pub space: i32,
     pub width: i32,
     pub within: i32,
     pub parallel: Option<ParallelEdge>,
+    pub end_to_end: Option<i32>,
 }
+
 
 /// A LEF58 end-of-line keep-out rule (`frLef58EolKeepOutConstraint`, as `io::Parser` reads it —
 /// the class name is not read): a line end narrower than `width` keeps other metal out of a box
@@ -86,6 +94,41 @@ pub struct EolKeepOut {
     pub except_within: bool,
     pub within_low: i32,
     pub within_high: i32,
+}
+
+/// A LEF58 convex corner spacing rule (`frLef58CornerSpacingConstraint`, as `io::Parser` reads
+/// it): per WIDTH row a spacing pair; `same_xy` when every pair's two values agree (the check only
+/// runs then); `corner_to_corner` measures the corner's Euclidean distance instead of its larger
+/// axis gap. CORNERONLY's within, EXCEPTSAMENET and EXCEPTSAMEMETAL are stored by the reference and
+/// never read, so they are not kept.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CornerSpacing {
+    pub widths: Vec<i32>,
+    pub spacings: Vec<(i32, i32)>,
+    pub same_xy: bool,
+    pub corner_to_corner: bool,
+}
+
+impl CornerSpacing {
+    /// `fr1DLookupTbl::find` (lower-bound mode): within the rows, the row BEFORE the first row not
+    /// below `width` (the first row itself when that is it) — so a width equal to a row takes the
+    /// previous row; below the rows the first, above them the last.
+    pub fn find(&self, width: i32) -> (i32, i32) {
+        let (first, last) = (self.widths[0], self.widths[self.widths.len() - 1]);
+        let idx = if width >= first && width <= last {
+            self.widths.partition_point(|&w| w < width).saturating_sub(1)
+        } else if width < first {
+            0
+        } else {
+            self.widths.len() - 1
+        };
+        self.spacings[idx]
+    }
+
+    /// `fr1DLookupTbl::findMax`: the LAST row's pair (not the largest).
+    pub fn find_max(&self) -> (i32, i32) {
+        self.spacings[self.spacings.len() - 1]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,6 +353,81 @@ pub mod read {
 
     type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+    /// LEF58 corner spacing rule `k` of `layer`, as `io::Parser` translates it, or the first clause
+    /// outside the modelled subset (CONVEXCORNER with its width table, CORNERONLY, CORNERTOCORNER;
+    /// not CONCAVECORNER, SAMEMASK or EXCEPTEOL) — or an empty table, which the reference would
+    /// index out of bounds.
+    pub fn corner_spacing_rule(db: &Db, layer: &str, k: usize) -> Result<CornerSpacing, &'static str> {
+        if db.cornerspacingrule_get_type(layer, k) != "CONVEXCORNER" {
+            return Err("CONCAVECORNER");
+        }
+        if db.cornerspacingrule_is_same_mask(layer, k) {
+            return Err("SAMEMASK");
+        }
+        if db.cornerspacingrule_is_except_eol(layer, k) {
+            return Err("EXCEPTEOL");
+        }
+        let widths = db.cornerspacingrule_get_width_table(layer, k);
+        let flat = db.cornerspacingrule_get_spacing_table(layer, k);
+        let spacings: Vec<(i32, i32)> = flat.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0], c[1])).collect();
+        if widths.is_empty() || widths.len() != spacings.len() {
+            return Err("an empty or ragged width table");
+        }
+        // `isCornerToCorner` is read only when CORNERONLY is not set (`else if`).
+        let corner_to_corner = !db.cornerspacingrule_is_corner_only(layer, k) && db.cornerspacingrule_is_corner_to_corner(layer, k);
+        Ok(CornerSpacing { same_xy: spacings.iter().all(|&(a, b)| a == b), widths, spacings, corner_to_corner })
+    }
+
+    /// LEF58 end-of-line spacing rule `k` of `layer`, as `io::Parser` translates it
+    /// (`frLef58SpacingEndOfLineConstraint`): `Ok(None)` for a rule the reference DROPS with a warning
+    /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH — tested first, as it does), `Err(clause)`
+    /// for a clause outside the modelled subset (SPACING / ENDOFLINE / WITHIN, ENDTOEND without its
+    /// extension or cut spaces, PARALLELEDGE with only its space, within and TWOEDGES).
+    pub fn lef58_eol_rule(db: &Db, layer: &str, k: usize) -> Result<Option<EolRule>, &'static str> {
+        if db.spacingeolrule_is_except_exact_width_valid(layer, k) || db.spacingeolrule_is_fill_concave_corner_valid(layer, k) || db.spacingeolrule_is_equal_rect_width_valid(layer, k) {
+            return Ok(None);
+        }
+        let unmodelled: [(bool, &'static str); 22] = [
+            (db.spacingeolrule_is_exact_width_valid(layer, k), "EXACTWIDTH"),
+            (db.spacingeolrule_is_wrong_dir_spacing_valid(layer, k), "WRONGDIRSPACING"),
+            (db.spacingeolrule_is_opposite_width_valid(layer, k), "OPPOSITEWIDTH"),
+            (db.spacingeolrule_is_end_prl_spacing_valid(layer, k), "ENDPRLSPACING"),
+            (db.spacingeolrule_is_wrong_dir_within_valid(layer, k), "WRONGDIRWITHIN"),
+            (db.spacingeolrule_is_same_mask_valid(layer, k), "SAMEMASK"),
+            (db.spacingeolrule_is_extension_valid(layer, k), "ENDTOEND EXTENSION"),
+            (db.spacingeolrule_is_other_end_width_valid(layer, k), "ENDTOEND OTHERENDWIDTH"),
+            (db.spacingeolrule_is_cut_spaces_valid(layer, k), "ENDTOEND cut spaces"),
+            (db.spacingeolrule_is_subtract_eol_width_valid(layer, k), "PARALLELEDGE SUBTRACTEOLWIDTH"),
+            (db.spacingeolrule_is_par_prl_valid(layer, k), "PARALLELEDGE PRL"),
+            (db.spacingeolrule_is_par_min_length_valid(layer, k), "PARALLELEDGE MINLENGTH"),
+            (db.spacingeolrule_is_same_metal_valid(layer, k), "PARALLELEDGE SAMEMETAL"),
+            (db.spacingeolrule_is_non_eol_corner_only_valid(layer, k), "PARALLELEDGE NONEOLCORNERONLY"),
+            (db.spacingeolrule_is_parallel_same_mask_valid(layer, k), "PARALLELEDGE PARALLELSAMEMASK"),
+            (db.spacingeolrule_is_min_length_valid(layer, k) || db.spacingeolrule_is_max_length_valid(layer, k), "MINLENGTH/MAXLENGTH"),
+            (db.spacingeolrule_is_enclose_cut_valid(layer, k), "ENCLOSECUT"),
+            (db.spacingeolrule_is_to_concave_corner_valid(layer, k), "TOCONCAVECORNER"),
+            (db.spacingeolrule_is_to_notch_length_valid(layer, k), "TONOTCHLENGTH"),
+            (db.spacingeolrule_is_min_adjacent_length_valid(layer, k), "MINADJACENTLENGTH"),
+            (db.spacingeolrule_is_cut_class_valid(layer, k) || db.spacingeolrule_is_withcut_valid(layer, k), "CUTCLASS/WITHCUT"),
+            (db.spacingeolrule_is_enclosure_end_valid(layer, k), "ENCLOSUREEND"),
+        ];
+        if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
+            return Err(clause);
+        }
+        let parallel = db.spacingeolrule_is_parallel_edge_valid(layer, k).then(|| ParallelEdge {
+            space: db.spacingeolrule_get_par_space(layer, k),
+            within: db.spacingeolrule_get_par_within(layer, k),
+            two_edges: db.spacingeolrule_is_two_edges_valid(layer, k),
+        });
+        Ok(Some(EolRule {
+            space: db.spacingeolrule_get_eol_space(layer, k),
+            width: db.spacingeolrule_get_eol_width(layer, k),
+            within: db.spacingeolrule_get_eol_within(layer, k),
+            parallel,
+            end_to_end: db.spacingeolrule_is_end_to_end_valid(layer, k).then(|| db.spacingeolrule_get_end_to_end_space(layer, k)),
+        }))
+    }
+
     pub fn tech(db: &Db) -> Res<Tech> {
         let mut layers: Vec<Layer> = Vec::new();
         let placeholder = |name: &str| Layer { name: name.into(), ..Layer::default() };
@@ -352,8 +470,10 @@ pub mod read {
                     let eol = db
                         .layer_v54_eol_rules(&name)?
                         .into_iter()
-                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }) })
+                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None })
                         .collect();
+                    let corner_spacing: Vec<CornerSpacing> = (0..db.num_layer_get_tech_layer_corner_spacing_rules(&name)).filter_map(|k| corner_spacing_rule(db, &name, k).ok()).collect();
+                    let lef58_eol: Vec<EolRule> = (0..db.num_layer_get_tech_layer_spacing_eol_rules(&name)).filter_map(|k| lef58_eol_rule(db, &name, k).ok().flatten()).collect();
                     let eol_keepout: Vec<EolKeepOut> = (0..db.num_layer_get_tech_layer_eol_keep_out_rules(&name))
                         .map(|k| EolKeepOut {
                             width: db.eolkeepoutrule_get_eol_width(&name, k),
@@ -372,7 +492,7 @@ pub mod read {
                     // Only the plain flag makes the constraint; "except non-core pins" alone is
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, eol_keepout, min_area, min_enclosed_areas, rect_only });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;

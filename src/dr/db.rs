@@ -33,7 +33,42 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 out.push(format!("{}: spacing with a width range", l.name));
             }
         }
+        // Families the reference's io translates that the database census does not list, counted
+        // here from the generated accessors — only the rules io KEEPS (it drops the rest with a
+        // warning, and sky130's cut layers carry two LEF58 enclosure rules without a CUTCLASS that
+        // it drops that way) — and refused (none is modelled).
+        let name = l.name.as_str();
+        let kept = |n: usize, keeps: &dyn Fn(usize) -> bool| (0..n).filter(|&k| keeps(k)).count();
+        let untracked = [
+            ("lef58_cut_enclosure", kept(db.num_layer_get_tech_layer_cut_enclosure_rules(name), &|k| cut_enclosure_kept(db, name, k))),
+            ("lef58_max_spacing", kept(db.num_layer_get_tech_layer_max_spacing_rules(name), &|k| db.maxspacingrule_has_cut_class(name, k))),
+            ("lef58_two_wires_forbidden_spacing", db.num_layer_get_tech_layer_two_wires_forbidden_spc_rules(name)),
+            ("lef58_width_table_orthogonal", kept(db.num_layer_get_tech_layer_width_table_rules(name), &|k| db.widthtablerule_is_orthogonal(name, k))),
+            ("lef58_wrong_dir_spacing", kept(db.num_layer_get_tech_layer_wrong_dir_spacing_rules(name), &|k| !db.wrongdirspacingrule_is_length_valid(name, k) && db.wrongdirspacingrule_get_prl_length(name, k) >= 0)),
+            ("orthogonal_spacing_table", usize::from(db.layer_has_orth_spacing_table(name))),
+            ("right_way_on_grid_only", usize::from(db.layer_is_right_way_on_grid_only(name))),
+        ];
+        for (family, n) in untracked {
+            if n > 0 {
+                out.push(format!("{name}: {family} ({n})"));
+            }
+        }
         for (family, n) in db.layer_rule_census(&l.name) {
+            if family == "lef58_spacing_eol" {
+                // Modelled rule by rule: the first clause outside the subset names the refusal.
+                if let Some(clause) = (0..n).find_map(|k| crate::tech::read::lef58_eol_rule(db, &l.name, k).err()) {
+                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                }
+                continue;
+            }
+            if family == "lef58_corner_spacing" {
+                // ⛔ The check models the subset, but the router's side does not exist yet: the
+                // worker's corner-spacing PATCH pass (`patchMetalShape_cornerSpacing`) and a block
+                // pin's corner-to-corner cost (`modCornerToCornerSpacing`). Refused until both are.
+                let clause = (0..n).find_map(|k| crate::tech::read::corner_spacing_rule(db, &l.name, k).err()).unwrap_or("the router's corner patch pass and block-pin cost");
+                out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                continue;
+            }
             let modelled = match family.as_str() {
                 "cut_spacing" => n <= 1,
                 "v55_influence" => true,
@@ -59,6 +94,23 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether `io::Parser` keeps LEF58 enclosure rule `k` of cut layer `layer`: it skips EOL rules
+/// with SIDESPACING or ENDSPACING, HORIZONTAL/VERTICAL, INCLUDEABUTTED, OFFCENTERLINE, LENGTH,
+/// EXTRACUT, REDUNDANTCUT, PARALLEL, CONCAVECORNERS and any rule without a CUTCLASS.
+fn cut_enclosure_kept(db: &Db, layer: &str, k: usize) -> bool {
+    let ty = db.cutenclosurerule_get_type(layer, k);
+    !(ty == "EOL" && (db.cutenclosurerule_is_side_spacing_valid(layer, k) || db.cutenclosurerule_is_end_spacing_valid(layer, k)))
+        && ty != "HORZ_AND_VERT"
+        && !db.cutenclosurerule_is_include_abutted(layer, k)
+        && !db.cutenclosurerule_is_off_center_line(layer, k)
+        && !db.cutenclosurerule_is_length_valid(layer, k)
+        && !db.cutenclosurerule_is_extra_cut_valid(layer, k)
+        && !db.cutenclosurerule_is_redundant_cut_valid(layer, k)
+        && !db.cutenclosurerule_is_parallel_valid(layer, k)
+        && !db.cutenclosurerule_is_concave_corners_valid(layer, k)
+        && db.cutenclosurerule_is_cut_class_valid(layer, k)
 }
 
 /// The reason suffix for a master whose obstructions carry their own rule (pin access refuses it too).
