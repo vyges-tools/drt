@@ -85,7 +85,7 @@ const DESCRIBE: &str = r#"{
     "pin_access is correlated stage by stage against an instrumented reference router, and end to end on the database it writes (preferred points, point counts, port points, pin-access indices) on sky130hs designs, and stage by stage on Nangate45 and GF180 designs, 2026-09-25.",
     "Design rules modelled: shorts (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing (with or without a parallel edge), minimum width, minimum area (patched where the router can, reported where it cannot), minimum enclosed area (MINENCLOSEDAREA without a WIDTH; a rule with one is skipped, as the reference skips it), and rect-only layers (which are also unidirectional). A net carrying antenna jumpers (the database's hasJumpers, set by global routing's antenna repair) is routed at ten times the off-guide cost.",
     "REFUSED rather than approximated, by detailed_route: any other rule family a layer carries (LEF58 end-of-line forms, minimum step, corner spacing and the rest, named in the reason); a multi-patterned routing layer; LEF 5.4 spacing limited to a width range; a cell whose obstructions carry DESIGNRULEWIDTH or SPACING; a non-default rule with hard spacing, via generate rules or wire extension; FIXED wiring, a via or patch with no wire, or a routed net on a non-default rule already in the database; and congested input guides. From iteration 7 a congested worker widens the clip of later rows, and from iteration 23 NEARDRC rips up the nets near each marker; both are transcribed but no correlated design exercises them yet.",
-    "REFUSED rather than approximated, by pin_access: a nearby-track cost round (a pin that no other round can reach); a multi-patterned routing layer; a cell whose obstructions carry DESIGNRULEWIDTH or SPACING.",
+    "REFUSED rather than approximated, by pin_access: a nearby-track cost round (a pin that no other round can reach); and every rule family or layer property detailed_route refuses (the access points are judged by the same design-rule check), named in the reason.",
     "Taken as absent: a metal-width via map, right-way-on-grid-only layers.",
     "The router settings are its defaults: via-access layer the second routing layer (detailed_route takes --via-access-layer), no via-in-pin range, three sparse points per pin, non-preferred tracks allowed. detailed_route routes between the block's minimum and maximum routing layers as the database holds them, with the database's non-default rules; pin_access's top routing layer is the block's maximum routing layer, else the topmost."
   ],
@@ -291,12 +291,14 @@ fn run(a: &Args) -> Outcome {
         Ok(t) => t,
         Err(e) => return fail("error", 2, e.to_string()),
     };
-    // A multi-patterned routing layer is unidirectional AND coloured; pin access does not model
-    // colouring. A master obstruction with its own rule is a blockage pin access checks against
-    // that rule, which it does not model either.
-    let unidirectional: Vec<String> = vyges_drt::dr::db::unmodelled_rules(&db, &tech).into_iter().filter(|r| r.ends_with(": multi-patterned") || r.ends_with(vyges_drt::dr::db::OBS_RULE)).collect();
-    if !unidirectional.is_empty() {
-        return fail("refused", 3, format!("not modelled: {}", unidirectional.join("; ")));
+    // Pin access judges each access point with the design-rule check, so every rule family that
+    // check does not model is refused here as detailed routing refuses it — not only a
+    // multi-patterned layer (unidirectional AND coloured) or an obstruction with its own rule.
+    // Checking points while silently ignoring a rule the technology carries is the one outcome
+    // that must not happen (asap7's LEF58 families reached it before).
+    let unmodelled: Vec<String> = vyges_drt::dr::db::unmodelled_rules(&db, &tech);
+    if !unmodelled.is_empty() {
+        return fail("refused", 3, format!("not modelled: {}", unmodelled.join("; ")));
     }
     let cfg = padb::config(&db, &tech);
     let (masters, insts, ports) = match padb::read_design(&db, &tech, cfg.top_routing_layer) {

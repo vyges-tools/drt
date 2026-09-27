@@ -71,8 +71,9 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 
 ### Limits
 
-Refused: a nearby-track round (a pin no other round reaches); a multi-patterned routing layer; a
-cell whose obstructions carry `DESIGNRULEWIDTH` or `SPACING`.
+Refused: a nearby-track round (a pin no other round reaches), and every rule family or layer
+property detailed routing refuses, since the access points are judged by the same design-rule
+check.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
 with the rect-only and minimum-width rules. Not modelled, so a technology that has them is checked
 without them: LEF58 end-of-line forms, a metal-width via map, right-way-on-grid-only layers. The
