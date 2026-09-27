@@ -16,7 +16,8 @@ pub use crate::dr::wire::InitialRouting;
 /// layer that carries one — a design with any must be refused, not routed with the rule ignored.
 /// A cut layer may carry one plain spacing rule (more than one is refused too). Also refused: a
 /// multi-patterned routing layer (unidirectional, and coloured — colouring is not modelled) and
-/// LEF 5.4 spacing limited to a width RANGE. A rect-only layer is modelled (unidirectional, and the
+/// LEF 5.4 spacing limited to a width RANGE, and a master whose obstructions carry DESIGNRULEWIDTH or
+/// SPACING (`master: …`). A rect-only layer is modelled (unidirectional, and the
 /// check's rect-only rule); its "except non-core pins" flag is never read.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
@@ -43,7 +44,28 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             }
         }
     }
+    // A master obstruction with DESIGNRULEWIDTH or SPACING: the reference keeps it as a blockage of
+    // its OWN, with that rule (`io::Parser` master import: only an obstruction with both at -1 is
+    // merged into the layer's polygon set). Ours merges every obstruction and reads neither value,
+    // so such a master would be checked against the wrong shapes and the wrong rule — refused.
+    // ⚠️ Conservative: the reference first moves a cut obstruction enclosed by one pin into that
+    // pin, so a flagged cut there never becomes a blockage; it is refused here all the same.
+    let mut seen = std::collections::BTreeSet::new();
+    for inst in db.inst_names() {
+        let master = db.inst_get_master(&inst);
+        if seen.insert(master.clone()) && obstruction_has_rule(&db.master_obstruction_rules(&master).unwrap_or_default()) {
+            out.push(format!("{master}: {OBS_RULE}"));
+        }
+    }
     out
+}
+
+/// The reason suffix for a master whose obstructions carry their own rule (pin access refuses it too).
+pub const OBS_RULE: &str = "an obstruction with DESIGNRULEWIDTH or SPACING";
+
+/// Any obstruction with a DESIGNRULEWIDTH or SPACING (`-1` is the database's "none" for both).
+fn obstruction_has_rule(rules: &[(i32, i32)]) -> bool {
+    rules.iter().any(|&(w, s)| w != -1 || s != -1)
 }
 
 /// A regular net's routing read from the database (`None` without a wire). Refused: a FIXED wire
@@ -376,4 +398,20 @@ fn port_stacks(db: &Db, tech: &Tech, tech_vias: usize, names: &[String], wires: 
 /// The gcell grid the routing used, written to the database (one uniform pattern per axis).
 pub fn write_gcell_grid(db: &mut Db, grid: &crate::dr::guides::GCellGrid) -> Result<(), String> {
     db.block_set_gcell_grid(grid.x, grid.y).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rule (`io::Parser` master import): an obstruction is merged into its layer's shapes only when
+    // BOTH its DESIGNRULEWIDTH and its SPACING are -1 (the database's "none"); either one set makes
+    // it a blockage of its own, which is refused.
+    #[test]
+    fn an_obstruction_with_either_value_carries_a_rule() {
+        assert!(!obstruction_has_rule(&[]));
+        assert!(!obstruction_has_rule(&[(-1, -1), (-1, -1)]));
+        assert!(obstruction_has_rule(&[(-1, -1), (200, -1)]));
+        assert!(obstruction_has_rule(&[(-1, 0)]));
+    }
 }

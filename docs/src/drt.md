@@ -71,7 +71,8 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 
 ### Limits
 
-Refused: a nearby-track round (a pin no other round reaches); a multi-patterned routing layer.
+Refused: a nearby-track round (a pin no other round reaches); a multi-patterned routing layer; a
+cell whose obstructions carry `DESIGNRULEWIDTH` or `SPACING`.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
 with the rect-only and minimum-width rules. Not modelled, so a technology that has them is checked
 without them: LEF58 end-of-line forms, a metal-width via map, right-way-on-grid-only layers. The
@@ -111,7 +112,8 @@ where a patch cannot fix it), minimum enclosed area (`MINENCLOSEDAREA` without a
 rect-only layers. A net the global router gave antenna jumpers is kept to its guides: off them it
 costs ten times as much.
 Refused rather than approximated: any other rule family a layer carries (named in the report's
-`reason`); a multi-patterned routing layer; spacing limited to a width range; a non-default rule
-with hard spacing, via generate rules or wire extension; FIXED wiring, or a routed net on a
-non-default rule, already in the database; congested input guides; and a run that still has
+`reason`); a multi-patterned routing layer; spacing limited to a width range; a cell whose
+obstructions carry `DESIGNRULEWIDTH` or `SPACING`; a non-default rule with hard spacing, via
+generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
+the database; congested input guides; and a run that still has
 markers at iteration 7, where congestion-driven clip growth begins.
