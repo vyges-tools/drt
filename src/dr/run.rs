@@ -411,6 +411,8 @@ struct DrCtx<'a> {
     min_area: Vec<i64>,
     through: Vec<[bool; 4]>,
     term_aps: HashSet<((i32, i32), usize, usize)>,
+    /// Each instance's pin-access class (`usize::MAX`: none).
+    class_of: Vec<usize>,
     fixed_trees: Vec<PackedRTree<Fixed>>,
     index_trees: Vec<PackedRTree<usize>>,
     inst_index: HashMap<&'a str, usize>,
@@ -493,7 +495,7 @@ fn dr_init<'a>(d: &'a DesignIn, g: &'a GuidesIn, p: &'a Prep, t: &'a TaOut) -> D
     for (i, x) in d.insts.iter().enumerate() {
         term_base[i + 1] = term_base[i] + d.masters[&x.unique.master].terms.len();
     }
-    DrCtx { d, g, p, t, guide_trees, gr_tree, bpins, min_area, through, term_aps, fixed_trees, index_trees, inst_index, term_base }
+    DrCtx { d, g, p, t, guide_trees, gr_tree, bpins, min_area, through, term_aps, class_of, fixed_trees, index_trees, inst_index, term_base }
 }
 
 impl DrCtx<'_> {
@@ -659,6 +661,19 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     let term_shapes = |f: &Fixed| cx.term_shapes(f);
     let port_aps = |k: usize| -> Vec<DrAp> { d.pa.port_aps[k].iter().flatten().map(|a| DrAp { point: a.point, layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect() };
     let inst_is_block = |i: usize| d.insts[i].is_block;
+    // A terminal's access points per pin, in design coordinates: its class representative's,
+    // shifted by the instance's offset from it (as the connected-terminal set is built).
+    let inst_term_aps = |i: usize, k: usize| -> Vec<Vec<DrAp>> {
+        let c = cx.class_of[i];
+        if c == usize::MAX {
+            return Vec::new();
+        }
+        let (inst, rep) = (&d.insts[i], &d.insts[d.pa.classes[c].insts[0]]);
+        let shift = (inst.unique.location.0 - rep.unique.location.0, inst.unique.location.1 - rep.unique.location.1);
+        d.pa.class_aps[c].get(k).map_or(Vec::new(), |pins| {
+            pins.iter().map(|aps| aps.iter().map(|a| DrAp { point: (a.point.0 + shift.0, a.point.1 + shift.1), layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect()).collect()
+        })
+    };
     let ccx = CostCtx {
         tech,
         defaults: &p.defaults,
@@ -671,6 +686,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
         term_shapes: &term_shapes,
         port_aps: &port_aps,
         inst_is_block: &inst_is_block,
+        inst_term_aps: &inst_term_aps,
     };
     let mut cw = CostWorker { cx: &ccx, g: &mut g, ap_svia: Default::default() };
     init_maze_cost(&mut cw, &nets, &w.ext, &rule_of).map_err(|e| e.0)?;

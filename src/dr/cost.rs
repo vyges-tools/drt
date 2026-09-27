@@ -312,6 +312,9 @@ pub struct CostCtx<'a> {
     pub port_aps: &'a dyn Fn(usize) -> Vec<DrAp>,
     /// Whether an instance's master is a block.
     pub inst_is_block: &'a dyn Fn(usize) -> bool,
+    /// An instance terminal's access points, per pin (design coordinates), by (instance, term):
+    /// what a block master's pin cost reads (`initMazeCost_terms`, `modBlockedEdgesForMacroPin`).
+    pub inst_term_aps: &'a dyn Fn(usize, usize) -> Vec<Vec<DrAp>>,
 }
 
 impl CostCtx<'_> {
@@ -996,14 +999,26 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
 
 fn init_maze_cost_terms(w: &mut CostWorker<'_, '_>, terms: &BTreeSet<TermKey>) -> Result<(), Unmodelled> {
     for (_, _, _, obj) in terms {
-        if let Fixed::InstTerm { inst, .. } = *obj {
-            if (w.cx.inst_is_block)(inst) {
-                return Err(Unmodelled("a block master's pins".into()));
-            }
-        }
         mod_term_cost(w, obj, true, false);
     }
     Ok(())
+}
+
+/// `modBlockedEdgesForMacroPin`: every access point of the terminal's pins (a pin with none is
+/// skipped) blocks — or, when the cost is removed, unblocks — each planar direction it may leave
+/// in, at its grid node. The node is `getMazeXIdx`/`getMazeYIdx`'s: a lower bound, so a point past
+/// the grid lands one beyond it, where only a W/S edge (corrected onto the last node) still lands.
+fn mod_blocked_edges_for_macro_pin(w: &mut CostWorker<'_, '_>, aps: &[Vec<DrAp>], add: bool) {
+    for a in aps.iter().flatten() {
+        let Some(z) = w.g.z_of(a.layer) else { continue };
+        let x = w.g.xs.partition_point(|&c| c < a.point.0) as i64;
+        let y = w.g.ys.partition_point(|&c| c < a.point.1) as i64;
+        for d in [Dir6::E, Dir6::W, Dir6::N, Dir6::S] {
+            if a.has(d) {
+                w.g.set_blocked(x, y, z as i64, d, add);
+            }
+        }
+    }
 }
 
 /// One terminal's fixed-shape costs, every pin shape on a grid layer (cut shapes are not
@@ -1014,6 +1029,18 @@ pub fn mod_term_cost(w: &mut CostWorker<'_, '_>, obj: &Fixed, add: bool, skip_vi
     let (min_l, max_l) = (w.g.zs[0], *w.g.zs.last().expect("a layer"));
     let is_inst = matches!(obj, Fixed::InstTerm { .. });
     let t = if add { ModCost::AddFixed } else { ModCost::SubFixed };
+    // A block master's pin (`initMazeCost_terms`): its access points, and the planar directions the
+    // spacing costs are reset in. Removing the cost, those are the LAST access point's (every pin's
+    // points in turn overwrite them; none leaves both false); adding, both directions.
+    let (block, aps) = match *obj {
+        Fixed::InstTerm { inst, term, .. } if (w.cx.inst_is_block)(inst) => (true, (w.cx.inst_term_aps)(inst, term)),
+        _ => (false, Vec::new()),
+    };
+    let (reset_h, reset_v) = if block && !add {
+        aps.iter().flatten().fold((false, false), |_, a| (a.has(Dir6::E) || a.has(Dir6::W), a.has(Dir6::N) || a.has(Dir6::S)))
+    } else {
+        (true, true)
+    };
     for (l, b) in (w.cx.term_shapes)(obj) {
         if tech.layers[l].kind != LayerKind::Routing || l < min_l || l > max_l {
             continue;
@@ -1024,8 +1051,16 @@ pub fn mod_term_cost(w: &mut CostWorker<'_, '_>, obj: &Fixed, add: bool, skip_vi
                 w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
                 w.mod_min_spacing_cost_via(&b, z, t, false, false, false, None);
             }
-            w.mod_eol_spacing_rules_cost(&b, z, t, false, None, true, true);
-            w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
+            // A block's pin: corner-to-corner spacing (a rule family the census refuses), its
+            // access edges blocked, and the spacing costs SET rather than added (reset, removed).
+            // Minimum-cut costs follow for block, pad and ring pins: refused by the census too.
+            let mut t2 = t;
+            if block {
+                mod_blocked_edges_for_macro_pin(w, &aps, add);
+                t2 = if add { ModCost::SetFixed } else { ModCost::ResetFixed };
+            }
+            w.mod_eol_spacing_rules_cost(&b, z, t2, false, None, reset_h, reset_v);
+            w.mod_min_spacing_cost_planar(&b, z, t2, false, None, block, reset_h, reset_v);
         } else {
             w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
             w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
@@ -1120,7 +1155,7 @@ mod tests {
         let aps = |_: usize| Vec::new();
         let block = |_: usize| false;
         let fixed: Vec<PackedRTree<Fixed>> = Vec::new();
-        let cx = CostCtx { tech: t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block };
+        let cx = CostCtx { tech: t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block, inst_term_aps: &|_, _| Vec::new() };
         let mut w = CostWorker { cx: &cx, g, ap_svia: BTreeMap::new() };
         f(&mut w)
     }
@@ -1142,7 +1177,7 @@ mod tests {
         let aps = |_: usize| Vec::new();
         let block = |_: usize| false;
         let defaults = [None, None, None, Some(0), None];
-        let cx = CostCtx { tech: t, defaults: &defaults, eol, ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed, term_shapes: &shapes, port_aps: &aps, inst_is_block: &block };
+        let cx = CostCtx { tech: t, defaults: &defaults, eol, ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed, term_shapes: &shapes, port_aps: &aps, inst_is_block: &block, inst_term_aps: &|_, _| Vec::new() };
         let mut w = CostWorker { cx: &cx, g, ap_svia: BTreeMap::new() };
         f(&mut w)
     }
@@ -1306,5 +1341,26 @@ mod tests {
         assert_eq!(svia.get(&(3, 3, 0)), Some(&7));
         assert!(ALL.iter().all(|&d| !g.is_blocked(5, 5, 0, d)));
         assert!(!g.nodes[g.idx(5, 5, 0)].svia);
+    }
+
+    // Rule (`modBlockedEdgesForMacroPin`): each access point of a block's pin blocks the planar
+    // edges it may leave by, at `getMazeXIdx`/`getMazeYIdx`'s node — a LOWER BOUND, so a point
+    // between grid lines takes the next line, and one past the last line takes an index beyond the
+    // grid, where only a W/S edge (corrected onto the last node's E/N) still lands. Removing the
+    // cost unblocks the same edges.
+    #[test]
+    fn a_macro_pin_blocks_its_access_edges_at_the_lower_bound_node() {
+        let t = Tech { layers: vec![Layer::default(), Layer::default(), Layer { kind: LayerKind::Routing, ..Default::default() }, Layer { kind: LayerKind::Cut, ..Default::default() }, Layer { kind: LayerKind::Routing, ..Default::default() }], ..Default::default() };
+        let mut g = grid(); // lines at 0, 100 .. 900 on both axes; layers 2 and 4
+        let ap = |x, y, access| DrAp { point: (x, y), layer: 2, access, vias: Vec::new() };
+        // Bits: N 1, S 2, E 4, W 8. (350, 300): E and N, at node x = 4 (the line at 400).
+        // (950, 500): W only, past the last line — lands on node 9's east edge.
+        let aps = vec![vec![ap(350, 300, 4 | 1)], vec![ap(950, 500, 8)]];
+        with(&t, &mut g, |w| mod_blocked_edges_for_macro_pin(w, &aps, true));
+        assert!(g.is_blocked(4, 3, 0, Dir6::E) && g.is_blocked(4, 3, 0, Dir6::N));
+        assert!(!g.is_blocked(3, 3, 0, Dir6::E), "not the node below the point");
+        assert!(g.is_blocked(9, 5, 0, Dir6::E), "the W edge of index 10, corrected onto node 9");
+        with(&t, &mut g, |w| mod_blocked_edges_for_macro_pin(w, &aps, false));
+        assert!(!g.is_blocked(4, 3, 0, Dir6::E) && !g.is_blocked(4, 3, 0, Dir6::N) && !g.is_blocked(9, 5, 0, Dir6::E));
     }
 }
