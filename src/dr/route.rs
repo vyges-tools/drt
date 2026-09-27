@@ -25,11 +25,71 @@ pub fn abs_priority(is_clock: bool, has_ndr: bool) -> i32 {
 /// up — those with more than one pin; incremental — those not routed before), by absolute
 /// priority (highest first), then (pins inside the worker, pin-box area, id) — the marker
 /// priorities are all equal before any marker.
-pub fn sort_reroute_nets(nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, ripped: &dyn Fn(&DrNet) -> bool) -> Vec<usize> {
+pub fn sort_reroute_nets(nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, ripped: &dyn Fn(&DrNet) -> bool, prio: &dyn Fn(usize) -> i32) -> Vec<usize> {
     let mut order: Vec<usize> = (0..nets.len()).filter(|&i| ripped(&nets[i])).collect();
     let area = |n: &DrNet| i64::from(n.pin_box.dx()) * i64::from(n.pin_box.dy());
-    order.sort_by_key(|&i| (std::cmp::Reverse(abs(&nets[i])), nets[i].num_pins_in, area(&nets[i]), nets[i].id));
+    // `mazeIterInit_sortRerouteNets`: the net's marker priority (NEARDRC; 0 otherwise), then its
+    // absolute priority, both highest first; then pins inside, pin-box area, id.
+    order.sort_by_key(|&i| (std::cmp::Reverse(prio(i)), std::cmp::Reverse(abs(&nets[i])), nets[i].num_pins_in, area(&nets[i]), nets[i].id));
     order
+}
+
+/// ⚠️ UNWITNESSED: no corpus design reaches NEARDRC with an effect — single_row (the only one past
+/// iteration 7) keeps its two violations whatever is ripped, and its DEF is the same with this rule
+/// disabled. Transcribed from the reference and pinned by unit tests only.
+///
+/// NEARDRC's rip-up (`initRipUpNetsFromMarkers` → `getRipUpNetsFromMarker`): every net with a
+/// worker shape on a marker's layer inside the marker box bloated by twice that layer's width.
+/// A marker not touching the route box is ignored — the worker's markers are COPIES, without the
+/// victim/aggressor sides whose boxes would otherwise be tried. Membership only, so the region
+/// query's order does not matter here. Returns worker net indices, ascending.
+pub fn near_drc_ripped(tech: &crate::tech::Tech, nets: &[DrNet], markers: &[crate::gc::Marker], route_box: &Rect) -> Vec<usize> {
+    let touches = |a: &Rect, b: &Rect| a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh;
+    let boxes = |f: &DrFig, l: usize| -> Vec<Rect> {
+        match f {
+            DrFig::Via { via, origin, .. } => {
+                let vd = &tech.via_defs[*via];
+                let figs = if vd.layer1 == l { &vd.layer1_figs } else if vd.layer2 == l { &vd.layer2_figs } else if vd.cut == l { &vd.cut_figs } else { return Vec::new() };
+                figs.iter().map(|r| Rect { xl: r.xl + origin.0, yl: r.yl + origin.1, xh: r.xh + origin.0, yh: r.yh + origin.1 }).collect()
+            }
+            _ => {
+                let (fl, b) = crate::dr::design::stored_box(tech, f);
+                if fl == l { vec![b] } else { Vec::new() }
+            }
+        }
+    };
+    let mut out = BTreeSet::new();
+    for m in markers {
+        if !touches(route_box, &m.bbox) {
+            continue;
+        }
+        let k = tech.layers[m.layer].width * 2;
+        let q = Rect { xl: m.bbox.xl - k, yl: m.bbox.yl - k, xh: m.bbox.xh + k, yh: m.bbox.yh + k };
+        for (i, n) in nets.iter().enumerate() {
+            if n.route.iter().chain(&n.ext).any(|f| boxes(f, m.layer).iter().any(|b| touches(b, &q))) {
+                out.insert(i);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// NEARDRC's marker priorities (`route_queue_init_queue`): counting down from the number of ripped
+/// nets, each ripped net (in worker order) a marker lists among its sources gets the next value, in
+/// marker order, once. Others keep 0.
+pub fn near_drc_priorities(nets: &[DrNet], ripped: &[usize], markers: &[crate::gc::Marker], name: &dyn Fn(usize) -> String) -> Vec<i32> {
+    let mut prio = vec![0i32; nets.len()];
+    let mut curr = ripped.len() as i32;
+    let mut added = BTreeSet::new();
+    for m in markers {
+        for &i in ripped {
+            if m.owners.contains(&crate::gc::Owner::Net(name(i))) && added.insert(i) {
+                prio[i] = curr;
+                curr -= 1;
+            }
+        }
+    }
+    prio
 }
 
 /// A net's via reservation: per pin with a terminal (not a macro's), the access point with a
@@ -76,8 +136,8 @@ pub fn init_maze_cost_via_helper(w: &mut CostWorker<'_, '_>, net: &DrNet, add: b
 /// The first iteration's queue: every net's via reservation, made in the priority order, then
 /// the ROUTING order — the queue re-sorted by net name (bytes), then worker net id.
 #[allow(clippy::too_many_arguments)]
-pub fn init_queue<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, name: &dyn Fn(&DrNet) -> &'n str, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>, is_macro_term: &dyn Fn(usize) -> bool, ripped: &dyn Fn(&DrNet) -> bool) -> Vec<usize> {
-    let mut order = sort_reroute_nets(nets, abs, ripped);
+pub fn init_queue<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, name: &dyn Fn(&DrNet) -> &'n str, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>, is_macro_term: &dyn Fn(usize) -> bool, ripped: &dyn Fn(&DrNet) -> bool, prio: &dyn Fn(usize) -> i32) -> Vec<usize> {
+    let mut order = sort_reroute_nets(nets, abs, ripped, prio);
     for &i in &order {
         init_maze_cost_via_helper(w, &nets[i], true, ndr_of(&nets[i]), is_macro_term);
     }
@@ -559,5 +619,48 @@ fn add_cut_spc_cost(w: &mut CostWorker<'_, '_>, path: &[Idx]) {
             let b = Rect { xl: f.xl + origin.0, yl: f.yl + origin.1, xh: f.xh + origin.0, yh: f.yh + origin.1 };
             w.mod_cut_spacing_cost(&b, z, ModCost::AddRoute, Some((path[k].0 as usize, path[k].1 as usize)));
         }
+    }
+}
+
+#[cfg(test)]
+mod near_drc_tests {
+    use super::*;
+    use crate::gc::{Marker, Owner, Rule};
+    use crate::tech::{Layer, LayerKind, Tech};
+
+    fn net(id: usize, figs: Vec<DrFig>) -> DrNet {
+        DrNet { id, net: id, pins: Vec::new(), num_pins_in: 0, pin_box: Rect::new(0, 0, 0, 0), ext: figs, route: Vec::new() }
+    }
+    fn seg(x: i32) -> DrFig {
+        DrFig::Seg { layer: 2, begin: (x, 0), end: (x, 1000), width: 100, begin_ext: 0, end_ext: 0, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false }
+    }
+    fn marker(b: Rect, owners: &[&str]) -> Marker {
+        Marker { rule: Rule::Short, layer: 2, bbox: b, owners: owners.iter().map(|n| Owner::Net(n.to_string())).collect(), victim: None, aggressor: None }
+    }
+
+    // Rule (`getRipUpNetsFromMarker`): a net with a shape on the marker's layer inside the marker
+    // box bloated by twice the layer's width is ripped; a marker not touching the route box is
+    // ignored (the worker's markers are copies, without the sides that could still reach it).
+    #[test]
+    fn near_drc_rips_the_nets_near_a_marker_touching_the_route_box() {
+        let t = Tech { layers: vec![Layer::default(), Layer::default(), Layer { kind: LayerKind::Routing, width: 100, ..Default::default() }], ..Default::default() };
+        let route = Rect::new(0, 0, 1000, 1000);
+        // Wire boxes: x 450..550 (net 0), 700..800 (net 1), 900..1000 (net 2).
+        let nets = vec![net(0, vec![seg(500)]), net(1, vec![seg(750)]), net(2, vec![seg(950)])];
+        // Marker 500..600, bloated by 200: 300..800 — reaches nets 0 and 1, not 2.
+        assert_eq!(near_drc_ripped(&t, &nets, &[marker(Rect::new(500, 400, 600, 500), &[])], &route), vec![0, 1]);
+        // A marker outside the route box rips nothing, however close its bloat comes.
+        assert!(near_drc_ripped(&t, &nets, &[marker(Rect::new(1050, 400, 1100, 500), &[])], &route).is_empty());
+    }
+
+    // Rule (`route_queue_init_queue`, NEARDRC): counting down from the number of ripped nets, in
+    // marker order and then worker order, each ripped net a marker names gets the next value once.
+    #[test]
+    fn near_drc_priorities_count_down_in_marker_order() {
+        let nets: Vec<DrNet> = (0..4).map(|i| net(i, Vec::new())).collect();
+        let name = |i: usize| format!("n{i}");
+        let ms = [marker(Rect::new(0, 0, 1, 1), &["n2"]), marker(Rect::new(0, 0, 1, 1), &["n0", "n2", "n3"])];
+        // Ripped: 0, 2, 3 (net 1 was not). n2 first (marker 0): 3; then n0: 2; n3: 1; net 1 keeps 0.
+        assert_eq!(near_drc_priorities(&nets, &[0, 2, 3], &ms, &name), vec![2, 0, 3, 1]);
     }
 }

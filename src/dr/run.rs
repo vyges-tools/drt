@@ -428,19 +428,18 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut) -> Res<(DesignRoutes,
     let mut routes = DesignRoutes::with_initial(&p.tech, crate::dr::db::initial_shapes(&p.tech, &d.design.nets, &d.insts, &d.masters, &d.ports, &d.initial)?);
     let mut flow = FlowState::default();
     let mut clip = ClipSize::default();
+    let mut increase_clip = false;
     let mut iterations = 0;
     for (iter, row) in strategy(ROUTE_SHAPE_COST, MARKER_COST).into_iter().enumerate() {
         if iter > crate::dr::flow::END_ITERATION {
             break;
         }
-        // From iteration 7 a congested worker widens the clip of later rows: not modelled.
-        if iter >= 7 {
-            return Err(format!("iteration {iter} reached with markers standing: congestion-driven clip growth not modelled"));
-        }
         let mut args = row;
-        args.size = clip.size(&row, false);
+        // `increaseClipsize_`: set by a congested worker of the last OPTIMIZATION iteration (the only
+        // flow that resets and sets it), read at the start of every row that does not rip up all.
+        args.size = clip.size(&row, increase_clip);
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
-        search_repair(&cx, &mut routes, &mut flow, iter, &args)?;
+        search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip)?;
         iterations = iter + 1;
         if routes.markers().next().is_none() {
             break;
@@ -514,16 +513,14 @@ impl DrCtx<'_> {
 
 /// One search-and-repair iteration: the flow for this iteration, its workers in batches, each batch
 /// routed then written back worker by worker; the connectivity check after.
-fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut FlowState, iter: usize, args: &crate::dr::flow::IterArgs) -> Res<()> {
+fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut FlowState, iter: usize, args: &crate::dr::flow::IterArgs, increase_clip: &mut bool) -> Res<()> {
     let flow = flow_state.next(routes.markers().count(), args, false);
     if matches!(args.ripup, RipUp::Drc | RipUp::NearDrc) && routes.markers().next().is_none() {
         return Ok(());
     }
-    let ripup_all = match args.ripup {
-        RipUp::All | RipUp::Incr => true,
-        RipUp::Drc => false,
-        other => return Err(format!("rip-up mode {other:?} in iteration {iter} not modelled")),
-    };
+    // Every rip-up mode is modelled: ALL and INCR start from nets, DRC from markers, NEARDRC from
+    // the nets near them.
+    let ripup_all = matches!(args.ripup, RipUp::All | RipUp::Incr);
     let tech = &cx.p.tech;
     let mt = mt_safe_dist(&cx.d.ndrs.iter().collect::<Vec<_>>());
     let batches: Vec<Vec<WorkerBoxes>> = match flow {
@@ -554,13 +551,21 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         Flow::Skip => Vec::new(),
     };
     let mut changed = false;
+    // optimizationFlow clears the flag before its workers; endWorkersBatch sets it for any
+    // congested worker. The tile flows touch neither.
+    if flow == Flow::Optimization {
+        *increase_clip = false;
+    }
     for group in batches {
         let mut results = Vec::new();
         for w in group {
             results.push(route_worker(cx, routes, iter, args, ripup_all, &w)?);
         }
+        if flow == Flow::Optimization && results.iter().any(|r| r.4) {
+            *increase_clip = true;
+        }
         // The batch written back, worker by worker.
-        for (w, routed, markers, wm) in &results {
+        for (w, routed, markers, wm, _) in &results {
             let best = in_check_box(markers, &w.drc).len();
             if !written_back(iter, args.ripup, wm, best) {
                 continue;
@@ -600,14 +605,14 @@ fn stubborn_tiles_flow(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &m
         }
         // Per worker id, the first with the fewest markers in its check box.
         let mut best: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
-        for (k, (id, (w, _, markers, _))) in results.iter().enumerate() {
+        for (k, (id, (w, _, markers, _, _))) in results.iter().enumerate() {
             let n = in_check_box(markers, &w.drc).len();
             if best.get(id).is_none_or(|&(_, b)| n < b) {
                 best.insert(*id, (k, n));
             }
         }
         for (_, (k, n)) in best {
-            let (_, (w, routed, markers, wm)) = &results[k];
+            let (_, (w, routed, markers, wm, _)) = &results[k];
             if !written_back(iter, args.ripup, wm, n) {
                 continue;
             }
@@ -619,7 +624,9 @@ fn stubborn_tiles_flow(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &m
     Ok(())
 }
 
-type WorkerResult = (WorkerBoxes, Vec<(usize, Vec<DrFig>)>, Vec<Marker>, crate::dr::flow::WorkerMarkers);
+/// A routed worker: its boxes, each net's routes, its markers, its starting markers, and whether
+/// it found itself congested (`identifyCongestionLevel`, iterations 7 to 30).
+type WorkerResult = (WorkerBoxes, Vec<(usize, Vec<DrFig>)>, Vec<Marker>, crate::dr::flow::WorkerMarkers, bool);
 
 /// One worker: its nets, grid, costs and queue. Its routed nets' shapes, its final markers.
 fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, w: &WorkerBoxes) -> Res<WorkerResult> {
@@ -641,7 +648,13 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     };
     let mut nets = built;
     if nets.is_empty() {
-        return Ok((*w, Vec::new(), Vec::new(), wm));
+        return Ok((*w, Vec::new(), Vec::new(), wm, false));
+    }
+    // NEARDRC (`initRipUpNetsFromMarkers`, in initNets before any cost): the nets near a starting
+    // marker lose their routes here, so those never cost.
+    let near_ripped = if args.ripup == RipUp::NearDrc { crate::dr::route::near_drc_ripped(tech, &nets, &wm.markers, &w.route) } else { Vec::new() };
+    for &i in &near_ripped {
+        nets[i].route.clear();
     }
     let gcfg = GridConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: d.cfg.top_routing_layer };
     let (xm, ym, zs) = grid_maps(tech, &d.tracks, &gcfg, &w.route, &w.ext, &nets);
@@ -690,15 +703,20 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     };
     let mut cw = CostWorker { cx: &ccx, g: &mut g, ap_svia: Default::default() };
     init_maze_cost(&mut cw, &nets, &w.ext, &rule_of).map_err(|e| e.0)?;
-    let (routed, markers) = run_queue(cx, &mut cw, &nets, &wm, iter, args, ripup_all, w);
-    Ok((*w, routed, markers, wm))
+    let (routed, markers) = run_queue(cx, &mut cw, &nets, &wm, iter, args, ripup_all, &near_ripped, w);
+    // identifyCongestionLevel, at the worker's end, iterations 7 to 30.
+    let congested = (7..=30).contains(&iter) && {
+        let pts: Vec<Vec<((i32, i32), usize)>> = nets.iter().map(|n| n.pins.iter().filter(|p| p.term.is_none()).flat_map(|p| p.patterns.iter().map(|a| (a.point, a.layer))).collect()).collect();
+        crate::dr::flow::worker_congested(&pts, &w.route, &zs, &|l| tech.layers[l].dir == crate::tech::Dir::Vertical, &d.tracks)
+    };
+    Ok((*w, routed, markers, wm, congested))
 }
 
 /// The worker's search-and-repair queue: the nets it rerouted (every worker net of a net any of
 /// whose worker nets rerouted, in worker order: a rerouted one's last shapes, another's the
 /// routes it started from) and its final markers.
 #[allow(clippy::too_many_arguments)]
-fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &crate::dr::flow::WorkerMarkers, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, w: &WorkerBoxes) -> (Vec<(usize, Vec<DrFig>)>, Vec<Marker>) {
+fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &crate::dr::flow::WorkerMarkers, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, near_ripped: &[usize], w: &WorkerBoxes) -> (Vec<(usize, Vec<DrFig>)>, Vec<Marker>) {
     let (d, p, t) = (cx.d, cx.p, cx.t);
     let tech = &p.tech;
     let (r, e) = (w.route, w.ext);
@@ -768,7 +786,8 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
         max_ndr_spacing: &max_ndr,
         marker_decay: args.decay,
         maze_end_iter: args.maze_end,
-        markers_drive: !ripup_all,
+        // The gc-version skip is DRC's alone (not NEARDRC's).
+        markers_drive: args.ripup == RipUp::Drc,
         pinned: &|i: usize| crate::dr::flow::ripup_pinned(args.ripup, d.initial[nets[i].net].is_some()),
     };
     // The design's markers in the check box (or, with a re-check marker there, a check's; copies
@@ -779,15 +798,25 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     let abs = |n: &DrNet| abs_priority(st_nets[n.net].is_clock, st_nets[n.net].ndr.is_some());
     let net_name = |n: &DrNet| st_nets[n.net].name.as_str();
     let ndr_of = |n: &DrNet| -> Option<crate::dr::cost::Ndr<'_>> { nets.iter().position(|x| std::ptr::eq(x, n)).and_then(|i| ndr_eol[i]) };
-    let ripped = |n: &DrNet| crate::dr::flow::first_ripped(args.ripup, n.pins.len(), d.initial[n.net].is_some());
-    let order = if ripup_all { init_queue(cw, nets, &abs, &net_name, &ndr_of, &|k| t.macro_term[k], &ripped) } else { Vec::new() };
+    // NEARDRC routes its ripped nets (their priorities from the markers the queue starts from —
+    // after any re-check), reserving their vias as rip-up-all does but never unreserving them.
+    let near = args.ripup == RipUp::NearDrc;
+    let prio = if near { crate::dr::route::near_drc_priorities(nets, near_ripped, &worker_markers, &name_of) } else { vec![0; nets.len()] };
+    let ripped = |n: &DrNet| {
+        if near {
+            nets.iter().position(|x| std::ptr::eq(x, n)).is_some_and(|i| near_ripped.contains(&i))
+        } else {
+            crate::dr::flow::first_ripped(args.ripup, n.pins.len(), d.initial[n.net].is_some())
+        }
+    };
+    let order = if ripup_all || near { init_queue(cw, nets, &abs, &net_name, &ndr_of, &|k| t.macro_term[k], &ripped, &|i| prio[i]) } else { Vec::new() };
     let mut mst = MazeState::new(tech, cw.g, d.die);
     if !args.follow_guide {
         mst.all_guided();
     }
     let mut last: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
     let mut final_markers = Vec::new();
-    let start = if ripup_all { Start::Nets(&order) } else { Start::Markers(&worker_markers) };
+    let start = if ripup_all || near { Start::Nets(&order) } else { Start::Markers(&worker_markers) };
     for ev in route_queue(cw, &mut mst, &q, nets, start, hist) {
         match ev {
             Event::Route { net, figs, .. } => {

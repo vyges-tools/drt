@@ -115,5 +115,6 @@ Refused rather than approximated: any other rule family a layer carries (named i
 `reason`); a multi-patterned routing layer; spacing limited to a width range; a cell whose
 obstructions carry `DESIGNRULEWIDTH` or `SPACING`; a non-default rule with hard spacing, via
 generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
-the database; congested input guides; and a run that still has
-markers at iteration 7, where congestion-driven clip growth begins.
+the database; and congested input guides. Past iteration 7 the router widens the clip of
+congested workers, and from iteration 23 rips up the nets near each marker (NEARDRC); both follow
+the reference, though no correlated design exercises them yet.

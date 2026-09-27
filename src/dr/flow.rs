@@ -505,6 +505,58 @@ pub fn stubborn_batches(boxes: &[Vec<Rect>], bloat: i32) -> Vec<Vec<usize>> {
     batches
 }
 
+/// ⚠️ UNWITNESSED: no corpus worker is ever congested (single_row, the only design past iteration
+/// 7, has none). Transcribed from the reference and pinned by a unit test only.
+///
+/// `identifyCongestionLevel` (a worker's end, iterations 7 to 30): the nets with boundary access
+/// points on BOTH the low and the high side of the route box (on a vertical layer the bottom and
+/// top, on a horizontal one the left and right) count their boundary points per grid layer from
+/// z = 4 up; a layer is congested when the larger side reaches 0.4 of its tracks across the box —
+/// the box's height on a horizontal layer, its width on a vertical one, over the spacing of the
+/// LAST track pattern of the crossing kind (a horizontal layer's horizontal lines). The division is
+/// in float, as the reference's: no tracks makes an infinite factor, or NaN with no crossings.
+/// `pts`: per worker net, its boundary pins' access points (point, layer); `zs`: the grid's layers.
+pub fn worker_congested(pts: &[Vec<((i32, i32), usize)>], route: &Rect, zs: &[usize], vertical: &dyn Fn(usize) -> bool, tracks: &[crate::tech::TrackPattern]) -> bool {
+    let side = |(x, y): (i32, i32), l: usize| -> (bool, bool) {
+        if vertical(l) {
+            (y == route.yl, y != route.yl && y == route.yh)
+        } else {
+            (x == route.xl, x != route.xl && x == route.xh)
+        }
+    };
+    let mut low = vec![0i32; zs.len()];
+    let mut high = vec![0i32; zs.len()];
+    for net in pts {
+        let (lo, hi) = net.iter().fold((false, false), |(a, b), &(p, l)| {
+            let (sl, sh) = side(p, l);
+            (a || sl, b || sh)
+        });
+        if !(lo && hi) {
+            continue;
+        }
+        for &(p, l) in net {
+            let Some(z) = zs.iter().position(|&x| x == l) else { continue };
+            if z < 4 {
+                continue;
+            }
+            let (sl, sh) = side(p, l);
+            low[z] += i32::from(sl);
+            high[z] += i32::from(sh);
+        }
+    }
+    for (z, &l) in zs.iter().enumerate() {
+        let horizontal = !vertical(l);
+        let Some(tp) = tracks.iter().rev().find(|t| t.layer == l && t.vertical_tracks != horizontal) else { continue };
+        let size = if horizontal { route.yh - route.yl } else { route.xh - route.xl };
+        let n = size / tp.spacing;
+        let factor = (low[z].max(high[z])) as f32 / n as f32;
+        if factor >= 0.4 {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +719,30 @@ mod tests {
         assert_eq!(c.size(&s[3], true), 9);
         assert_eq!(c.size(&s[4], false), 9);
         assert_eq!(c.size(&s[5], false), 9);
+    }
+
+    // Rule (`identifyCongestionLevel`): only nets crossing BOTH sides count, only from grid z = 4 up,
+    // against the tracks across the box of the last pattern of the crossing kind; 0.4 is the line.
+    #[test]
+    fn a_worker_is_congested_when_crossings_reach_forty_percent_of_its_tracks() {
+        use crate::tech::TrackPattern;
+        let route = Rect::new(0, 0, 1000, 1000);
+        let zs = [2, 4, 6, 8, 10];
+        let vertical = |l: usize| l.is_multiple_of(4); // 4 and 8 vertical, 2, 6, 10 horizontal
+        // Layer 10 (z = 4, horizontal): horizontal lines every 100 → 10 tracks across the height.
+        // An earlier pattern of the same kind is ignored: the LAST one counts.
+        let tracks = [TrackPattern { layer: 10, vertical_tracks: false, start: 0, num: 10, spacing: 50 }, TrackPattern { layer: 10, vertical_tracks: false, start: 0, num: 10, spacing: 100 }];
+        let crossing = |y: i32| vec![((0, y), 10), ((1000, y), 10)];
+        // Four nets crossing left to right on layer 10: 4 / 10 = 0.4 → congested.
+        let four: Vec<_> = (0..4).map(|k| crossing(100 * k)).collect();
+        assert!(worker_congested(&four, &route, &zs, &vertical, &tracks));
+        // Three: 0.3, not.
+        assert!(!worker_congested(&four[..3], &route, &zs, &vertical, &tracks));
+        // A net touching only ONE side does not count, however many points it has.
+        let one_side: Vec<_> = (0..6).map(|k| vec![((0, 100 * k), 10)]).collect();
+        assert!(!worker_congested(&one_side, &route, &zs, &vertical, &tracks));
+        // Below z = 4 nothing is counted: the same crossings on layer 8 (z = 3).
+        let low_z: Vec<_> = (0..6).map(|k| vec![((100 * k, 0), 8), ((100 * k, 1000), 8)]).collect();
+        assert!(!worker_congested(&low_z, &route, &zs, &vertical, &[TrackPattern { layer: 8, vertical_tracks: true, start: 0, num: 10, spacing: 100 }]));
     }
 }
