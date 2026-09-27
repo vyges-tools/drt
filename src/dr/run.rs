@@ -13,7 +13,7 @@ use vyges_opendb::Db;
 use crate::dr::cost::{init_maze_cost, CostCtx, CostWorker, DrFig};
 use crate::dr::db::TaDesign;
 use crate::dr::design::{connectivity_check, DesignRoutes, WriteBack};
-use crate::dr::drw::{gcell_boundary_pins, grid_maps, init_edges, init_nets_init_dr, init_nets_search_repair, localize_ext, merge_boundary_pins, mt_safe_dist, worker_batches, worker_groups, DrAp, DrNet, DrNetInput, DrPin, DrTerm, GridConfig, WorkerBoxes, BATCH_SIZE};
+use crate::dr::drw::{access_point_locations, gcell_boundary_pins, grid_maps, init_edges, init_nets_init_dr, init_nets_search_repair, localize_ext, merge_boundary_pins, mt_safe_dist, worker_batches, worker_groups, DrAp, DrNet, DrNetInput, DrPin, DrTerm, GridConfig, WorkerBoxes, BATCH_SIZE};
 use crate::dr::flow::{guide_tile_boxes, in_check_box, strategy, tile_batches, worker_markers, written_back, ClipSize, Flow, FlowState, RipUp, MARKER_COST, ROUTE_SHAPE_COST};
 use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig, GuideNet, GuidePin};
 use crate::dr::maze::{MazeCfg, MazeState};
@@ -663,7 +663,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     }
     let gcfg = GridConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: d.cfg.top_routing_layer };
     let (xm, ym, zs) = grid_maps(tech, &d.tracks, &gcfg, &w.route, &w.ext, &nets);
-    let mut g = init_edges(tech, &p.defaults, &gcfg, &xm, &ym, &zs, &w.route, &d.die);
+    let mut g = init_edges(tech, &p.defaults, &gcfg, &xm, &ym, &zs, &w.route, &d.die, &access_point_locations(tech, &gcfg, &nets));
     localize_ext(tech, &g, &w.ext, &mut nets);
     let rule_of = |n: &DrNet| -> Option<(&NdrRule, &[Option<EolTable>])> {
         let r = d.design.nets[n.net].ndr.as_ref()?;

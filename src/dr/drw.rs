@@ -1020,6 +1020,43 @@ pub fn non_pref_layer(tech: &crate::tech::Tech, cfg: &GridConfig, l: usize) -> O
     None
 }
 
+/// The layers an access point's coordinate joins the grid on (`initTrackCoords_pin`): from its
+/// layer, two at a time, to the next one routed across it (clamped into the routing layers).
+fn ap_layers(tech: &crate::tech::Tech, cfg: &GridConfig, begin: usize) -> Vec<usize> {
+    let end = if begin < cfg.bottom_routing_layer {
+        cfg.bottom_routing_layer
+    } else if begin > cfg.top_routing_layer {
+        cfg.top_routing_layer
+    } else {
+        non_pref_layer(tech, cfg, begin).unwrap_or(begin)
+    };
+    let mut out = vec![begin];
+    let mut l = begin;
+    while l != end {
+        l = if end > l { l + 2 } else { l - 2 };
+        out.push(l);
+    }
+    out
+}
+
+/// Per layer, the access-point locations (`FlexGridGraph::ap_locs_`, filled with the grid
+/// coordinates in `initTrackCoords_pin`): each access point of every pin, on each of its
+/// [`ap_layers`]. Read by [`init_edges`] only — the reference clears them once the edges exist.
+pub fn access_point_locations(tech: &crate::tech::Tech, cfg: &GridConfig, nets: &[DrNet]) -> ApLocs {
+    let mut out = ApLocs::new();
+    for pin in nets.iter().flat_map(|n| &n.pins) {
+        for ap in &pin.patterns {
+            for l in ap_layers(tech, cfg, ap.layer) {
+                out.insert((l, ap.point));
+            }
+        }
+    }
+    out
+}
+
+/// (layer, point) of every access point location; see [`access_point_locations`].
+pub type ApLocs = BTreeSet<(usize, (i32, i32))>;
+
 /// Per layer, per coordinate: whether it is a real track (`true`) or added for an access point, a
 /// route or a box side (`false`). Layer `None` holds the route and extended boxes' sides.
 pub type CoordMaps = BTreeMap<Option<usize>, BTreeMap<i32, bool>>;
@@ -1076,26 +1113,11 @@ pub fn grid_maps(tech: &crate::tech::Tech, tracks: &[crate::tech::TrackPattern],
         }
         for pin in &net.pins {
             for ap in &pin.patterns {
-                let mut l = ap.layer;
-                let end = if l < cfg.bottom_routing_layer {
-                    cfg.bottom_routing_layer
-                } else if l > cfg.top_routing_layer {
-                    cfg.top_routing_layer
-                } else {
-                    non_pref_layer(tech, cfg, l).unwrap_or(l)
-                };
-                loop {
+                for l in ap_layers(tech, cfg, ap.layer) {
                     if tech.layers[l].is_horizontal() {
                         ym.entry(Some(l)).or_default().insert(ap.point.1, false);
                     } else {
                         xm.entry(Some(l)).or_default().insert(ap.point.0, false);
-                    }
-                    if end > l {
-                        l += 2;
-                    } else if end < l {
-                        l -= 2;
-                    } else {
-                        break;
                     }
                 }
             }
@@ -1204,7 +1226,7 @@ impl GridGraph {
 /// ⚠️ An off-track cost bit is set whether or not its edge was added (outside the route box it
 /// was not).
 #[allow(clippy::too_many_arguments)]
-pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &GridConfig, xm: &CoordMaps, ym: &CoordMaps, zs: &[usize], route_box: &Rect, die: &Rect) -> GridGraph {
+pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &GridConfig, xm: &CoordMaps, ym: &CoordMaps, zs: &[usize], route_box: &Rect, die: &Rect, ap_locs: &ApLocs) -> GridGraph {
     let (xs, ys) = (coords(xm), coords(ym));
     let mut g = GridGraph { nodes: vec![Node::default(); xs.len() * ys.len() * zs.len()], xs, ys, zs: zs.to_vec() };
     let empty: BTreeMap<i32, bool> = BTreeMap::new();
@@ -1253,6 +1275,9 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
         let non_pref = if l + 2 <= cfg.top_routing_layer { l + 2 } else if l >= 2 { l - 2 } else { l };
         let in_range = l >= cfg.bottom_routing_layer && l <= cfg.top_routing_layer;
         let horizontal = tech.layers[l].is_horizontal();
+        // Right-way-on-grid-only: a right-way edge only on a real track; an up-via off the grid
+        // only at an access point location.
+        let rwogo = tech.layers[l].right_way_on_grid_only;
         let (own, up2, np) = if horizontal { (map(ym, l), map(xm, l + 2), map(xm, non_pref)) } else { (map(xm, l), map(ym, l + 2), map(ym, non_pref)) };
         // Preferred edges and up-vias.
         let (outer, inner) = if horizontal { (ny, nx) } else { (nx, ny) };
@@ -1262,7 +1287,7 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
             for i in 0..inner {
                 let (x, y) = if horizontal { (i, o) } else { (o, i) };
                 let ood = out_of_die_via(&g, x, y, l);
-                if in_range && (!ood || !has_out_of_die_viol(&g, x, y, l)) {
+                if in_range && (!ood || !has_out_of_die_viol(&g, x, y, l)) && (!rwogo || track) {
                     let (x2, y2) = if horizontal { (x + 1, y) } else { (x, y + 1) };
                     let added = x2 < nx && y2 < ny && in_box((g.xs[x], g.ys[y])) && in_box((g.xs[x2], g.ys[y2]));
                     let border = if horizontal { oc == route_box.yl || oc == route_box.yh } else { oc == route_box.xl || oc == route_box.xh };
@@ -1280,9 +1305,12 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
                 }
                 let ic = if horizontal { g.xs[x] } else { g.ys[y] };
                 let Some(&track2) = up2.get(&ic) else { continue };
-                let k = g.idx(x, y, z);
-                g.nodes[k].up |= z + 1 < zs.len() && in_box((g.xs[x], g.ys[y]));
-                g.nodes[k].grid_cost_u |= !(track && track2);
+                let on_grid = track && track2;
+                if on_grid || !rwogo || ap_locs.contains(&(l, (g.xs[x], g.ys[y]))) {
+                    let k = g.idx(x, y, z);
+                    g.nodes[k].up |= z + 1 < zs.len() && in_box((g.xs[x], g.ys[y]));
+                    g.nodes[k].grid_cost_u |= !on_grid;
+                }
             }
         }
         // Non-preferred edges along the coordinates of the layer routed across.
@@ -1418,13 +1446,36 @@ mod tests {
         for ro in [true, false] {
             let (t, tracks, defaults, cfg, b) = uni(ro);
             let (xm, ym, zs) = grid_maps(&t, &tracks, &cfg, &b, &b, &[]);
-            let g = init_edges(&t, &defaults, &cfg, &xm, &ym, &zs, &b, &b);
+            let g = init_edges(&t, &defaults, &cfg, &xm, &ym, &zs, &b, &b, &ApLocs::new());
             let x = g.xs.iter().position(|&c| c == 100).unwrap();
             let y1 = g.ys.iter().position(|&c| c == 100).unwrap();
             let y3 = g.ys.iter().position(|&c| c == 300).unwrap();
             assert_eq!(g.nodes[g.idx(x, y3, 0)].north, !ro);
             assert_eq!(g.nodes[g.idx(x, y1, 0)].east, !ro);
             assert!(g.nodes[g.idx(x, y3, 0)].east);
+        }
+    }
+
+    // Rule (`FlexGridGraph::initEdges`, right-way-on-grid-only): on such a layer a right-way edge
+    // runs only along a real track (not along a coordinate an access point added), and an up-via
+    // off the grid only at an access point location (`isAccessPointLocation`) — there it costs as
+    // off-grid. Without the constraint both exist. Layer 2 is horizontal; y = 400 is off-track.
+    #[test]
+    fn a_right_way_on_grid_only_layer_keeps_edges_on_tracks_and_off_grid_vias_at_access_points() {
+        for rwogo in [true, false] {
+            let (mut t, tracks, defaults, cfg, b) = uni(false);
+            t.layers[2].right_way_on_grid_only = rwogo;
+            let (xm, mut ym, zs) = grid_maps(&t, &tracks, &cfg, &b, &b, &[]);
+            ym.entry(Some(2)).or_default().insert(400, false);
+            let g = init_edges(&t, &defaults, &cfg, &xm, &ym, &zs, &b, &b, &ApLocs::new());
+            let x = g.xs.iter().position(|&c| c == 300).unwrap();
+            let (y3, y4) = (g.ys.iter().position(|&c| c == 300).unwrap(), g.ys.iter().position(|&c| c == 400).unwrap());
+            assert!(g.nodes[g.idx(x, y3, 0)].east && g.nodes[g.idx(x, y3, 0)].up);
+            assert_eq!(g.nodes[g.idx(x, y4, 0)].east, !rwogo);
+            assert_eq!(g.nodes[g.idx(x, y4, 0)].up, !rwogo);
+            let at_ap = init_edges(&t, &defaults, &cfg, &xm, &ym, &zs, &b, &b, &ApLocs::from([(2, (300, 400))]));
+            let n = &at_ap.nodes[at_ap.idx(x, y4, 0)];
+            assert!(n.up && n.grid_cost_u);
         }
     }
 

@@ -67,6 +67,11 @@ pub struct Layer {
     /// A rect-only routing layer: every polygon of a net on it must be one rectangle (where its
     /// own fixed shapes do not already break that), and it is UNIDIRECTIONAL.
     pub rect_only: bool,
+    /// The layer carries the right-way-on-grid-only constraint: io makes it for RIGHTWAYONGRIDONLY
+    /// OR a multi-patterned layer (`numMasks > 1`, refused before routing). Its consumers: pin
+    /// access (on-grid points only), the maze grid (right-way edges on tracks only; an off-grid via
+    /// only at an access point) and, through `Tech::allow_pin_feedthrough`, guides and the maze.
+    pub right_way_on_grid_only: bool,
 }
 
 /// An end-of-line spacing rule: a line end narrower than `width` needs `space` to a facing edge
@@ -605,7 +610,8 @@ pub mod read {
                     // Only the plain flag makes the constraint; "except non-core pins" alone is
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only });
+                    let right_way_on_grid_only = db.layer_is_right_way_on_grid_only(&name) || db.layer_get_num_masks(&name) > 1;
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;

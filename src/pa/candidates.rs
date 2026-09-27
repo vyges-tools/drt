@@ -224,6 +224,9 @@ fn create_multiple(cx: &Context<'_>, out: &mut Vec<Candidate>, apset: &mut BTree
 fn coords_from_rect(cx: &Context<'_>, rect: Rect, layer: usize, lower: ApType, upper: ApType, is_macro: bool) -> (BTreeMap<i32, ApType>, BTreeMap<i32, ApType>) {
     let tech = cx.tech;
     let (mut xs, mut ys) = (BTreeMap::new(), BTreeMap::new());
+    if only_allow_on_grid_access(tech, layer, is_macro) && upper != ApType::OnGrid {
+        return (xs, ys);
+    }
     let l = &tech.layers[layer];
     if rect.dx().min(rect.dy()) < l.min_width {
         return (xs, ys);
@@ -232,7 +235,7 @@ fn coords_from_rect(cx: &Context<'_>, rect: Rect, layer: usize, lower: ApType, u
     let horz = l.is_horizontal();
     let hwidth = l.width / 2;
     let mut use_center_line = false;
-    if is_macro {
+    if is_macro && !l.right_way_on_grid_only {
         let rect_horz = rect.dx() >= rect.dy();
         if (rect_horz && horz) || (!rect_horz && !horz) {
             let w = l.width;
@@ -263,6 +266,12 @@ fn coords_from_rect(cx: &Context<'_>, rect: Rect, layer: usize, lower: ApType, u
         }
     }
     (xs, ys)
+}
+
+/// `OnlyAllowOnGridAccess`: a standard-cell pin whose layer two up (the via's upper layer) is
+/// right-way-on-grid-only gets on-grid via access only. A macro or IO pin never does.
+fn only_allow_on_grid_access(tech: &Tech, layer: usize, is_macro: bool) -> bool {
+    !is_macro && layer + 2 <= tech.top_layer_num() && tech.layers[layer + 2].right_way_on_grid_only
 }
 
 /// One class's coordinates across `layer_num`'s direction.
@@ -391,6 +400,39 @@ mod tests {
         let cx = Context::new(&t, &[]);
         let (xs, ys) = coords_from_rect(&cx, Rect::new(0, 0, 160, 1000), 2, ApType::Center, ApType::Center, false);
         assert!(xs.is_empty() && ys.is_empty());
+    }
+
+    /// Rule (`OnlyAllowOnGridAccess`, `genAPsFromRect`): a standard-cell pin whose layer two up is
+    /// right-way-on-grid-only makes no coordinates in a round whose upper class is not OnGrid; a
+    /// macro or IO pin is not restricted.
+    #[test]
+    fn a_right_way_on_grid_only_upper_layer_allows_on_grid_via_access_only() {
+        let mut t = tech(vec![]);
+        t.layers[4].right_way_on_grid_only = true;
+        let cx = Context::new(&t, &[]);
+        let rect = Rect::new(0, 0, 400, 1000);
+        let (xs, ys) = coords_from_rect(&cx, rect, 2, ApType::Center, ApType::Center, false);
+        assert!(xs.is_empty() && ys.is_empty());
+        // The OnGrid upper round still runs: li1's centre x.
+        let (xs, _) = coords_from_rect(&cx, rect, 2, ApType::Center, ApType::OnGrid, false);
+        assert_eq!(xs, BTreeMap::from([(200, ApType::Center)]));
+        // A macro pin is not restricted.
+        let (xs, _) = coords_from_rect(&cx, rect, 2, ApType::Center, ApType::Center, true);
+        assert_eq!(xs, BTreeMap::from([(200, ApType::Center)]));
+    }
+
+    /// Rule (`genAPsFromRect`): a macro pin's thin right-way rectangle takes its centre line (every
+    /// coordinate on it OnGrid) — unless its layer is right-way-on-grid-only; then the costed
+    /// rounds run, and with no tracks the OnGrid round finds nothing.
+    #[test]
+    fn a_right_way_on_grid_only_layer_takes_no_centre_line() {
+        let mut t = tech(vec![]);
+        let rect = Rect::new(0, 0, 1000, 200);
+        let (_, ys) = coords_from_rect(&Context::new(&t, &[]), rect, 4, ApType::OnGrid, ApType::OnGrid, true);
+        assert_eq!(ys, BTreeMap::from([(100, ApType::OnGrid)]));
+        t.layers[4].right_way_on_grid_only = true;
+        let (_, ys) = coords_from_rect(&Context::new(&t, &[]), rect, 4, ApType::OnGrid, ApType::OnGrid, true);
+        assert!(ys.is_empty());
     }
 
     /// Rule (nearby-track rounds): the point recorded as made is the path's first bend when the

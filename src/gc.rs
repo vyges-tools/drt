@@ -2054,9 +2054,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),

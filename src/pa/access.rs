@@ -260,6 +260,21 @@ pub fn create_access_point(pin: &Pin<'_>, point: (i32, i32), layer: usize, lower
             _ => {}
         }
     }
+    // Right-way-on-grid-only forbids off-track right-way planar access: unless the point is on a
+    // track across the layer (its lower class OnGrid), no access along the layer's direction.
+    if allow_planar && l.right_way_on_grid_only && lower != ApType::OnGrid {
+        match l.dir {
+            Dir::Horizontal => {
+                ap.set(Access::W, false);
+                ap.set(Access::E, false);
+            }
+            Dir::Vertical => {
+                ap.set(Access::N, false);
+                ap.set(Access::S, false);
+            }
+            _ => {}
+        }
+    }
     ap
 }
 
@@ -672,6 +687,22 @@ mod tests {
         let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
         let a = create_access_point(&pin, (0, 0), 2, ApType::OnGrid, ApType::OnGrid);
         assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [true, true, false, false]);
+    }
+
+    /// Rule (`createSingleAccessPoint`): right-way-on-grid-only forbids off-track right-way planar
+    /// access — l2 is vertical, so a point whose lower class is not OnGrid loses N and S; an
+    /// OnGrid one keeps them. Wrong-way access is untouched.
+    #[test]
+    fn a_right_way_on_grid_only_layer_takes_right_way_access_on_track_only() {
+        let mut t = tech();
+        t.layers[2].right_way_on_grid_only = true;
+        let cx = Context::new(&t, &[]);
+        let (c, owner) = (cfg(true), Owner::Net("n".into()));
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let a = create_access_point(&pin, (0, 0), 2, ApType::Center, ApType::OnGrid);
+        assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [false, false, true, true]);
+        let a = create_access_point(&pin, (0, 0), 2, ApType::OnGrid, ApType::Center);
+        assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [true, true, true, true]);
     }
 
     /// Rule: a via's segment may leave it the wrong way on its other layer only when that layer
