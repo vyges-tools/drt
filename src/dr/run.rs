@@ -827,7 +827,9 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
             Event::Route { net, figs, .. } => {
                 last.insert(net, figs);
             }
-            Event::Final { markers } => final_markers = markers,
+            // A check patch joins the net's route (and marks it modified).
+            Event::Patch { net, fig, .. } => last.entry(net).or_insert_with(|| nets[net].route.clone()).push(fig),
+            Event::Final { markers, .. } => final_markers = markers,
             _ => {}
         }
     }

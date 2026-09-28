@@ -122,6 +122,39 @@ pub fn normalize_marker_order(markers: &mut [Marker]) {
     }
 }
 
+/// A patch the check's surgical fix makes (`drPatchWire`): its layer, origin, box relative to the
+/// origin, and owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchWire {
+    pub layer: usize,
+    pub origin: (i32, i32),
+    pub offset: Rect,
+    pub owner: Owner,
+}
+
+impl PatchWire {
+    pub fn bbox(&self) -> Rect {
+        Rect::new(self.offset.xl + self.origin.0, self.offset.yl + self.origin.1, self.offset.xh + self.origin.0, self.offset.yh + self.origin.1)
+    }
+}
+
+/// `modifyMarkers`: per patch, per marker on its layer whose box touches the patch's, sourced by
+/// the patch's owner and not holding its origin: the box grows to take the origin in.
+pub fn modify_markers(markers: &mut [Marker], patches: &[PatchWire]) {
+    for p in patches {
+        let (b, o) = (p.bbox(), p.origin);
+        for m in markers.iter_mut() {
+            if m.layer != p.layer || !(m.bbox.xl <= b.xh && b.xl <= m.bbox.xh && m.bbox.yl <= b.yh && b.yl <= m.bbox.yh) || !m.owners.contains(&p.owner) {
+                continue;
+            }
+            if m.bbox.xl <= o.0 && o.0 <= m.bbox.xh && m.bbox.yl <= o.1 && o.1 <= m.bbox.yh {
+                continue;
+            }
+            m.bbox = Rect::new(m.bbox.xl.min(o.0), m.bbox.yl.min(o.1), m.bbox.xh.max(o.0), m.bbox.yh.max(o.1));
+        }
+    }
+}
+
 /// A marker side: its owner, layer, rectangle, and whether the shape is fixed.
 pub type Side = (Owner, usize, Rect, bool);
 
@@ -759,10 +792,25 @@ impl<'a> Worker<'a> {
     /// pin, rectangle order), its pins rebuilt from its fixed shapes and these, the new
     /// rectangles in — as the reference's check updates a net it rerouted.
     pub fn replace_route(&mut self, owner: &Owner, route: &[(usize, Rect)], taper: &[(usize, Rect, bool)]) {
-        let i = self.net(owner);
+        self.replace_routes(&[(owner.clone(), route.to_vec(), taper.to_vec())]);
+    }
+
+    /// Several owners' route shapes replaced at once (`updateGCWorker`): every one's rectangles
+    /// out of the trees first, in the order given; then each rebuilt and re-inserted in turn.
+    #[allow(clippy::type_complexity)]
+    pub fn replace_routes(&mut self, batch: &[(Owner, Vec<(usize, Rect)>, Vec<(usize, Rect, bool)>)]) {
+        let ids: Vec<usize> = batch.iter().map(|(o, _, _)| self.net(o)).collect();
+        for &i in &ids {
+            self.remove_route(i);
+        }
+        for (&i, (owner, route, taper)) in ids.iter().zip(batch) {
+            self.insert_route(i, owner, route, taper);
+        }
+    }
+
+    /// An owner's route rectangles out of the trees (layer, pin, rectangle order).
+    fn remove_route(&mut self, i: usize) {
         let n = self.tech.layers.len();
-        let old: Vec<usize> = self.shapes.iter().map(|v| v.len()).collect();
-        let old_spc: Vec<usize> = self.spc.iter().map(|v| v.len()).collect();
         for layer in 0..n {
             for k in 0..self.shapes[layer].len() {
                 if self.alive[layer][k] && self.shapes[layer][k].net == i {
@@ -779,6 +827,14 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+    }
+
+    /// An owner's pins rebuilt from its fixed shapes and these route shapes, the new rectangles
+    /// into the trees.
+    fn insert_route(&mut self, i: usize, owner: &Owner, route: &[(usize, Rect)], taper: &[(usize, Rect, bool)]) {
+        let n = self.tech.layers.len();
+        let old: Vec<usize> = self.shapes.iter().map(|v| v.len()).collect();
+        let old_spc: Vec<usize> = self.spc.iter().map(|v| v.len()).collect();
         {
             let net = &mut self.nets[i];
             net.route = vec![Polygon90Set::new(); n];
@@ -810,6 +866,13 @@ impl<'a> Worker<'a> {
     /// Metal spacing, then metal shapes (minimum width, rect-only), then end-of-line spacing, then
     /// cut spacing, over every owner's shapes; the markers made.
     pub fn run(&mut self) -> &[Marker] {
+        self.run_patched(&[])
+    }
+
+    /// `run`, with `modifyMarkers` for the surgical fix's patches before the markers' final order:
+    /// a marker on a patch's layer, touching its box, sourced by its owner and not holding its
+    /// origin grows to take the origin in.
+    pub fn run_patched(&mut self, patches: &[PatchWire]) -> &[Marker] {
         self.markers.clear();
         self.seen.clear();
         self.check_metal_corner_spacing();
@@ -817,8 +880,20 @@ impl<'a> Worker<'a> {
         self.check_metal_shape();
         self.check_metal_end_of_line();
         self.check_cut_spacing();
+        modify_markers(&mut self.markers, patches);
         normalize_marker_order(&mut self.markers);
         &self.markers
+    }
+
+    /// `checkMetalCornerSpacing` alone, as the surgical fix's patch pass runs it: its markers in
+    /// the order made (the pass then clears them).
+    pub fn corner_markers(&mut self) -> Vec<Marker> {
+        self.markers.clear();
+        self.seen.clear();
+        self.check_metal_corner_spacing();
+        let m = std::mem::take(&mut self.markers);
+        self.seen.clear();
+        m
     }
 
     /// Whether checks start from this owner's shapes.
@@ -1042,11 +1117,28 @@ impl<'a> Worker<'a> {
     /// `checkMetalEndOfLine_eol`; `rule` is the marker's (`EolSpacing` or `Lef58SpacingEndOfLine`,
     /// which also gates each pair on `endToEndHelper`).
     fn check_eol(&mut self, layer: usize, k: usize, r: &EolRule, rule: Rule) {
+        if self.target.is_some() {
+            self.eol_tn(layer, k, r, rule);
+        }
         if !self.is_eol_edge(layer, k, r) {
             return;
         }
         if let Some(has_route) = self.qualifies_as_eol(layer, k, r) {
             self.eol_has_eol(layer, k, r, has_route, rule);
+        }
+    }
+
+    /// `checkMetalEndOfLine_eol_TN` (a target's check only, before the edge's own): every other
+    /// edge in the target edge's own query window that qualifies as a line end is checked AGAINST
+    /// the target edge — so a marker whose line end is another owner's is made first, with that
+    /// owner the victim (the target edge's own check then finds it made).
+    fn eol_tn(&mut self, layer: usize, k: usize, r: &EolRule, rule: Rule) {
+        let q = Self::eol_query_rect(&self.segs[layer][k], r);
+        for i in self.query_segs(layer, &q) {
+            if let Some(has_route) = self.qualifies_as_eol(layer, i, r) {
+                let q2 = Self::eol_query_rect(&self.segs[layer][i], r);
+                self.eol_has_eol_check(layer, (i, k), &q2, has_route, (r, rule));
+            }
         }
     }
 
@@ -1300,7 +1392,9 @@ impl<'a> Worker<'a> {
         if self.query(layer, &probe).iter().any(|&s| overlap(&probe, &self.shapes[layer][s].rect).is_some()) {
             return;
         }
-        self.add_marker(rule, layer, marker, e1.net, e2.net);
+        // The sides are the two EDGES (as rectangles), the line end's the victim.
+        let edge = |s: &Seg| Rect::new(s.from.0.min(s.to.0), s.from.1.min(s.to.1), s.from.0.max(s.to.0), s.from.1.max(s.to.1));
+        self.add_marker_of(rule, layer, marker, (e1.net, edge(e1), e1.fixed), (e2.net, edge(e2), e2.fixed));
     }
 
     // ---- LEF58 corner spacing ----
@@ -2526,6 +2620,23 @@ mod corner_tests {
 }
 
 #[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    // Rule (`modifyMarkers`): a marker on the patch's layer that touches its box, is sourced by its
+    // owner and does not hold its origin grows to take the origin in; any other is left alone.
+    #[test]
+    fn a_patch_stretches_the_markers_it_touches_to_its_origin() {
+        let p = PatchWire { layer: 4, origin: (100, 50), offset: Rect::new(0, -10, 40, 10), owner: Owner::Net("a".into()) };
+        let m = |owner: &str, layer: usize, b: Rect| Marker { rule: Rule::CornerSpacing, layer, bbox: b, owners: vec![Owner::Net(owner.into())], victim: None, aggressor: None };
+        let mut ms = vec![m("a", 4, Rect::new(130, 40, 160, 60)), m("b", 4, Rect::new(130, 40, 160, 60)), m("a", 6, Rect::new(130, 40, 160, 60)), m("a", 4, Rect::new(90, 40, 160, 60)), m("a", 4, Rect::new(141, 40, 160, 60))];
+        modify_markers(&mut ms, &[p]);
+        let boxes: Vec<Rect> = ms.iter().map(|m| m.bbox).collect();
+        assert_eq!(boxes, vec![Rect::new(100, 40, 160, 60), Rect::new(130, 40, 160, 60), Rect::new(130, 40, 160, 60), Rect::new(90, 40, 160, 60), Rect::new(141, 40, 160, 60)]);
+    }
+}
+
+#[cfg(test)]
 mod eol_tests {
     //! End-of-line spacing on constructed geometry: layer 4 (horizontal, width 140, spacing 140)
     //! with an end-of-line rule — space 200, width 150, within 30 — unless a test says otherwise.
@@ -2545,6 +2656,26 @@ mod eol_tests {
 
     fn net(n: &str) -> Owner {
         Owner::Net(n.into())
+    }
+
+    // Rule (`checkMetalEndOfLine_eol_hasEol_helper`): an end-of-line marker's sides are the two
+    // EDGES — the line end (victim) and the edge it faces (aggressor) — not the marker box.
+    // Rule (`checkMetalEndOfLine_eol_TN`): checking only `b` (the target), `a`'s line end is still
+    // checked against `b`'s facing edge first, so the marker's victim is `a`, not the target.
+    #[test]
+    fn an_eol_marker_names_the_two_edges_and_a_target_check_keeps_the_other_line_end() {
+        let t = tech_with(rule());
+        let run = |target: Option<&str>| {
+            let mut w = Worker::new(&t);
+            w.add(&net("a"), 4, Rect::new(0, 0, 1000, 140), false);
+            w.add(&net("b"), 4, Rect::new(1150, -500, 1500, 640), false);
+            w.init();
+            w.target = target.map(net);
+            w.run().iter().filter(|m| m.rule == Rule::EolSpacing).map(|m| (m.victim.clone(), m.aggressor.clone())).collect::<Vec<_>>()
+        };
+        let want = vec![(Some((net("a"), 4, Rect::new(1000, 0, 1000, 140), false)), Some((net("b"), 4, Rect::new(1150, -500, 1150, 640), false)))];
+        assert_eq!(run(None), want);
+        assert_eq!(run(Some("b")), want);
     }
 
     /// The end-of-line markers' boxes.

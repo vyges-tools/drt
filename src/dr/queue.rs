@@ -26,7 +26,7 @@ use crate::dr::cost::{CostWorker, DrFig, Ndr};
 use crate::dr::drw::DrNet;
 use crate::dr::maze::{Idx, MazeCfg, MazeState};
 use crate::dr::route::{after_check, maze_net_end, reroute_net, NetCtx, Search};
-use crate::gc::{Marker, Owner, Rule, Worker};
+use crate::gc::{Marker, Owner, PatchWire, Rule, Worker};
 use crate::polygon90::Rect;
 use crate::rtree::DynRTree;
 
@@ -50,15 +50,18 @@ struct Entry {
 pub enum Event {
     /// A net routed: its worker id, reroutes before, the searches, what it wrote, the check's
     /// markers.
-    Route { net: usize, reroutes: u32, searches: Vec<Search>, figs: Vec<DrFig>, markers: Vec<Marker> },
+    Route { net: usize, reroutes: u32, searches: Vec<Search>, figs: Vec<DrFig>, markers: Vec<Marker>, patches: Vec<PatchWire> },
     /// An owner checked: the markers.
     Check { owner: Owner, markers: Vec<Marker> },
     /// After the queue, the check over every owner: the worker's markers.
-    Final { markers: Vec<Marker> },
+    Final { markers: Vec<Marker>, patches: Vec<PatchWire> },
     /// The check's view of an owner (`VYGD_GC`): `gcinit` / `gcupd` and its maximal rectangles.
     Gc(String),
     /// An entry pushed onto the queue (after its batch was sorted).
     Push { block: Block, num_reroute: i32, do_route: bool, checking: Option<Owner> },
+    /// A check patch written to a worker net (`writeGCPatchesToDRWorker`): the net, the patch as
+    /// written, and how many path points it could move to (0: not moved).
+    Patch { net: usize, fig: DrFig, valid: usize },
 }
 
 /// What the queue reads beyond the costs.
@@ -199,6 +202,17 @@ impl RouteRq {
         }
     }
 
+    /// One shape added to a net's list at index `k` (a written check patch).
+    fn add_fig(&mut self, tech: &crate::tech::Tech, net: usize, k: usize, f: &DrFig) {
+        for (l, r) in Self::rects(tech, f) {
+            while self.trees.len() <= l {
+                self.trees.push(DynRTree::new(Vec::new()));
+            }
+            let id = self.trees[l].insert(r, (net, false, k));
+            self.ids.entry(net).or_default().push((l, id));
+        }
+    }
+
     fn remove_net(&mut self, net: usize) {
         for (l, id) in self.ids.remove(&net).unwrap_or_default() {
             self.trees[l].remove(id);
@@ -309,11 +323,16 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 if gc_dump {
                     events.push(Event::Gc(format!("gcupd|{}", owner_tag(&owner)) + &gw.dump(&owner)));
                 }
-                let m = check(&mut gw, &owner);
+                gw.target = Some(owner.clone());
+                let (m, pw) = gc_main_surgical(&mut gw, q, nets, &state, &rq, Some(i));
                 after_check(w, &nets[i], &figs, cx.ext_box);
+                // The patches go to the net at the point of its paths nearest each.
+                let points: Vec<(i32, i32)> = searches.iter().flat_map(|s| s.path.iter()).map(|m| (w.g.xs[m.0 as usize], w.g.ys[m.1 as usize])).collect();
+                let written = write_gc_patches(q, &mut state, &mut rq, &pw, &points);
                 checked.insert(Block::Owner(owner.clone()), (gc_version, m.len()));
                 last_markers = m.len();
-                events.push(Event::Route { net: i, reroutes, searches, figs, markers: m.clone() });
+                events.push(Event::Route { net: i, reroutes, searches, figs, markers: m.clone(), patches: pw.iter().map(|(_, p)| p.clone()).collect() });
+                events.extend(written);
                 (m, owner)
             }
             (b, _) => {
@@ -349,8 +368,171 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
         }
     }
     gw.target = None;
-    events.push(Event::Final { markers: gw.run().to_vec() });
+    let (m, pw) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None);
+    events.push(Event::Final { markers: m, patches: pw.iter().map(|(_, p)| p.clone()).collect() });
+    events.extend(write_gc_patches(q, &mut state, &mut rq, &pw, &[]));
     events
+}
+
+/// `FlexGCWorker::main` with the surgical fix (the worker's own checks): when the technology has
+/// corner spacing, `patchMetalShape` — `checkMetalCornerSpacing`, then
+/// `patchMetalShape_cornerSpacing` — and the patched nets updated with their patches
+/// (`updateGCWorker`); then the full check and `modifyMarkers`. `target`: the worker net checked
+/// (`setTargetNet(drNet)`), none after the queue. The check's markers and patches.
+/// (The min-area and min-step patching of the same branch are not modelled: neither fires on any
+/// design of the corpora.)
+fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>) -> (Vec<Marker>, Vec<(usize, PatchWire)>) {
+    let mut pw = Vec::new();
+    if q.mcfg.tech.layers.iter().any(|l| !l.corner_spacing.is_empty()) {
+        let markers = gw.corner_markers();
+        pw = patch_corner_spacing(q, state, rq, &markers, target);
+        if !pw.is_empty() {
+            update_patched(gw, q, nets, state, &pw);
+        }
+    }
+    let patches: Vec<PatchWire> = pw.iter().map(|(_, p)| p.clone()).collect();
+    (gw.run_patched(&patches).to_vec(), pw)
+}
+
+/// `patchMetalShape_cornerSpacing`: per corner-spacing marker, the first route shape of a source
+/// net in the worker's region query of the marker's layer (in query order; with a target, only
+/// the target worker net's) whose point lies in the route box — a via (its origin; its box on the
+/// layer), a wire (its end nearer the marker), or a patch (its origin; ⚠️ a patch does not end
+/// the search, a later via or wire replaces it). The marker box, stretched across the layer to
+/// the shape's box and one manufacturing grid further along it (away from the shape when the
+/// shape starts at the marker's far side), becomes a patch there — kept when its box touches the
+/// route box or the route box holds its origin (`isPatchValid`).
+fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, markers: &[Marker], target: Option<usize>) -> Vec<(usize, PatchWire)> {
+    let tech = q.mcfg.tech;
+    let rb = q.route_box;
+    let in_rb = |p: (i32, i32)| rb.xl <= p.0 && p.0 <= rb.xh && rb.yl <= p.1 && p.1 <= rb.yh;
+    let shift = |r: &Rect, o: (i32, i32)| Rect::new(r.xl + o.0, r.yl + o.1, r.xh + o.0, r.yh + o.1);
+    let mut out = Vec::new();
+    for m in markers.iter().filter(|m| m.rule == Rule::CornerSpacing) {
+        let l = m.layer;
+        let mb0 = m.bbox;
+        let mut chosen: Option<(usize, (i32, i32), Rect)> = None;
+        for (ni, ext, k) in rq.query(l, &mb0) {
+            let name = (q.name)(ni);
+            if !m.owners.contains(&Owner::Net(name.clone())) {
+                continue;
+            }
+            if let Some(t) = target {
+                if (q.name)(t) != name || ni != t {
+                    continue;
+                }
+            }
+            match if ext { &state[ni].ext[k] } else { &state[ni].figs[k] } {
+                &DrFig::Via { via, origin, .. } => {
+                    if in_rb(origin) {
+                        let vd = &tech.via_defs[via];
+                        let figs = if vd.layer1 == l { &vd.layer1_figs } else { &vd.layer2_figs };
+                        let b = figs.iter().skip(1).fold(figs[0], |a, f| Rect::new(a.xl.min(f.xl), a.yl.min(f.yl), a.xh.max(f.xh), a.yh.max(f.yh)));
+                        chosen = Some((ni, origin, shift(&b, origin)));
+                        break;
+                    }
+                }
+                &DrFig::Seg { begin, end, width, begin_ext, end_ext, .. } => {
+                    let dist = |p: (i32, i32)| (p.0.clamp(mb0.xl, mb0.xh) - p.0).abs() + (p.1.clamp(mb0.yl, mb0.yh) - p.1).abs();
+                    let o = if dist(begin) < dist(end) { begin } else { end };
+                    if in_rb(o) {
+                        chosen = Some((ni, o, DrFig::seg_box(begin, end, width, begin_ext, end_ext)));
+                        break;
+                    }
+                }
+                &DrFig::Patch { origin, offset, .. } => {
+                    if in_rb(origin) {
+                        chosen = Some((ni, origin, shift(&offset, origin)));
+                    }
+                }
+            }
+        }
+        let Some((ni, origin, fb)) = chosen else { continue };
+        let mb = stretch_corner_patch(mb0, fb, tech.layers[l].is_horizontal(), tech.manufacturing_grid);
+        let p = PatchWire { layer: l, origin, offset: Rect::new(mb.xl - origin.0, mb.yl - origin.1, mb.xh - origin.0, mb.yh - origin.1), owner: Owner::Net((q.name)(ni)) };
+        if touches(&p.bbox(), &rb) || in_rb(origin) {
+            out.push((ni, p));
+        }
+    }
+    out
+}
+
+/// The corner patch's box: the marker box across the layer's direction as the shape's box, and one
+/// manufacturing grid further along it — toward the low side when the shape starts exactly at the
+/// marker's high side, else toward the high side.
+fn stretch_corner_patch(marker: Rect, fig: Rect, horizontal: bool, grid: i32) -> Rect {
+    let mut mb = marker;
+    if horizontal {
+        mb.yl = fig.yl;
+        mb.yh = fig.yh;
+        if fig.xl == mb.xh {
+            mb.xl -= grid;
+        } else {
+            mb.xh += grid;
+        }
+    } else {
+        mb.xl = fig.xl;
+        mb.xh = fig.xh;
+        if fig.yl == mb.yh {
+            mb.yl -= grid;
+        } else {
+            mb.yh += grid;
+        }
+    }
+    mb
+}
+
+/// A written patch's origin: the path point nearest its own (squared distance; the first of
+/// equals), its box moved so it stays where it was. No points: unchanged.
+fn move_to_nearest(origin: (i32, i32), offset: Rect, points: &[(i32, i32)]) -> ((i32, i32), Rect) {
+    if points.is_empty() {
+        return (origin, offset);
+    }
+    let d2 = |a: (i32, i32)| (i64::from(a.0) - i64::from(origin.0)).pow(2) + (i64::from(a.1) - i64::from(origin.1)).pow(2);
+    let mut best = i64::MAX;
+    let mut c = (0, 0);
+    for &pt in points {
+        if d2(pt) < best {
+            best = d2(pt);
+            c = pt;
+        }
+    }
+    (c, Rect::new(origin.0 - c.0 + offset.xl, origin.1 - c.1 + offset.yl, origin.0 - c.0 + offset.xh, origin.1 - c.1 + offset.yh))
+}
+
+/// `updateGCWorker` after the patch pass: each patched net (by id) rebuilt from its worker nets'
+/// shapes with its patches added.
+fn update_patched(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], pw: &[(usize, PatchWire)]) {
+    let mut ids: Vec<(usize, Owner)> = Vec::new();
+    for (ni, p) in pw {
+        if !ids.iter().any(|(_, o)| *o == p.owner) {
+            ids.push((nets[*ni].net, p.owner.clone()));
+        }
+    }
+    ids.sort_by_key(|(id, _)| *id);
+    let batch: Vec<_> = ids
+        .into_iter()
+        .map(|(_, owner)| {
+            let (mut route, taper) = owner_route(q, nets, state, &owner);
+            route.extend(pw.iter().filter(|(_, p)| p.owner == owner).map(|(_, p)| (p.layer, p.bbox())));
+            (owner, route, taper)
+        })
+        .collect();
+    gw.replace_routes(&batch);
+}
+
+/// `writeGCPatchesToDRWorker`: each patch onto its worker net's route (and region query); with
+/// path points, its origin moved to the nearest (the first of equals) and its box kept.
+fn write_gc_patches(q: &QueueCtx<'_>, state: &mut [NetState], rq: &mut RouteRq, pw: &[(usize, PatchWire)], points: &[(i32, i32)]) -> Vec<Event> {
+    let mut out = Vec::new();
+    for (ni, p) in pw {
+        let (origin, offset) = move_to_nearest(p.origin, p.offset, points);
+        let fig = DrFig::Patch { layer: p.layer, origin, offset };
+        rq.add_fig(q.mcfg.tech, *ni, state[*ni].figs.len(), &fig);
+        state[*ni].figs.push(fig.clone());
+        out.push(Event::Patch { net: *ni, fig, valid: points.len() });
+    }
+    out
 }
 
 /// The check on one owner, against everything the check holds.
@@ -712,6 +894,26 @@ pub fn order_map(order: &[usize]) -> BTreeMap<usize, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (`patchMetalShape_cornerSpacing`): on a horizontal layer the patch spans the shape's y
+    // and one grid past the marker in x — to the left when the shape starts at the marker's right
+    // side, else to the right. Vertical: the same across.
+    #[test]
+    fn a_corner_patch_takes_the_shape_across_and_one_grid_along() {
+        let m = Rect::new(100, 10, 120, 30);
+        assert_eq!(stretch_corner_patch(m, Rect::new(120, 0, 300, 40), true, 1), Rect::new(99, 0, 120, 40));
+        assert_eq!(stretch_corner_patch(m, Rect::new(0, 0, 100, 40), true, 1), Rect::new(100, 0, 121, 40));
+        assert_eq!(stretch_corner_patch(m, Rect::new(90, 30, 130, 200), false, 1), Rect::new(90, 9, 130, 30));
+    }
+
+    // Rule (`writeGCPatchesToDRWorker`): with path points, the origin moves to the nearest (strictly
+    // nearer: the first of two equals stays) and the box keeps its place.
+    #[test]
+    fn a_written_patch_moves_to_the_nearest_path_point() {
+        let (o, b) = move_to_nearest((100, 100), Rect::new(0, -5, 20, 5), &[(90, 100), (110, 100), (100, 130)]);
+        assert_eq!((o, b), ((90, 100), Rect::new(10, -5, 30, 5)));
+        assert_eq!(move_to_nearest((100, 100), Rect::new(0, -5, 20, 5), &[]), ((100, 100), Rect::new(0, -5, 20, 5)));
+    }
 
     // Rule: a marker cost decays as an integer times a 32-bit float factor, truncated — 10 × 0.95
     // is 9 (9.4999…), and a cost of 1 decays to 0.
