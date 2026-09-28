@@ -180,6 +180,13 @@ pub struct CutSpacingTable {
     pub no_prl: bool,
     pub horizontal: bool,
     pub vertical: bool,
+    /// What the maze's cut cost reads (`getDefaultSpacing`, `getDefaultCenterToCenter`,
+    /// `getDefaultCenterAndEdge`), as io sets them: the raw table's `[0][0]` pair (first, second),
+    /// and the flags of the alphabetically FIRST column and row class names (`std::map::begin`,
+    /// a `/SIDE` suffix dropped) — not necessarily the classes at `[0][0]`.
+    pub default_spacing: (i32, i32),
+    pub default_center_to_center: bool,
+    pub default_center_and_edge: bool,
 }
 
 impl CutSpacingTable {
@@ -297,6 +304,11 @@ pub struct Tech {
 }
 
 impl Tech {
+    /// `ALLOW_PIN_AS_FEEDTHROUGH`: io clears it once any routing layer carries the
+    /// right-way-on-grid-only constraint. Read by guide processing and the maze.
+    pub fn allow_pin_feedthrough(&self) -> bool {
+        !self.layers.iter().any(|l| l.right_way_on_grid_only)
+    }
     pub fn top_layer_num(&self) -> usize {
         self.layers.len() - 1
     }
@@ -466,6 +478,17 @@ pub mod read {
                     t.prl_aligned.push(db.cutspacingtablerule_is_prl_for_aligned_cut_classes(layer, k, c1, c2));
                 }
             }
+            // The raw table: row count, then per row its length and its (first, second) pairs.
+            let raw = db.cutspacingtablerule_get_spacing_table_table(layer, k);
+            if raw.len() < 4 || raw[0] < 1 || raw[1] < 1 {
+                return Err("an empty cut spacing table");
+            }
+            t.default_spacing = (raw[2], raw[3]);
+            let first = |names: Vec<String>| names.into_iter().next().map(|n| n.split('/').next().unwrap_or("").to_string()).unwrap_or_default();
+            let c1 = first(db.cutspacingtablerule_get_spacing_table_col_map_names(layer, k));
+            let c2 = first(db.cutspacingtablerule_get_spacing_table_row_map_names(layer, k));
+            t.default_center_to_center = db.cutspacingtablerule_is_center_to_center(layer, k, &c1, &c2);
+            t.default_center_and_edge = db.cutspacingtablerule_is_center_and_edge(layer, k, &c1, &c2);
             out = Some(t);
         }
         Ok(out)

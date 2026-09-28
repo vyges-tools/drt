@@ -511,6 +511,7 @@ fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeC
             st.set_dst_i(w.g, mi, false);
         }
     }
+    let mut first_conn = true;
     while !unconn.is_empty() {
         st.reset_prev_dirs();
         // The next destination: the nearest access point to the connected box (first pin at it).
@@ -547,7 +548,8 @@ fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeC
             return (out, figs, false);
         }
         out.push(Search { dst: (cx.pin_name)(&net.pins[dk]), path: path.clone() });
-        post_astar_update(w, st, &path, &mut conn, &mut unconn, &mut at);
+        post_astar_update(w, st, &path, &mut conn, &mut unconn, &mut at, first_conn);
+        first_conn = false;
         let wcx = WriteCtx { route_box: cx.route_box, real_ap: &real_ap, ap: &any_ap, has_access_point: cx.has_access_point, ndr: cx.ndr_rule, auto_taper: cx.auto_taper, tapers: &tapers, taper_at: &taper_at, area_at: &area_at };
         figs.extend(write_path(w, &wcx, &path));
         figs.extend(patch_min_area(w, st, &wcx, &path, mcfg.drc_cost, mcfg.fixed_cost, mcfg.marker_cost));
@@ -559,7 +561,13 @@ fn route_net_search(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeC
 /// After a search: the destination's pins are connected (their access points become sources),
 /// every node on the path becomes a source and joins the connected set (the destination point
 /// itself excepted).
-fn post_astar_update(w: &CostWorker<'_, '_>, st: &mut MazeState, path: &[Idx], conn: &mut Vec<Idx>, unconn: &mut BTreeSet<usize>, at: &mut BTreeMap<Idx, BTreeSet<usize>>) {
+///
+/// Without pin feedthrough (`ALLOW_PIN_AS_FEEDTHROUGH` false — any right-way-on-grid-only layer):
+/// a connected pin's access points do NOT become sources, and after the FIRST connection the
+/// sources start over from the path alone (the source pin's access points dropped; a one-point
+/// path keeps its point).
+fn post_astar_update(w: &CostWorker<'_, '_>, st: &mut MazeState, path: &[Idx], conn: &mut Vec<Idx>, unconn: &mut BTreeSet<usize>, at: &mut BTreeMap<Idx, BTreeSet<usize>>, first_conn: bool) {
+    let feedthrough = w.cx.tech.allow_pin_feedthrough();
     let mut local: BTreeSet<Idx> = BTreeSet::new();
     if let Some(&d) = path.first() {
         let pins: Vec<usize> = at.get(&d).map(|s| s.iter().copied().collect()).unwrap_or_default();
@@ -576,9 +584,21 @@ fn post_astar_update(w: &CostWorker<'_, '_>, st: &mut MazeState, path: &[Idx], c
                     at.remove(&mi);
                     st.set_dst_i(w.g, mi, false);
                 }
-                local.insert(mi);
-                st.set_src_i(w.g, mi, true);
+                if feedthrough {
+                    local.insert(mi);
+                    st.set_src_i(w.g, mi, true);
+                }
             }
+        }
+    }
+    if first_conn && !feedthrough {
+        for &mi in conn.iter() {
+            st.set_src_i(w.g, mi, false);
+        }
+        conn.clear();
+        if path.len() == 1 {
+            conn.push(path[0]);
+            st.set_src_i(w.g, path[0], true);
         }
     }
     for win in path.windows(2) {
@@ -598,7 +618,7 @@ fn post_astar_update(w: &CostWorker<'_, '_>, st: &mut MazeState, path: &[Idx], c
         }
     }
     for mi in local {
-        if Some(&mi) != path.first() {
+        if (first_conn && !feedthrough) || Some(&mi) != path.first() {
             conn.push(mi);
         }
     }
@@ -619,6 +639,39 @@ fn add_cut_spc_cost(w: &mut CostWorker<'_, '_>, path: &[Idx]) {
             let b = Rect { xl: f.xl + origin.0, yl: f.yl + origin.1, xh: f.xh + origin.0, yh: f.yh + origin.1 };
             w.mod_cut_spacing_cost(&b, z, ModCost::AddRoute, Some((path[k].0 as usize, path[k].1 as usize)));
         }
+    }
+}
+
+#[cfg(test)]
+mod post_astar_tests {
+    use super::*;
+    use crate::dr::cost::CostCtx;
+    use crate::dr::drw::{GridGraph, Node};
+    use crate::tech::{Layer, LayerKind, Tech};
+
+    // Rule (`routeNet_postAstarUpdate`, `ALLOW_PIN_AS_FEEDTHROUGH`): pin 1 (access points (0,0)
+    // and (0,2)) is reached at (0,0) from the source pin's (2,2) along y = 0. With feedthrough the
+    // pin's other access point becomes a source and the source pin stays; without it (a
+    // right-way-on-grid-only layer) after the FIRST connection only the path is a source, the
+    // path's destination point included.
+    #[test]
+    fn without_feedthrough_the_first_connection_leaves_only_the_path_as_sources() {
+        let run = |rwogo: bool| {
+            let t = Tech { layers: vec![Layer::default(), Layer::default(), Layer { kind: LayerKind::Routing, width: 100, right_way_on_grid_only: rwogo, ..Default::default() }], ..Default::default() };
+            let mut g = GridGraph { xs: vec![0, 100, 200], ys: vec![0, 100, 200], zs: vec![2], nodes: vec![Node::default(); 9] };
+            let mut st = MazeState::new(&t, &g, Rect::new(0, 0, 200, 200));
+            let none = |_: &crate::dr::ta::Fixed| Vec::new();
+            let cx = CostCtx { tech: &t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &[], term_shapes: &none, port_aps: &|_| Vec::new(), inst_is_block: &|_| false, inst_term_aps: &|_, _| Vec::new() };
+            let w = CostWorker { cx: &cx, g: &mut g, ap_svia: Default::default() };
+            let mut conn = vec![(2, 2, 0)];
+            st.set_src_i(w.g, (2, 2, 0), true);
+            let mut unconn = BTreeSet::from([1]);
+            let mut at = BTreeMap::from([((0, 0, 0), BTreeSet::from([1])), ((0, 2, 0), BTreeSet::from([1]))]);
+            post_astar_update(&w, &mut st, &[(0, 0, 0), (2, 0, 0)], &mut conn, &mut unconn, &mut at, true);
+            (conn, [(0, 2, 0), (2, 2, 0), (0, 0, 0)].map(|i: Idx| st.src[w.g.idx(i.0 as usize, i.1 as usize, i.2 as usize)]))
+        };
+        assert_eq!(run(false), (vec![(2, 2, 0), (0, 2, 0), (1, 0, 0), (2, 0, 0)], [true, true, true]));
+        assert_eq!(run(true), (vec![(0, 0, 0), (1, 0, 0), (2, 0, 0)], [false, false, true]));
     }
 }
 

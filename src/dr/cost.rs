@@ -689,21 +689,31 @@ impl CostWorker<'_, '_> {
         }
     }
 
-    /// Cut spacing costs around a cut shape: the default via's cut at each node too close to it
-    /// (one plain, edge-to-edge, different-net rule).
+    /// Cut spacing costs around a cut shape (`modCutSpacingCost`): the default via's cut at each
+    /// node too close to it — under the one plain, edge-to-edge, different-net rule, or failing
+    /// that the LEF58 different-net cut spacing table's DEFAULT pair (second when the two cuts run
+    /// parallel, else first; centre to centre per the table's default flags).
     /// `avoid`: a node left alone (the via's own, when a routed via's cut is the shape).
     pub fn mod_cut_spacing_cost(&mut self, b: &Rect, z: usize, t: ModCost, avoid: Option<(usize, usize)>) {
         let tech = self.cx.tech;
         let cut = self.g.zs[z] + 1;
-        let Some(spacing) = tech.layers.get(cut).and_then(|c| c.cut_spacing) else { return };
+        let Some(layer) = tech.layers.get(cut) else { return };
+        let (spacing, table) = (layer.cut_spacing, layer.cut_table.as_ref());
+        if spacing.is_none() && table.is_none() {
+            return;
+        }
         let Some(v) = self.cx.default_via(cut as i64) else { return };
         let vd = &tech.via_defs[v];
         let cf = &vd.cut_figs;
         let vb = cf.iter().skip(1).fold(cf[0], |a, f| Rect { xl: a.xl.min(f.xl), yl: a.yl.min(f.yl), xh: a.xh.max(f.xh), yh: a.yh.max(f.yh) });
-        let d = spacing;
+        let mut d = spacing.unwrap_or(0);
+        if let Some(tb) = table {
+            d = d.max(tb.default_spacing.0).max(tb.default_spacing.1);
+        }
         let bx = Rect { xl: b.xl - d - vb.xh + 1, yl: b.yl - d - vb.yh + 1, xh: b.xh + d - vb.xl - 1, yh: b.yh + d - vb.yl - 1 };
         let Some((x1, y1, x2, y2)) = self.range(&bx) else { return };
-        let req = i64::from(spacing) * i64::from(spacing);
+        let center = |r: &Rect| (i64::from((r.xl + r.xh) / 2), i64::from((r.yl + r.yh) / 2));
+        let bc = center(b);
         for i in x1..=x2 {
             for j in y1..=y2 {
                 if avoid == Some((i, j)) {
@@ -711,8 +721,23 @@ impl CostWorker<'_, '_> {
                 }
                 let p = (self.g.xs[i], self.g.ys[j]);
                 for f in cf.clone() {
-                    let (d2, _, _) = box_box_d2(b, &shift(&f, p));
-                    if d2 < req {
+                    let tmp = shift(&f, p);
+                    let (d2, dx, dy) = box_box_d2(b, &tmp);
+                    let mut viol = spacing.is_some_and(|s| d2 < i64::from(s) * i64::from(s));
+                    if let (false, Some(tb)) = (viol, table) {
+                        let prl = (-dx).max(-dy);
+                        let (first, second) = tb.default_spacing;
+                        let req = if prl > 0 { second } else { first };
+                        let c2c = tb.default_center_to_center || (tb.default_center_and_edge && req == first.max(second));
+                        let cur = if c2c {
+                            let tc = center(&tmp);
+                            (bc.0 - tc.0).pow(2) + (bc.1 - tc.1).pow(2)
+                        } else {
+                            d2
+                        };
+                        viol = cur < i64::from(req) * i64::from(req);
+                    }
+                    if viol {
                         let k = self.g.idx(i, j, z);
                         self.g.mod_via(k, t, false);
                         break;
@@ -1247,6 +1272,28 @@ mod tests {
         with_defaults(&t, &mut g, &[], &[], |w| w.mod_cut_spacing_cost(&Rect { xl: 290, yl: 290, xh: 310, yh: 310 }, 0, ModCost::AddFixed, None));
         assert_eq!(g.nodes[g.idx(5, 5, 0)].fixed_via, 0);
         assert_eq!(g.nodes[g.idx(4, 4, 0)].fixed_via, 1);
+    }
+
+    // Rule (`modCutSpacingCost`, LEF58 different-net cut spacing table): with no plain rule, the
+    // table's DEFAULT pair decides — its second value when the two cuts overlap along an axis
+    // (prl > 0), else its first; edge to edge unless the table's default is centre to centre.
+    // A cut 290..310 square; the via cut at (300, 370) spans 290..310 × 360..380: 50 away, prl 20.
+    #[test]
+    fn a_cut_table_default_costs_parallel_cuts_by_its_second_value() {
+        let cost = |spc: (i32, i32), c2c: bool| {
+            let mut t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
+            t.layers[3].cut_table = Some(crate::tech::CutSpacingTable { default_spacing: spc, default_center_to_center: c2c, ..Default::default() });
+            let mut g = grid();
+            g.ys = vec![0, 100, 200, 300, 370, 500, 600, 700, 800, 900];
+            with_defaults(&t, &mut g, &[], &[], |w| w.mod_cut_spacing_cost(&Rect { xl: 290, yl: 290, xh: 310, yh: 310 }, 0, ModCost::AddFixed, None));
+            g.nodes[g.idx(3, 4, 0)].fixed_via
+        };
+        assert_eq!(cost((50, 80), false), 1);
+        assert_eq!(cost((50, 50), false), 0);
+        assert_eq!(cost((80, 50), false), 0);
+        // Centre to centre: 70 apart, the second value 60 — clean; edge to edge (50) it is not.
+        assert_eq!(cost((50, 60), true), 0);
+        assert_eq!(cost((50, 60), false), 1);
     }
 
     // Rule: an instance pin UNBLOCKS the planar edges a blockage blocked under it (its access

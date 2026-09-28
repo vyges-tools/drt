@@ -271,6 +271,39 @@ impl Ctx<'_> {
         // Different cut layers: spacing between cut layers is not modelled.
     }
 
+    /// `prep_via2viaForbiddenLen_lef58CutSpcTbl`: two cuts on the same layer under its LEF58
+    /// different-net cut spacing table — the spacing between their classes (`getSpacing`'s MAX of
+    /// first and second, END/SIDE by each cut's orientation across the direction) plus the cut's
+    /// length along it (edge to edge); centre-and-edge: the larger of MAX and MIN plus the two half
+    /// lengths; centre to centre: the spacing alone. Forbidden from 0. (Cuts on different layers
+    /// read only the SAMEMETAL / SAMENET inter-layer tables, refused.)
+    fn via2via_lef58_cut_spc_tbl(&self, v1: usize, v2: usize, along_x: bool, out: &mut Ranges) {
+        let tech = self.tech;
+        let (vd1, vd2) = (&tech.via_defs[v1], &tech.via_defs[v2]);
+        // The reference swaps the two when the second's cut layer is higher; on one layer never.
+        if vd1.cut != vd2.cut {
+            return;
+        }
+        let Some(tb) = tech.layers[vd1.cut].cut_table.as_ref() else { return };
+        let (cb1, cb2) = (bbox(&vd1.cut_figs), bbox(&vd2.cut_figs));
+        let layer = &tech.layers[vd1.cut];
+        let class = |r: &Rect| layer.cut_class_of(r.dx().min(r.dy()), r.dx().max(r.dy()));
+        let (c1, c2) = (class(&cb1), class(&cb2));
+        let side = |r: &Rect| if along_x { r.dx() < r.dy() } else { r.dx() > r.dy() };
+        let (first, second) = tb.get(c1, side(&cb1), c2, side(&cb2));
+        let pair = tb.pair(c1, c2);
+        let along = |r: &Rect| if along_x { r.dx() } else { r.dy() };
+        let mut req = first.max(second);
+        if !tb.center_to_center[pair] && !tb.center_and_edge[pair] {
+            req += along(&cb1);
+        } else if tb.center_and_edge[pair] {
+            req = first.max(second).max(first.min(second) + (along(&cb1) + along(&cb2)) / 2);
+        }
+        if req != 0 {
+            out.push((0, req));
+        }
+    }
+
     fn via2via_prl(&self, l: usize, v1: usize, v2: usize, along_x: bool) -> i32 {
         let (b1, b2) = (enclosure(&self.tech.via_defs[v1], l), enclosure(&self.tech.via_defs[v2], l));
         if along_x {
@@ -285,6 +318,7 @@ impl Ctx<'_> {
         if let (Some(a), Some(b)) = (v1, v2) {
             self.via2via_min_spc(l, a, b, along_x, &mut r, ndr);
             self.via2via_cut_spc(a, b, along_x, &mut r);
+            self.via2via_lef58_cut_spc_tbl(a, b, along_x, &mut r);
         }
         let prl = match (v1, v2) {
             (Some(a), Some(b)) => self.via2via_prl(l, a, b, along_x),
@@ -575,6 +609,26 @@ mod tests {
         let mut out = Ranges::new();
         c.via2via_cut_spc(0, 0, true, &mut out);
         assert_eq!(out, vec![(0, 160)]);
+    }
+
+    // Rule (`prep_via2viaForbiddenLen_lef58CutSpcTbl`): two cuts on one layer under its LEF58
+    // different-net cut spacing table are forbidden from 0 to the classes' spacing (MAX of first
+    // and second) plus the cut's length along (edge to edge); centre-and-edge: the larger of MAX
+    // and MIN plus the two half lengths; centre to centre: the spacing alone. The cut is 80 long.
+    #[test]
+    fn a_cut_spacing_table_forbids_via_to_via_from_zero() {
+        let range = |c2c: bool, cae: bool| {
+            let mut t = tech(vec![via("v", r(-100, -100, 100, 100), r(-50, -50, 50, 50))]);
+            t.layers[3].cut_spacing = None;
+            t.layers[3].cut_table = Some(crate::tech::CutSpacingTable { n: 1, spacing: vec![(30, 50); 4], center_to_center: vec![c2c], center_and_edge: vec![cae], ..Default::default() });
+            let c = Ctx { tech: &t, defaults: &[None, None, None, Some(0), None], cfg: &cfg(2, 4) };
+            let mut out = Ranges::new();
+            c.via2via_lef58_cut_spc_tbl(0, 0, true, &mut out);
+            out
+        };
+        assert_eq!(range(false, false), vec![(0, 130)]);
+        assert_eq!(range(false, true), vec![(0, 110)]);
+        assert_eq!(range(true, false), vec![(0, 50)]);
     }
 
     // Via to via on one layer: only when BOTH vias are wider than the wire across the run, at

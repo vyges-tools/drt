@@ -19,6 +19,8 @@ pub use crate::dr::wire::InitialRouting;
 /// LEF 5.4 spacing limited to a width RANGE, and a master whose obstructions carry DESIGNRULEWIDTH or
 /// SPACING (`master: …`). A rect-only layer is modelled (unidirectional, and the
 /// check's rect-only rule); its "except non-core pins" flag is never read.
+/// Right-way-on-grid-only is modelled in every consumer (pin access, the maze grid, guides and
+/// the maze's pin feedthrough); a multi-patterned layer, which io also gives it, stays refused.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
     for l in &tech.layers {
@@ -46,7 +48,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             ("lef58_width_table_orthogonal", kept(db.num_layer_get_tech_layer_width_table_rules(name), &|k| db.widthtablerule_is_orthogonal(name, k))),
             ("lef58_wrong_dir_spacing", kept(db.num_layer_get_tech_layer_wrong_dir_spacing_rules(name), &|k| !db.wrongdirspacingrule_is_length_valid(name, k) && db.wrongdirspacingrule_get_prl_length(name, k) >= 0)),
             ("orthogonal_spacing_table", usize::from(db.layer_has_orth_spacing_table(name))),
-            ("right_way_on_grid_only", usize::from(db.layer_is_right_way_on_grid_only(name))),
         ];
         for (family, n) in untracked {
             if n > 0 {

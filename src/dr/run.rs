@@ -247,7 +247,7 @@ pub fn init_guide(db: &Db, d: &DesignIn) -> Res<GuidesIn> {
         let all: Vec<(usize, Rect)> = order.iter().flat_map(|n| raw[n].iter().copied()).collect();
         build_gcell_patterns(tech, d.die, &all).ok_or("no gcell grid from the guides")?
     };
-    let gcfg = GuideConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: top, via_access_layer: d.cfg.via_access_layer, allow_pin_feedthrough: true };
+    let gcfg = GuideConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: top, via_access_layer: d.cfg.via_access_layer, allow_pin_feedthrough: tech.allow_pin_feedthrough() };
     let inst_index: HashMap<&str, usize> = d.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
     let port_index: HashMap<&str, usize> = d.ports.iter().enumerate().map(|(k, p)| (p.name.as_str(), k)).collect();
     let class_of = classes_of(d);
