@@ -325,7 +325,10 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 }
                 gw.target = Some(owner.clone());
                 let (m, pw) = gc_main_surgical(&mut gw, q, nets, &state, &rq, Some(i));
-                after_check(w, &nets[i], &figs, cx.ext_box);
+                // `modEolCosts_poly` reads the check's net, which already holds the new patches.
+                let mut with_patches = figs.clone();
+                with_patches.extend(pw.iter().map(|(_, p)| DrFig::Patch { layer: p.layer, origin: p.origin, offset: p.offset }));
+                after_check(w, &nets[i], &with_patches, cx.ext_box);
                 // The patches go to the net at the point of its paths nearest each.
                 let points: Vec<(i32, i32)> = searches.iter().flat_map(|s| s.path.iter()).map(|m| (w.g.xs[m.0 as usize], w.g.ys[m.1 as usize])).collect();
                 let written = write_gc_patches(q, &mut state, &mut rq, &pw, &points);
