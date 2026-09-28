@@ -99,6 +99,28 @@ fn overlaps(a: &Rect, b: &Rect) -> bool {
     a.xl < b.xh && b.xl < a.xh && a.yl < b.yh && b.yl < a.yh
 }
 
+fn bbox_of(figs: &[Rect]) -> Rect {
+    figs.iter().skip(1).fold(figs[0], |a, f| Rect { xl: a.xl.min(f.xl), yl: a.yl.min(f.yl), xh: a.xh.max(f.xh), yh: a.yh.max(f.yh) })
+}
+
+/// `initMazeCost_minCut_helper`: the minimum-cut costs of a net's committed vias around the box
+/// (each via's first pad on either layer, the vias above and below it) — ADDED as the net starts
+/// routing, removed as it ends (the reverse of the other helpers).
+pub fn init_maze_cost_min_cut_helper(w: &mut CostWorker<'_, '_>, net: &DrNet, add: bool) {
+    let tech = w.cx.tech;
+    let t = if add { ModCost::AddRoute } else { ModCost::SubRoute };
+    for f in &net.ext {
+        let DrFig::Via { via, origin, .. } = *f else { continue };
+        let vd = &tech.via_defs[via];
+        for (l, figs) in [(vd.layer1, &vd.layer1_figs), (vd.layer2, &vd.layer2_figs)] {
+            let Some(z) = w.g.z_of(l) else { continue };
+            let b = shift(&figs[0], origin);
+            w.mod_min_cut_cost_via(&b, z, t, true);
+            w.mod_min_cut_cost_via(&b, z, t, false);
+        }
+    }
+}
+
 fn shift(r: &Rect, p: P) -> Rect {
     Rect { xl: r.xl + p.0, yl: r.yl + p.1, xh: r.xh + p.0, yh: r.yh + p.1 }
 }
@@ -312,6 +334,8 @@ pub struct CostCtx<'a> {
     pub port_aps: &'a dyn Fn(usize) -> Vec<DrAp>,
     /// Whether an instance's master is a block.
     pub inst_is_block: &'a dyn Fn(usize) -> bool,
+    /// Whether an instance's master is a block, a pad or a ring (its pins take minimum-cut costs).
+    pub inst_is_macro: &'a dyn Fn(usize) -> bool,
     /// An instance terminal's access points, per pin (design coordinates), by (instance, term):
     /// what a block master's pin cost reads (`initMazeCost_terms`, `modBlockedEdgesForMacroPin`).
     pub inst_term_aps: &'a dyn Fn(usize, usize) -> Vec<Vec<DrAp>>,
@@ -683,6 +707,63 @@ impl CostWorker<'_, '_> {
                             }
                         }
                         self.g.mod_via(k, t, false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `modMinimumcutCostVia`: around a wide metal box on the layer of `z`, the via above
+    /// (`upper`) or below it is costed where its cut would sit on the box — under a MINIMUMCUT rule
+    /// the box triggers (wider than WIDTH, longer than LENGTH if given) from the rule's connection
+    /// side: overlapping it without LENGTH, else within its distance (plus the layer's pitch)
+    /// along one axis only. A special access via at a node counts with its own cut. The set and
+    /// reset kinds (a macro pin) write the node on `z` itself.
+    pub fn mod_min_cut_cost_via(&mut self, b: &Rect, z: usize, t: ModCost, upper: bool) {
+        let tech = self.cx.tech;
+        let l = self.g.zs[z];
+        let (w1, len1) = (b.dx().min(b.dy()), b.dx().max(b.dy()));
+        let (min_l, max_l) = (self.g.zs[0], *self.g.zs.last().expect("a layer"));
+        let via = if upper { (l < max_l).then(|| self.cx.default_via(l as i64 + 1)).flatten() } else { (l > min_l).then(|| self.cx.default_via(l as i64 - 1)).flatten() };
+        let Some(v) = via else { return };
+        let vb = bbox_of(&tech.via_defs[v].cut_figs);
+        let Some(zi) = (if upper { Some(z) } else { z.checked_sub(1) }) else { return };
+        for m in tech.layers[l].min_cuts.clone() {
+            if !(m.length.is_none_or(|(ml, _)| len1 > ml) && w1 > m.width) {
+                continue;
+            }
+            if m.from_above.is_some_and(|a| a != upper) {
+                continue;
+            }
+            let dist = m.length.map_or(0, |(_, d)| d + tech.layers[l].pitch);
+            let bx = Rect { xl: b.xl - dist - vb.xh + 1, yl: b.yl - dist - vb.yh + 1, xh: b.xh + dist - vb.xl - 1, yh: b.yh + dist - vb.yl - 1 };
+            let Some((x1, y1, x2, y2)) = self.range(&bx) else { continue };
+            for i in x1..=x2 {
+                for j in y1..=y2 {
+                    let p = (self.g.xs[i], self.g.ys[j]);
+                    let k = self.g.idx(i, j, zi);
+                    let mut tb = vb;
+                    if self.g.nodes[k].svia {
+                        if let Some(&sv) = self.ap_svia.get(&(i, j, zi)) {
+                            tb = bbox_of(&tech.via_defs[sv].cut_figs);
+                        }
+                    }
+                    let (_, dx, dy) = box_box_d2(b, &shift(&tb, p));
+                    let hit = if m.length.is_none() {
+                        dx <= 0 && dy <= 0
+                    } else {
+                        let (dx, dy) = (dx.max(0), dy.max(0));
+                        ((dx > 0) ^ (dy > 0)) && dx + dy < dist
+                    };
+                    if !hit {
+                        continue;
+                    }
+                    match t {
+                        ModCost::SetFixed | ModCost::ResetFixed => {
+                            let kz = self.g.idx(i, j, z);
+                            self.g.nodes[kz].fixed_via = u8::from(t == ModCost::SetFixed);
+                        }
+                        _ => self.g.mod_via(k, t, false),
                     }
                 }
             }
@@ -1078,7 +1159,6 @@ pub fn mod_term_cost(w: &mut CostWorker<'_, '_>, obj: &Fixed, add: bool, skip_vi
             }
             // A block's pin: corner-to-corner spacing (a rule family the census refuses), its
             // access edges blocked, and the spacing costs SET rather than added (reset, removed).
-            // Minimum-cut costs follow for block, pad and ring pins: refused by the census too.
             let mut t2 = t;
             if block {
                 mod_blocked_edges_for_macro_pin(w, &aps, add);
@@ -1086,6 +1166,15 @@ pub fn mod_term_cost(w: &mut CostWorker<'_, '_>, obj: &Fixed, add: bool, skip_vi
             }
             w.mod_eol_spacing_rules_cost(&b, z, t2, false, None, reset_h, reset_v);
             w.mod_min_spacing_cost_planar(&b, z, t2, false, None, block, reset_h, reset_v);
+            // Block, pad and ring pins: minimum-cut costs, with the kind as it now stands (a
+            // block's set / reset). ⚠️ The source does this for a pin's cut shapes too; cut pin
+            // shapes are not costed here at all.
+            if let Fixed::InstTerm { inst, .. } = *obj {
+                if (w.cx.inst_is_macro)(inst) && !skip_via {
+                    w.mod_min_cut_cost_via(&b, z, t2, true);
+                    w.mod_min_cut_cost_via(&b, z, t2, false);
+                }
+            }
         } else {
             w.mod_min_spacing_cost_planar(&b, z, t, false, None, false, true, true);
             w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
@@ -1180,7 +1269,7 @@ mod tests {
         let aps = |_: usize| Vec::new();
         let block = |_: usize| false;
         let fixed: Vec<PackedRTree<Fixed>> = Vec::new();
-        let cx = CostCtx { tech: t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block, inst_term_aps: &|_, _| Vec::new() };
+        let cx = CostCtx { tech: t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block, inst_is_macro: &block, inst_term_aps: &|_, _| Vec::new() };
         let mut w = CostWorker { cx: &cx, g, ap_svia: BTreeMap::new() };
         f(&mut w)
     }
@@ -1202,7 +1291,7 @@ mod tests {
         let aps = |_: usize| Vec::new();
         let block = |_: usize| false;
         let defaults = [None, None, None, Some(0), None];
-        let cx = CostCtx { tech: t, defaults: &defaults, eol, ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed, term_shapes: &shapes, port_aps: &aps, inst_is_block: &block, inst_term_aps: &|_, _| Vec::new() };
+        let cx = CostCtx { tech: t, defaults: &defaults, eol, ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed, term_shapes: &shapes, port_aps: &aps, inst_is_block: &block, inst_is_macro: &block, inst_term_aps: &|_, _| Vec::new() };
         let mut w = CostWorker { cx: &cx, g, ap_svia: BTreeMap::new() };
         f(&mut w)
     }
@@ -1272,6 +1361,25 @@ mod tests {
         with_defaults(&t, &mut g, &[], &[], |w| w.mod_cut_spacing_cost(&Rect { xl: 290, yl: 290, xh: 310, yh: 310 }, 0, ModCost::AddFixed, None));
         assert_eq!(g.nodes[g.idx(5, 5, 0)].fixed_via, 0);
         assert_eq!(g.nodes[g.idx(4, 4, 0)].fixed_via, 1);
+    }
+
+    // Rule (`modMinimumcutCostVia`): around a metal box on layer 4 wider than a MINIMUMCUT rule's
+    // WIDTH, the via below is costed at every node whose default cut (20 x 20) overlaps the box —
+    // no LENGTH; the rule's FROMABOVE side leaves the via below alone; a narrow box, nothing.
+    #[test]
+    fn a_wide_box_costs_the_vias_whose_cut_would_land_on_it() {
+        let cost = |width: i32, from_above: Option<bool>, b: Rect| {
+            let mut t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
+            t.layers[4].min_cuts = vec![crate::tech::MinCut { num_cuts: 2, width, within: None, from_above, length: None }];
+            let mut g = grid();
+            with_defaults(&t, &mut g, &[], &[], |w| w.mod_min_cut_cost_via(&b, 1, ModCost::AddRoute, false));
+            (0..10).flat_map(|i| (0..10).map(move |j| (i, j))).filter(|&(i, j)| g.nodes[g.idx(i, j, 0)].route_via > 0).count()
+        };
+        let wide = Rect::new(250, 250, 650, 650);
+        assert_eq!(cost(300, None, wide), 16);
+        assert_eq!(cost(300, Some(true), wide), 0);
+        assert_eq!(cost(300, Some(false), wide), 16);
+        assert_eq!(cost(500, None, wide), 0);
     }
 
     // Rule (`modCutSpacingCost`, LEF58 different-net cut spacing table): with no plain rule, the

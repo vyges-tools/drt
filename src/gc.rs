@@ -89,6 +89,18 @@ pub enum Rule {
     CornerSpacing,
     /// Two cuts closer than a LEF58 cut spacing table allows (`checkLef58CutSpacingTbl`).
     Lef58CutSpacingTable,
+    /// A run of edges shorter than the layer's MINSTEP between two longer ones
+    /// (`checkMetalShape_minStep`).
+    MinStep,
+    /// A wide metal rectangle reached by a single cut where MINIMUMCUT needs more
+    /// (`checkMinimumCut`).
+    MinimumCut,
+    /// Closer than a SPACING … RANGE rule allows, where that rule decided the spacing
+    /// (`frSpacingRangeConstraint`, the layer's first).
+    SpacingRange,
+    /// A cut whose metal above or below overhangs it less than any LEF58 enclosure rule for the
+    /// metal's width allows (`checkLef58Enclosure_main`).
+    Lef58Enclosure,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -243,6 +255,67 @@ impl Seg {
 fn orientation(a: &Seg, b: &Seg) -> i32 {
     let ((a1, b1), (a2, b2)) = (a.vec(), b.vec());
     (a1 * b2 - b1 * a2).signum() as i32
+}
+
+/// A point.
+type P = (i32, i32);
+
+/// `checkMetalShape_minStep`'s walk over one pin's rings, each edge (from, to, fixed) in ring
+/// order: from the first edge at least MINSTEP long, each run of shorter edges up to the next long
+/// one is measured (its edges' end points boxed, its length summed, whether any edge — the closing
+/// long one included — is off the fixed shapes) and judged (`checkMetalShape_minStep_helper`).
+/// ⚠️ The corner flags are never set in the source, so an INSIDECORNER or OUTSIDECORNER rule
+/// never marks. The violations' boxes.
+pub(crate) fn min_step_boxes(rings: &[Vec<(P, P, bool)>], con: &crate::tech::MinStep) -> Vec<Rect> {
+    let len = |e: &(P, P, bool)| (e.1 .0 - e.0 .0).abs() + (e.1 .1 - e.0 .1).abs();
+    let mut out = Vec::new();
+    for ring in rings {
+        let n = ring.len();
+        let Some(first) = (0..n).find(|&i| len(&ring[i]) >= con.min_step_length) else { continue };
+        let mut e = first;
+        let mut be = e;
+        let (mut edges, mut length, mut has_route) = (0, 0, !ring[e].2);
+        let mut b = Rect::new(ring[e].1 .0, ring[e].1 .1, ring[e].1 .0, ring[e].1 .1);
+        loop {
+            e = (e + 1) % n;
+            let (to, fixed) = (ring[e].1, ring[e].2);
+            if len(&ring[e]) < con.min_step_length {
+                edges += 1;
+                length += len(&ring[e]);
+                has_route |= !fixed;
+                b = Rect::new(b.xl.min(to.0), b.yl.min(to.1), b.xh.max(to.0), b.yh.max(to.1));
+            } else {
+                if e == be {
+                    break;
+                }
+                has_route |= !fixed;
+                if min_step_marks(con, edges, length, has_route) {
+                    out.push(b);
+                }
+                be = e;
+                if be == first {
+                    break;
+                }
+                edges = 0;
+                length = 0;
+                has_route = !fixed;
+                b = Rect::new(to.0, to.1, to.0, to.1);
+            }
+        }
+    }
+    out
+}
+
+/// `checkMetalShape_minStep_helper`'s verdict on a run (the corner flags always false).
+fn min_step_marks(con: &crate::tech::MinStep, edges: i32, length: i32, has_route: bool) -> bool {
+    if edges == 0 || !has_route {
+        return false;
+    }
+    match con.kind {
+        Some(crate::tech::MinStepKind::InsideCorner) | Some(crate::tech::MinStepKind::OutsideCorner) => false,
+        Some(crate::tech::MinStepKind::Step) => length > con.max_length,
+        None => con.max_edges == -1 || edges > con.max_edges,
+    }
 }
 
 /// An edge's box (its two points, low to high).
@@ -890,9 +963,80 @@ impl<'a> Worker<'a> {
         self.check_metal_shape();
         self.check_metal_end_of_line();
         self.check_cut_spacing();
+        self.check_minimum_cut();
         modify_markers(&mut self.markers, patches);
         normalize_marker_order(&mut self.markers);
         &self.markers
+    }
+
+    /// `checkMinimumCut`: per routing layer with MINIMUMCUT rules, per owner checked from, per pin,
+    /// per maximal rectangle at least WIDTH wide (and LENGTH long, if given): each same-owner cut
+    /// below and/or above it (the rule's connection side; within its box, grown by the LENGTH
+    /// distance) is a violation — outright without LENGTH; with it, only a cut not inside the
+    /// rectangle whose own metal rectangle (same owner) also touches the wide one. Not both fixed.
+    fn check_minimum_cut(&mut self) {
+        let top = self.tech.layers.len() - 1;
+        for layer in 0..self.tech.layers.len() {
+            if self.tech.layers[layer].kind != LayerKind::Routing || self.tech.layers[layer].min_cuts.is_empty() {
+                continue;
+            }
+            let rules = self.tech.layers[layer].min_cuts.clone();
+            for net in 0..self.nets.len() {
+                if !self.checks_from(net) {
+                    continue;
+                }
+                let mine: Vec<Shape> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).map(|k| self.shapes[layer][k]).collect();
+                for r in mine {
+                    for m in &rules {
+                        self.minimum_cut_main(layer, top, &r, m);
+                    }
+                }
+            }
+        }
+    }
+
+    fn minimum_cut_main(&mut self, layer: usize, top: usize, r: &Shape, m: &crate::tech::MinCut) {
+        let (w, len) = (r.rect.dx().min(r.rect.dy()), r.rect.dx().max(r.rect.dy()));
+        if w < m.width || m.length.is_some_and(|(ml, _)| len < ml) {
+            return;
+        }
+        let d = m.length.map_or(0, |(_, dist)| dist);
+        let q = Rect::new(r.rect.xl - d, r.rect.yl - d, r.rect.xh + d, r.rect.yh + d);
+        let mut found: Vec<(usize, usize)> = Vec::new();
+        if m.from_above != Some(true) && layer > 0 {
+            found.extend(self.query(layer - 1, &q).into_iter().map(|k| (layer - 1, k)));
+        }
+        if m.from_above != Some(false) && layer < top {
+            found.extend(self.query(layer + 1, &q).into_iter().map(|k| (layer + 1, k)));
+        }
+        let touch = |a: &Rect, b: &Rect| a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh;
+        for (vl, k) in found {
+            let via = self.shapes[vl][k];
+            if via.net != r.net || (via.fixed && r.fixed) {
+                continue;
+            }
+            let inside = r.rect.xl <= via.rect.xl && r.rect.yl <= via.rect.yl && via.rect.xh <= r.rect.xh && via.rect.yh <= r.rect.yh;
+            if m.length.is_some() && inside {
+                continue;
+            }
+            if m.length.is_some() {
+                let enclosed = self.query(layer, &via.rect).into_iter().any(|e| {
+                    let s = &self.shapes[layer][e];
+                    s.net == via.net && touch(&s.rect, &via.rect) && touch(&s.rect, &r.rect)
+                });
+                if !enclosed {
+                    continue;
+                }
+            }
+            let b = generalized_intersect(&r.rect, &via.rect);
+            let mut owners = vec![self.owner(r.net).clone()];
+            owners.dedup();
+            if self.seen.insert((b, layer, Rule::MinimumCut, owners.clone())) {
+                let victim = (self.owner(r.net).clone(), layer, r.rect, r.fixed);
+                let aggressor = (self.owner(via.net).clone(), vl, via.rect, via.fixed);
+                self.markers.push(Marker { rule: Rule::MinimumCut, layer, bbox: b, owners, victim: Some(victim), aggressor: Some(aggressor) });
+            }
+        }
     }
 
     /// `checkMetalCornerSpacing` alone, as the surgical fix's patch pass runs it: its markers in
@@ -952,13 +1096,13 @@ impl<'a> Worker<'a> {
                 }
                 for k in 0..self.nets[net].pins[layer].len() {
                     let mut pin = self.nets[net].pins[layer][k].clone();
-                    self.metal_shape_of(layer, net, &mut pin);
+                    self.metal_shape_of(layer, net, k, &mut pin);
                 }
             }
         }
     }
 
-    fn metal_shape_of(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+    fn metal_shape_of(&mut self, layer: usize, net: usize, k: usize, pin: &mut Polygon90Set) {
         // Minimum width: the pin sliced horizontally, each slice's x length; then sliced
         // vertically, each slice's y length.
         for r in pin.rectangles() {
@@ -968,6 +1112,7 @@ impl<'a> Worker<'a> {
             self.min_width(layer, net, r, r.yh - r.yl);
         }
         self.min_area(layer, net, pin);
+        self.min_step(layer, net, k);
         self.rect_only(layer, net, pin);
         self.min_enclosed_area(layer, net, pin);
     }
@@ -1160,6 +1305,30 @@ impl<'a> Worker<'a> {
             return false;
         }
         orientation(&segs[e.prev], e) == 1 && orientation(e, &segs[e.next]) == 1
+    }
+
+    /// `checkMetalShape_minStep` on the owner's pin `k`: its rings as the list holds them.
+    fn min_step(&mut self, layer: usize, net: usize, k: usize) {
+        let Some(con) = self.tech.layers[layer].min_step else { return };
+        let segs = &self.segs[layer];
+        let mut rings: Vec<Vec<(P, P, bool)>> = Vec::new();
+        let mut seen = vec![false; segs.len()];
+        for s in 0..segs.len() {
+            if seen[s] || segs[s].net != net || segs[s].pin != k {
+                continue;
+            }
+            let mut ring = Vec::new();
+            let mut i = s;
+            while !seen[i] {
+                seen[i] = true;
+                ring.push((segs[i].from, segs[i].to, segs[i].fixed));
+                i = segs[i].next;
+            }
+            rings.push(ring);
+        }
+        for b in min_step_boxes(&rings, &con) {
+            self.add_marker_of(Rule::MinStep, layer, b, (net, b, false), (net, b, false));
+        }
     }
 
     /// Whether the owner's ROUTE shapes overlap `r` (with an area).
@@ -1605,6 +1774,8 @@ impl<'a> Worker<'a> {
                 m
             }
         });
+        // A SPACING … RANGE rule holding the rectangle's own width widens the window.
+        let max_spc = self.tech.layers[layer].spacing_ranges.iter().filter(|c| c.in_range(width(&s.rect))).fold(max_spc, |m, c| m.max(c.min_spacing));
         let q = bloat(&s.rect, max_spc);
         if self.check_ndrs {
             let others: Vec<Shape> = self.spc_rq[layer].query(&q).into_iter().map(|(_, v)| self.spc[layer][v.1]).collect();
@@ -1661,9 +1832,26 @@ impl<'a> Worker<'a> {
     /// The spacing two shapes need: the table at the wider of the two widths (a blockage counts
     /// as the layer's width) and the run length.
     fn required_spacing(&self, layer: usize, r1: &Shape, r2: &Shape, prl: i32) -> i32 {
+        self.required_spacing_range(layer, r1, r2, prl).0
+    }
+
+    /// `checkMetalSpacing_prl_getReqSpcVal`: the table's spacing, then — two different owners —
+    /// a SPACING … RANGE rule holding either width that asks more (and so names the marker).
+    fn required_spacing_range(&self, layer: usize, r1: &Shape, r2: &Shape, prl: i32) -> (i32, bool) {
         let l = &self.tech.layers[layer];
         let w = |s: &Shape| if self.owner(s.net).is_blockage() { l.width } else { width(&s.rect) };
-        l.spacing.as_ref().map_or(0, |t| t.find(w(r1).max(w(r2)), prl))
+        let (w1, w2) = (w(r1), w(r2));
+        let mut req = l.spacing.as_ref().map_or(0, |t| t.find(w1.max(w2), prl));
+        let mut is_range = false;
+        if r1.net != r2.net {
+            for c in &l.spacing_ranges {
+                if (c.in_range(w1) || c.in_range(w2)) && c.min_spacing > req {
+                    is_range = true;
+                    req = c.min_spacing;
+                }
+            }
+        }
+        (req, is_range)
     }
 
     /// Apart but closer than the table allows is a violation only when the gap lies between TRUE
@@ -1673,7 +1861,8 @@ impl<'a> Worker<'a> {
         if r1.fixed && r2.fixed {
             return;
         }
-        let mut req = i64::from(self.required_spacing(layer, &r1, &r2, prl));
+        let (req0, is_range) = self.required_spacing_range(layer, &r1, &r2, prl);
+        let mut req = i64::from(req0);
         if self.check_ndrs {
             let z = (layer / 2).saturating_sub(1);
             let ndr = |s: &Shape| -> i64 {
@@ -1705,7 +1894,8 @@ impl<'a> Worker<'a> {
         } else if !self.spc_marker_outside_net(layer, r1.net, &marker) {
             return;
         }
-        self.add_marker_of(Rule::MetalSpacing, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
+        let rule = if is_range { Rule::SpacingRange } else { Rule::MetalSpacing };
+        self.add_marker_of(rule, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
     }
 
     /// Whether the marker's sides lie on boundary edges of either owner.
@@ -1898,7 +2088,7 @@ impl<'a> Worker<'a> {
     fn check_cut_spacing(&mut self) {
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none()) {
+            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_enclosures.is_empty()) {
                 continue;
             }
             let table = l.cut_table.clone();
@@ -1918,8 +2108,71 @@ impl<'a> Worker<'a> {
                     if let Some(t) = &table {
                         self.cut_spacing_table(layer, k, t);
                     }
+                    self.lef58_enclosure(layer, k);
                 }
             }
+        }
+    }
+
+    /// `checkLef58Enclosure_main(rect)`: a routed cut of a class with LEF58 enclosure rules below
+    /// and/or above: the same-owner metal rectangle there holding the cut (the widest, the first of
+    /// equals) must overhang it as one of the rules for its width allows.
+    fn lef58_enclosure(&mut self, layer: usize, k: usize) {
+        let v = self.shapes[layer][k];
+        if v.fixed || self.tech.layers[layer].cut_enclosures.is_empty() {
+            return;
+        }
+        let c = self.tech.layers[layer].cut_class_of(v.rect.dx().min(v.rect.dy()), v.rect.dx().max(v.rect.dy()));
+        let rules = |above: bool| -> Vec<crate::tech::CutEnclosure> {
+            self.tech.layers[layer].cut_enclosures.iter().copied().filter(|e| !e.eol && e.class == c && if above { !e.below_only } else { !e.above_only }).collect()
+        };
+        let (below, above) = (rules(false), rules(true));
+        let enclosing = |l: usize| -> Option<Shape> {
+            let mut best: Option<Shape> = None;
+            for o in self.query(l, &v.rect) {
+                let s = self.shapes[l][o];
+                if s.net != v.net || !(s.rect.xl <= v.rect.xl && s.rect.yl <= v.rect.yl && v.rect.xh <= s.rect.xh && v.rect.yh <= s.rect.yh) {
+                    continue;
+                }
+                if best.is_none_or(|b| width(&s.rect) > width(&b.rect)) {
+                    best = Some(s);
+                }
+            }
+            best
+        };
+        // (Both looked up first: a check only adds markers, the queries read shapes.)
+        let below_enc = if below.is_empty() { None } else { enclosing(layer - 1) };
+        let above_enc = if above.is_empty() { None } else { enclosing(layer + 1) };
+        if let Some(e) = below_enc {
+            self.lef58_enclosure_main(layer, &v, layer - 1, &e, &below);
+        }
+        if let Some(e) = above_enc {
+            self.lef58_enclosure_main(layer, &v, layer + 1, &e, &above);
+        }
+    }
+
+    /// `checkLef58Enclosure_main(via, enc)`: the cut's overhangs inside the metal (end along the
+    /// cut's longer side), against the rules of the widest WIDTH not above the metal's width, in
+    /// order; none satisfied gives a marker on the metal's layer, the cut's box. ⚠️ The source's
+    /// sides record their boxes with the top at the RIGHT edge (`ury = xh`), kept. A cut with no
+    /// enclosing metal, or no rule for the width, is skipped (the source reads a null there).
+    fn lef58_enclosure_main(&mut self, layer: usize, v: &Shape, el: usize, e: &Shape, rules: &[crate::tech::CutEnclosure]) {
+        let (vr, er) = (v.rect, e.rect);
+        let mut side = (er.xh - vr.xh).min(vr.xl - er.xl);
+        let mut end = (er.yh - vr.yh).min(vr.yl - er.yl);
+        if vr.dx() > vr.dy() {
+            std::mem::swap(&mut side, &mut end);
+        }
+        let w = width(&er);
+        let Some(key) = rules.iter().map(|r| r.min_width).filter(|&mw| mw <= w).max() else { return };
+        if rules.iter().filter(|r| r.min_width == key).any(|r| r.valid(end, side)) {
+            return;
+        }
+        let owners = vec![self.owner(v.net).clone()];
+        if self.seen.insert((vr, el, Rule::Lef58Enclosure, owners.clone())) {
+            let victim = (self.owner(v.net).clone(), layer, Rect::new(vr.xl, vr.yl, vr.xh, vr.xh), v.fixed);
+            let aggressor = (self.owner(e.net).clone(), el, Rect::new(er.xl, er.yl, er.xh, er.xh), e.fixed);
+            self.markers.push(Marker { rule: Rule::Lef58Enclosure, layer: el, bbox: vr, owners, victim: Some(victim), aggressor: Some(aggressor) });
         }
     }
 
@@ -2153,9 +2406,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
             ],
             manufacturing_grid: 5,
             via_defs: Vec::new(),
@@ -2621,6 +2874,127 @@ mod corner_tests {
         assert_eq!(r.find(-5), (50, 50));
         assert_eq!(r.find_max(), (300, 300));
         assert!(corners(r, Rect::new(160, 160, 260, 260), false).is_empty(), "60 is not below 50");
+    }
+}
+
+#[cfg(test)]
+mod min_step_tests {
+    use super::*;
+    use crate::tech::{MinStep, MinStepKind};
+
+    fn ring(pts: &[P], fixed: bool) -> Vec<(P, P, bool)> {
+        (0..pts.len()).map(|k| (pts[k], pts[(k + 1) % pts.len()], fixed)).collect()
+    }
+
+    // Rule (`checkMetalShape_minStep`): from the first edge at least MINSTEP long, each run of
+    // shorter edges up to the next long one is boxed by its edges' end points; a STEP rule marks it
+    // past MAXLENGTH (none: any run), unless every edge of it and the closing one is fixed. A 100
+    // square with a 10 x 10 notch at its top right corner: one run (the two notch edges).
+    #[test]
+    fn a_run_of_short_edges_between_long_ones_breaks_min_step() {
+        let notch = [(0, 0), (100, 0), (100, 90), (90, 90), (90, 100), (0, 100)];
+        let step = |max_length| MinStep { min_step_length: 20, kind: Some(MinStepKind::Step), max_length, max_edges: -1 };
+        // The box starts at the long edge's end before the run, (100, 90).
+        assert_eq!(min_step_boxes(&[ring(&notch, false)], &step(-1)), vec![Rect::new(90, 90, 100, 100)]);
+        // Within MAXLENGTH (the run is 20 long): no marker; fixed edges only: none either.
+        assert!(min_step_boxes(&[ring(&notch, false)], &step(20)).is_empty());
+        assert!(min_step_boxes(&[ring(&notch, true)], &step(-1)).is_empty());
+        // The corner types need a corner the walk never records.
+        let inside = MinStep { kind: Some(MinStepKind::InsideCorner), ..step(-1) };
+        assert!(min_step_boxes(&[ring(&notch, false)], &inside).is_empty());
+        // MAXEDGES (type unknown): marks only past it.
+        let edges = |n| MinStep { kind: None, max_edges: n, ..step(-1) };
+        assert_eq!(min_step_boxes(&[ring(&notch, false)], &edges(1)).len(), 1);
+        assert!(min_step_boxes(&[ring(&notch, false)], &edges(2)).is_empty());
+        // An edge exactly MINSTEP long is not short: a 10 notch under MINSTEP 10 is clean.
+        assert!(min_step_boxes(&[ring(&notch, false)], &MinStep { min_step_length: 10, ..step(-1) }).is_empty());
+        // A plain rectangle has no short edge.
+        assert!(min_step_boxes(&[ring(&[(0, 0), (100, 0), (100, 100), (0, 100)], false)], &step(-1)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod min_cut_tests {
+    use super::*;
+    use crate::tech::MinCut;
+
+    // Rule (`checkMinimumCut`): a same-owner cut below a rectangle at least WIDTH wide is a
+    // violation (no LENGTH); FROMABOVE looks only above; a narrower rectangle, or both fixed, none.
+    // Layers 2 (routing), 3 (cut), 4 (routing).
+    #[test]
+    fn a_single_cut_under_a_wide_rectangle_breaks_minimum_cut() {
+        let run = |m: MinCut, wide: Rect, fixed: bool| {
+            let mut t = tests::tech();
+            t.layers[4].min_cuts = vec![m];
+            let mut w = Worker::new(&t);
+            w.add(&Owner::Net("a".into()), 4, wide, fixed);
+            w.add(&Owner::Net("a".into()), 3, Rect::new(100, 100, 150, 150), fixed);
+            w.add(&Owner::Net("a".into()), 2, Rect::new(0, 0, 300, 300), fixed);
+            w.init();
+            w.run().iter().filter(|m| m.rule == Rule::MinimumCut).map(|m| (m.bbox, m.aggressor.as_ref().map(|a| a.1))).collect::<Vec<_>>()
+        };
+        let rule = MinCut { num_cuts: 2, width: 300, within: None, from_above: None, length: None };
+        assert_eq!(run(rule, Rect::new(0, 0, 1000, 400), false), vec![(Rect::new(100, 100, 150, 150), Some(3))]);
+        assert!(run(rule, Rect::new(0, 0, 1000, 290), false).is_empty());
+        // Exactly WIDTH wide triggers (the check skips only narrower).
+        assert_eq!(run(MinCut { width: 400, ..rule }, Rect::new(0, 0, 1000, 400), false).len(), 1);
+        assert!(run(MinCut { from_above: Some(true), ..rule }, Rect::new(0, 0, 1000, 400), false).is_empty());
+        assert!(run(rule, Rect::new(0, 0, 1000, 400), true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod enclosure_range_tests {
+    use super::*;
+    use crate::tech::{CutEnclosure, SpacingRange};
+
+    // Rule (`checkLef58Enclosure_main`): a cut on layer 3 inside metal on layer 4 wider than the
+    // rule's WIDTH must overhang it by (first, second) either way round (ENDSIDE: ends then sides);
+    // the rule of the widest WIDTH not above the metal's width decides; the marker sits on the
+    // metal's layer at the cut, its sides with the top at the right edge. Cut 100..150 square.
+    #[test]
+    fn a_cut_too_close_to_its_metal_edge_breaks_lef58_enclosure() {
+        let run = |rules: Vec<CutEnclosure>, metal: Rect| {
+            let mut t = tests::tech();
+            t.layers[3].cut_enclosures = rules;
+            let mut w = Worker::new(&t);
+            w.add(&Owner::Net("a".into()), 3, Rect::new(100, 100, 150, 150), false);
+            w.add(&Owner::Net("a".into()), 4, metal, false);
+            w.init();
+            w.run().iter().filter(|m| m.rule == Rule::Lef58Enclosure).map(|m| (m.layer, m.bbox, m.victim.as_ref().map(|v| v.2))).collect::<Vec<_>>()
+        };
+        let rule = |first, second, min_width, endside| CutEnclosure { class: 0, above_only: true, below_only: false, eol: false, endside, first, second, min_width };
+        // Overhangs: sides (x) 10, ends (y) 30.
+        let metal = Rect::new(90, 70, 160, 180);
+        assert!(run(vec![rule(30, 10, 0, false)], metal).is_empty());
+        assert!(run(vec![rule(10, 30, 0, false)], metal).is_empty(), "either way round");
+        assert_eq!(run(vec![rule(10, 30, 0, true)], metal), vec![(4, Rect::new(100, 100, 150, 150), Some(Rect::new(100, 100, 150, 150)))]);
+        // The WIDTH 100 rule does not apply to a 70-wide metal: the WIDTH 0 one (satisfied) does.
+        assert!(run(vec![rule(30, 10, 0, false), rule(50, 50, 100, false)], metal).is_empty());
+        // A metal exactly the WIDTH wide takes that rule (70 here: 50 overhangs not met).
+        assert_eq!(run(vec![rule(30, 10, 0, false), rule(50, 50, 70, false)], metal).len(), 1);
+        // BELOW-only rules are not checked above.
+        assert!(run(vec![CutEnclosure { above_only: false, below_only: true, ..rule(50, 50, 0, false) }], metal).is_empty());
+    }
+
+    // Rule (`checkMetalSpacing_prl_getReqSpcVal`): between two owners, a SPACING … RANGE rule
+    // holding either width that asks more than the table decides the spacing — and names the
+    // marker. Layer 4 table: 140 (widths below 3000). Wires 140 wide, 200 apart.
+    #[test]
+    fn a_range_rule_asking_more_than_the_table_names_the_marker() {
+        let run = |ranges: Vec<SpacingRange>| {
+            let mut t = tests::tech();
+            t.layers[4].spacing_ranges = ranges;
+            let mut w = Worker::new(&t);
+            w.add(&Owner::Net("a".into()), 4, Rect::new(0, 0, 1000, 140), false);
+            w.add(&Owner::Net("b".into()), 4, Rect::new(0, 340, 1000, 480), false);
+            w.init();
+            w.run().iter().map(|m| m.rule).filter(|r| *r == Rule::SpacingRange || *r == Rule::MetalSpacing).collect::<Vec<_>>()
+        };
+        assert!(run(vec![]).is_empty());
+        assert_eq!(run(vec![SpacingRange { min_spacing: 250, min_width: 100, max_width: 200 }]), vec![Rule::SpacingRange]);
+        assert!(run(vec![SpacingRange { min_spacing: 250, min_width: 150, max_width: 200 }]).is_empty(), "out of range");
+        assert_eq!(run(vec![SpacingRange { min_spacing: 250, min_width: 140, max_width: 140 }]), vec![Rule::SpacingRange], "both bounds inclusive");
     }
 }
 

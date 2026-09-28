@@ -50,6 +50,9 @@ pub struct Layer {
     pub cut_classes: Vec<CutClass>,
     /// A cut layer's LEF58 different-net cut spacing table (the only kind modelled).
     pub cut_table: Option<CutSpacingTable>,
+    /// A cut layer's LEF58 enclosure rules as io keeps them (`frLef58EnclosureConstraint`), in the
+    /// technology's order.
+    pub cut_enclosures: Vec<CutEnclosure>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line SPACING rules, in the technology's order (the
@@ -72,6 +75,61 @@ pub struct Layer {
     /// access (on-grid points only), the maze grid (right-way edges on tracks only; an off-grid via
     /// only at an access point) and, through `Tech::allow_pin_feedthrough`, guides and the maze.
     pub right_way_on_grid_only: bool,
+    /// A routing layer's v5.4 MINIMUMCUT rules as io keeps them (`frMinimumcutConstraint`).
+    pub min_cuts: Vec<MinCut>,
+    /// A routing layer's v5.8 MINSTEP rule as io keeps it (`frMinStepConstraint`).
+    pub min_step: Option<MinStep>,
+    /// A routing layer's v5.4 SPACING … RANGE rules, in the technology's order
+    /// (`frSpacingRangeConstraint`; io keeps them out of the spacing table).
+    pub spacing_ranges: Vec<SpacingRange>,
+}
+
+/// `frSpacingRangeConstraint`: SPACING for a rectangle whose width is within [min, max].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpacingRange {
+    pub min_spacing: i32,
+    pub min_width: i32,
+    pub max_width: i32,
+}
+
+impl SpacingRange {
+    pub fn in_range(&self, w: i32) -> bool {
+        w >= self.min_width && w <= self.max_width
+    }
+}
+
+/// `frMinStepConstraint`: a run of edges each shorter than MINSTEP between two longer ones is a
+/// violation — unless its type needs a corner the check never records (INSIDECORNER,
+/// OUTSIDECORNER), the run is within MAXLENGTH, or (MAXEDGES, type then unknown) within MAXEDGES.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinStep {
+    pub min_step_length: i32,
+    /// The rule's type; `None` (the source's UNKNOWN) with MAXEDGES or none given.
+    pub kind: Option<MinStepKind>,
+    /// MAXLENGTH, -1 without one.
+    pub max_length: i32,
+    /// MAXEDGES, -1 without one.
+    pub max_edges: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinStepKind {
+    InsideCorner,
+    OutsideCorner,
+    Step,
+}
+
+/// `frMinimumcutConstraint`: NUMCUTS cuts needed where the metal is wider than WIDTH; WITHIN,
+/// the connection side and LENGTH … WITHIN are optional (`None` for the source's -1 / UNKNOWN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinCut {
+    pub num_cuts: i32,
+    pub width: i32,
+    pub within: Option<i32>,
+    /// `Some(true)` FROMABOVE, `Some(false)` FROMBELOW.
+    pub from_above: Option<bool>,
+    /// LENGTH and its WITHIN distance.
+    pub length: Option<(i32, i32)>,
 }
 
 /// An end-of-line spacing rule: a line end narrower than `width` needs `space` to a facing edge
@@ -142,6 +200,32 @@ impl CornerSpacing {
 
 /// A LEF58 cut class (`frLef58CutClass`): a cut `width` by `length` (the width when the class
 /// gives no length).
+/// `frLef58EnclosureConstraint`: for a cut of `class` (this crate's index: 0 no class, else the
+/// class's place + 1), a metal of at least `min_width` above and/or below (ABOVE / BELOW: only
+/// there) must overhang it by `first` and `second` — at the ends and sides for ENDSIDE, either way
+/// round otherwise. EOL-type rules are kept but never checked (the check reads the others only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutEnclosure {
+    pub class: usize,
+    pub above_only: bool,
+    pub below_only: bool,
+    pub eol: bool,
+    pub endside: bool,
+    pub first: i32,
+    pub second: i32,
+    pub min_width: i32,
+}
+
+impl CutEnclosure {
+    /// `isValidOverhang`.
+    pub fn valid(&self, end: i32, side: i32) -> bool {
+        if self.endside {
+            return end >= self.first && side >= self.second;
+        }
+        (end >= self.first && side >= self.second) || (end >= self.second && side >= self.first)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CutClass {
     pub name: String,
@@ -446,6 +530,23 @@ pub mod read {
     /// rule, and a LAYER rule on the first layer), or the first kind outside the modelled one — a
     /// different-net table on the layer itself (no LAYER, SAMENET or SAMEMETAL). Several such
     /// rules: the LAST is the one set, as io sets it.
+    /// A LEF58 enclosure rule io keeps: not EOL with SIDESPACING / ENDSPACING, not HORIZONTAL /
+    /// VERTICAL, INCLUDEABUTTED, OFFCENTERLINE, LENGTH, EXTRACUT, REDUNDANTCUT, PARALLEL or
+    /// CONCAVECORNERS, and with a CUTCLASS.
+    pub fn cut_enclosure_kept(db: &Db, layer: &str, k: usize) -> bool {
+        let ty = db.cutenclosurerule_get_type(layer, k);
+        !(ty == "EOL" && (db.cutenclosurerule_is_side_spacing_valid(layer, k) || db.cutenclosurerule_is_end_spacing_valid(layer, k)))
+            && ty != "HORZ_AND_VERT"
+            && !db.cutenclosurerule_is_include_abutted(layer, k)
+            && !db.cutenclosurerule_is_off_center_line(layer, k)
+            && !db.cutenclosurerule_is_length_valid(layer, k)
+            && !db.cutenclosurerule_is_extra_cut_valid(layer, k)
+            && !db.cutenclosurerule_is_redundant_cut_valid(layer, k)
+            && !db.cutenclosurerule_is_parallel_valid(layer, k)
+            && !db.cutenclosurerule_is_concave_corners_valid(layer, k)
+            && db.cutenclosurerule_is_cut_class_valid(layer, k)
+    }
+
     pub fn cut_spacing_table(db: &Db, layer: &str, classes: &[CutClass]) -> Result<Option<CutSpacingTable>, &'static str> {
         let mut out = None;
         for k in 0..db.num_layer_get_tech_layer_cut_spacing_table_def_rules(layer) {
@@ -634,14 +735,73 @@ pub mod read {
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
                     let right_way_on_grid_only = db.layer_is_right_way_on_grid_only(&name) || db.layer_get_num_masks(&name) > 1;
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only });
+                    let spacing_ranges: Vec<SpacingRange> = db
+                        .layer_v54_spacing_rules(&name)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|(sp, range)| range.map(|(lo, hi)| SpacingRange { min_spacing: sp as i32, min_width: lo as i32, max_width: hi as i32 }))
+                        .collect();
+                    // io: MAXEDGES makes the type unknown.
+                    let min_step = db.layer_has_min_step(&name).then(|| {
+                        let mut kind = match db.layer_get_min_step_type(&name).as_str() {
+                            "INSIDECORNER" => Some(MinStepKind::InsideCorner),
+                            "OUTSIDECORNER" => Some(MinStepKind::OutsideCorner),
+                            "STEP" => Some(MinStepKind::Step),
+                            _ => None,
+                        };
+                        let max_length = if db.layer_has_min_step_max_length(&name) { db.layer_get_min_step_max_length(&name) as i32 } else { -1 };
+                        let mut max_edges = -1;
+                        if db.layer_has_min_step_max_edges(&name) {
+                            max_edges = db.layer_get_min_step_max_edges(&name) as i32;
+                            kind = None;
+                        }
+                        MinStep { min_step_length: db.layer_get_min_step(&name) as i32, kind, max_length, max_edges }
+                    });
+                    // io: a rule without a minimum-cuts value is skipped; BELOW ONLY overrides ABOVE.
+                    let min_cuts: Vec<MinCut> = (0..db.num_layer_get_min_cut_rules(&name))
+                        .filter(|&k| db.v54mincutrule_get_minimum_cuts_valid(&name, k))
+                        .map(|k| {
+                            let mut from_above = None;
+                            if db.v54mincutrule_is_above_only(&name, k) {
+                                from_above = Some(true);
+                            }
+                            if db.v54mincutrule_is_below_only(&name, k) {
+                                from_above = Some(false);
+                            }
+                            MinCut {
+                                num_cuts: db.v54mincutrule_get_minimum_cuts_numcuts(&name, k) as i32,
+                                width: db.v54mincutrule_get_minimum_cuts_width(&name, k) as i32,
+                                within: db.v54mincutrule_get_cut_distance_valid(&name, k).then(|| db.v54mincutrule_get_cut_distance_cut_distance(&name, k) as i32),
+                                from_above,
+                                length: db.v54mincutrule_get_length_for_cuts_valid(&name, k).then(|| (db.v54mincutrule_get_length_for_cuts_length(&name, k) as i32, db.v54mincutrule_get_length_for_cuts_distance(&name, k) as i32)),
+                            }
+                        })
+                        .collect();
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, min_cuts, min_step, spacing_ranges });
                 }
                 "CUT" if !layers.is_empty() => {
                     let width = db.layer_get_width(&name) as i32;
                     let cut_spacing = Some(db.layer_get_spacing(&name)).filter(|&s| s > 0);
                     let cut_classes = cut_classes(db, &name);
                     let cut_table = cut_spacing_table(db, &name, &cut_classes).ok().flatten();
-                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, ..Layer::default() });
+                    let cut_enclosures = (0..db.num_layer_get_tech_layer_cut_enclosure_rules(&name))
+                        .filter(|&k| cut_enclosure_kept(db, &name, k))
+                        .filter_map(|k| {
+                            let class = cut_classes.iter().position(|c| c.name == db.cutenclosurerule_get_cut_class(&name, k))? + 1;
+                            let ty = db.cutenclosurerule_get_type(&name, k);
+                            Some(CutEnclosure {
+                                class,
+                                above_only: db.cutenclosurerule_is_above(&name, k),
+                                below_only: db.cutenclosurerule_is_below(&name, k),
+                                eol: ty == "EOL",
+                                endside: ty == "ENDSIDE",
+                                first: db.cutenclosurerule_get_first_overhang(&name, k) as i32,
+                                second: db.cutenclosurerule_get_second_overhang(&name, k) as i32,
+                                min_width: db.cutenclosurerule_get_min_width(&name, k) as i32,
+                            })
+                        })
+                        .collect();
+                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_enclosures, ..Layer::default() });
                 }
                 _ => {}
             }

@@ -26,7 +26,7 @@
 
 use crate::pa::stack::default_via;
 use crate::polygon90::Rect;
-use crate::tech::{Dir, LayerKind, SpacingTable, Tech, ViaDef};
+use crate::tech::{MinCut, Dir, LayerKind, SpacingTable, Tech, ViaDef};
 
 /// Forbidden length ranges, `(low, high)`.
 pub type Ranges = Vec<(i32, i32)>;
@@ -92,6 +92,8 @@ pub struct RuleTables {
     /// Per routing-layer index.
     pub eol: Vec<EolTable>,
     pub ndrs: Vec<NdrTables>,
+    /// Per technology layer: `hasVia2ViaMinStepViol` (`prep_minStepViasCheck`).
+    pub min_step_via: Vec<bool>,
 }
 
 /// The routing settings the tables read.
@@ -182,6 +184,18 @@ fn enclosure(vd: &ViaDef, layer: usize) -> Rect {
     }
 }
 
+/// `hasMinStepViol`: the two rectangles joined — one polygon, else no — its outer ring through the
+/// check's MINSTEP walk (every edge off the fixed shapes).
+fn has_min_step_viol(a: &Rect, b: &Rect, con: &crate::tech::MinStep) -> bool {
+    let polys = crate::polygon_formation::polygons_with_holes(&[*a, *b]);
+    if polys.len() != 1 {
+        return false;
+    }
+    let o = &polys[0].outer;
+    let ring: Vec<((i32, i32), (i32, i32), bool)> = (0..o.len()).map(|k| (o[k], o[(k + 1) % o.len()], false)).collect();
+    !crate::gc::min_step_boxes(&[ring], con).is_empty()
+}
+
 fn z_of(layer: usize) -> i64 {
     layer as i64 / 2 - 1
 }
@@ -258,6 +272,42 @@ impl Ctx<'_> {
         }
     }
 
+    /// `prep_via2viaForbiddenLen_minimumCut`: a via whose pad on layer `l` triggers a MINIMUMCUT
+    /// rule (wider than WIDTH, longer than LENGTH if given) keeps the other via's cut off that pad —
+    /// by LENGTH's distance when given — along the LAYER's direction (not the entry's), when the
+    /// rule's connection side (FROMABOVE / FROMBELOW) is the other via's. ⚠️ A rule whose first
+    /// half fails its connection skips its second half too (the source's `continue`).
+    fn via2via_min_cut(&self, l: usize, v1: usize, v2: usize, out: &mut Ranges) {
+        let tech = self.tech;
+        let horizontal = tech.layers[l].is_horizontal();
+        let (vd1, vd2) = (&tech.via_defs[v1], &tech.via_defs[v2]);
+        let (b1, b2) = (enclosure(vd1, l), enclosure(vd2, l));
+        let (c1, c2) = (bbox(&vd1.cut_figs), bbox(&vd2.cut_figs));
+        let (above1, above2) = (vd1.layer1 == l, vd2.layer1 == l);
+        let wl = |b: &Rect| (b.dx().min(b.dy()), b.dx().max(b.dy()));
+        let ((w1, len1), (w2, len2)) = (wl(&b1), wl(&b2));
+        let triggers = |m: &MinCut, w: i32, len: i32| m.length.is_none_or(|(ml, _)| len > ml) && w > m.width;
+        let side_ok = |m: &MinCut, other_above: bool| m.from_above.is_none_or(|a| a == other_above);
+        let req = |m: &MinCut, cut: &Rect, pad: &Rect| {
+            let d = m.length.map_or(0, |(_, dist)| dist);
+            d + if horizontal { (cut.xh - pad.xl).max(pad.xh - cut.xl) } else { (cut.yh - pad.yl).max(pad.yh - cut.yl) }
+        };
+        for m in &tech.layers[l].min_cuts {
+            if triggers(m, w1, len1) {
+                if !side_ok(m, above2) {
+                    continue;
+                }
+                out.push((0, req(m, &c2, &b1)));
+            }
+            if triggers(m, w2, len2) {
+                if !side_ok(m, above1) {
+                    continue;
+                }
+                out.push((0, req(m, &c1, &b2)));
+            }
+        }
+    }
+
     fn via2via_cut_spc(&self, v1: usize, v2: usize, along_x: bool, out: &mut Ranges) {
         let tech = self.tech;
         let (vd1, vd2) = (&tech.via_defs[v1], &tech.via_defs[v2]);
@@ -304,6 +354,129 @@ impl Ctx<'_> {
         }
     }
 
+    /// `prep_via2viaForbiddenLen_minStep`: one via below and one above layer `l` (their pads on it):
+    /// the narrower pad across `vertical` shifts along it until the joined shape no longer breaks
+    /// the layer's MINSTEP (`hasMinStepViol`, the check's own walk) — the distances where it does
+    /// are forbidden, `[minRange − 1, minRange + shift + 1]`.
+    fn via2via_min_step(&self, l: usize, v1: usize, v2: usize, vertical: bool, out: &mut Ranges) {
+        let tech = self.tech;
+        let Some(con) = tech.layers[l].min_step else { return };
+        let (vd1, vd2) = (&tech.via_defs[v1], &tech.via_defs[v2]);
+        if vd1.layer1 == vd2.layer1 {
+            return;
+        }
+        let (e1, e2) = if vd1.layer1 == l { (vd1.layer1_bbox(), vd2.layer2_bbox()) } else { (vd1.layer2_bbox(), vd2.layer1_bbox()) };
+        let across = |r: &Rect| if vertical { r.dx() } else { r.dy() };
+        let (mut sh, other) = if across(&e1) < across(&e2) {
+            (e1, e2)
+        } else if across(&e2) < across(&e1) {
+            (e2, e1)
+        } else {
+            return;
+        };
+        let mv = |r: &mut Rect, d: i32| {
+            if vertical {
+                r.yl += d;
+                r.yh += d;
+            } else {
+                r.xl += d;
+                r.xh += d;
+            }
+        };
+        let viol = |a: &Rect| has_min_step_viol(a, &other, &con);
+        let mut min_range = 0;
+        if other.xl <= sh.xl && other.yl <= sh.yl && sh.xh <= other.xh && sh.yh <= other.yh {
+            min_range = if vertical { other.yh - sh.yh + 1 } else { other.xh - sh.xh + 1 };
+            mv(&mut sh, min_range);
+        }
+        let (sh_edge, other_edge, sh_low, other_low, other_high) = if vertical {
+            (sh.yh - other.yh, other.xh - sh.xh, sh.yl, other.yl, other.yh)
+        } else {
+            (sh.xh - other.xh, other.yh - sh.yh, sh.xl, other.xl, other.xh)
+        };
+        let msl = con.min_step_length;
+        let shift;
+        if viol(&sh) {
+            if sh_edge < msl {
+                let mut s = msl - sh_edge - 1;
+                if sh_low < other_low {
+                    s = s.max(other_low - sh_low - 1);
+                }
+                mv(&mut sh, s + 1);
+                if viol(&sh) {
+                    s = other_high - sh_low;
+                }
+                shift = s;
+            } else {
+                shift = other_high - sh_low;
+            }
+        } else if sh_edge < msl {
+            if con.max_length <= 0 {
+                return;
+            }
+            let mut div = 2;
+            let mut length = sh_edge;
+            let top_sh = if vertical { sh.dx() } else { sh.dy() };
+            let top_other = if vertical { other.dy() } else { other.dx() };
+            if top_sh < msl {
+                length += top_sh + sh_edge;
+                if other_edge < msl {
+                    length += 2 * other_edge;
+                    if top_other < msl {
+                        return;
+                    }
+                }
+            } else if other_edge < msl {
+                length += other_edge;
+                div = 1;
+                if top_other < msl {
+                    length += top_other + other_edge + sh_edge;
+                }
+            }
+            let s = (con.max_length - length) / div + 1;
+            if s < 0 {
+                return;
+            }
+            mv(&mut sh, s);
+            if !viol(&sh) {
+                return;
+            }
+            min_range = s;
+            shift = other_high - sh_low;
+        } else {
+            min_range = other_low - sh_low - msl + 1;
+            mv(&mut sh, min_range);
+            if !viol(&sh) {
+                return;
+            }
+            let mut s = msl - 2;
+            mv(&mut sh, s + 1);
+            if viol(&sh) {
+                s = other_high - sh_low;
+            }
+            shift = s;
+        }
+        out.push((min_range - 1, min_range + shift + 1));
+    }
+
+    /// `prep_minStepViasCheck`: per routing layer with a layer below and above it in the technology
+    /// and a MINSTEP rule, whether the default vias' pads below and above it, joined, break the rule
+    /// (the reference then patches such shapes in its check — `patchMetalShape_minStep`).
+    pub fn min_step_via_flags(&self) -> Vec<bool> {
+        let tech = self.tech;
+        let top = tech.top_layer_num();
+        (0..tech.layers.len())
+            .map(|l| {
+                if tech.layers[l].kind != LayerKind::Routing || l < 2 || l + 2 > top {
+                    return false;
+                }
+                let (Some(down), Some(up)) = (self.default_at(l as i64 - 1), self.default_at(l as i64 + 1)) else { return false };
+                let Some(con) = tech.layers[l].min_step else { return false };
+                has_min_step_viol(&tech.via_defs[up].layer1_bbox(), &tech.via_defs[down].layer2_bbox(), &con)
+            })
+            .collect()
+    }
+
     fn via2via_prl(&self, l: usize, v1: usize, v2: usize, along_x: bool) -> i32 {
         let (b1, b2) = (enclosure(&self.tech.via_defs[v1], l), enclosure(&self.tech.via_defs[v2], l));
         if along_x {
@@ -317,8 +490,10 @@ impl Ctx<'_> {
         let mut r = Ranges::new();
         if let (Some(a), Some(b)) = (v1, v2) {
             self.via2via_min_spc(l, a, b, along_x, &mut r, ndr);
+            self.via2via_min_cut(l, a, b, &mut r);
             self.via2via_cut_spc(a, b, along_x, &mut r);
             self.via2via_lef58_cut_spc_tbl(a, b, along_x, &mut r);
+            self.via2via_min_step(l, a, b, !along_x, &mut r);
         }
         let prl = match (v1, v2) {
             (Some(a), Some(b)) => self.via2via_prl(l, a, b, along_x),
@@ -456,6 +631,30 @@ impl Ctx<'_> {
 }
 
 /// Every table, in the order they are computed.
+/// `prep_cutSpcTbl`: on each cut layer with a default via, the LEF58 different-net cut spacing
+/// table's DEFAULT (what the maze's cut cost reads) is REPLACED by the table's maximum for the
+/// default via's cut class against itself (`getMaxSpacing`, the most of END/SIDE either side),
+/// first and second, and that pair's centre flags — io's raw first entry stays only where the
+/// layer has no default via. (The inter-layer table's branch is not modelled: those are refused.)
+pub fn prep_cut_spc_tbl(tech: &mut Tech, defaults: &[Option<usize>]) {
+    for l in 0..tech.layers.len() {
+        if tech.layers[l].kind != LayerKind::Cut {
+            continue;
+        }
+        let Some(v) = defaults.get(l).copied().flatten() else { continue };
+        let cb = bbox(&tech.via_defs[v].cut_figs);
+        let c = tech.layers[l].cut_class_of(cb.dx().min(cb.dy()), cb.dx().max(cb.dy()));
+        let Some(tb) = tech.layers[l].cut_table.as_mut() else { continue };
+        let sides = [(true, true), (true, false), (false, true), (false, false)];
+        let first = sides.iter().map(|&(a, b)| tb.get(c, a, c, b).0).max().unwrap_or(0);
+        let second = sides.iter().map(|&(a, b)| tb.get(c, a, c, b).1).max().unwrap_or(0);
+        let pair = tb.pair(c, c);
+        tb.default_spacing = (first, second);
+        tb.default_center_to_center = tb.center_to_center[pair];
+        tb.default_center_and_edge = tb.center_and_edge[pair];
+    }
+}
+
 pub fn rule_tables(tech: &Tech, defaults: &[Option<usize>], ndrs: &[NdrRule], cfg: &RuleConfig) -> RuleTables {
     let c = Ctx { tech, defaults, cfg };
     let v2v = c.via2via_forbidden_len(None);
@@ -480,7 +679,7 @@ pub fn rule_tables(tech: &Tech, defaults: &[Option<usize>], ndrs: &[NdrRule], cf
         .iter()
         .map(|n| NdrTables { name: n.name.clone(), via2via: c.via2via_forbidden_len(Some(n)).into_iter().map(|(t, _)| t).collect(), turn: c.via_forbidden_turn_len(Some(n)), eol: ndr_eol(n) })
         .collect();
-    RuleTables { layers, eol, ndrs }
+    RuleTables { layers, eol, ndrs, min_step_via: c.min_step_via_flags() }
 }
 
 #[cfg(test)]
@@ -609,6 +808,23 @@ mod tests {
         let mut out = Ranges::new();
         c.via2via_cut_spc(0, 0, true, &mut out);
         assert_eq!(out, vec![(0, 160)]);
+    }
+
+    // Rule (`prep_cutSpcTbl`): a cut layer with a default via takes, as its table default, the
+    // most of END/SIDE either side for the via's class against itself, first and second; a layer
+    // without one keeps io's value.
+    #[test]
+    fn the_cut_table_default_is_the_default_via_class_maximum() {
+        let mut t = tech(vec![via("v", r(-100, -100, 100, 100), r(-50, -50, 50, 50))]);
+        // One class (no class): entries (c1, s1, c2, s2) = END/SIDE pairs.
+        let spacing = vec![(10, 20), (30, 5), (7, 40), (1, 2)];
+        t.layers[3].cut_table = Some(crate::tech::CutSpacingTable { n: 1, spacing, center_to_center: vec![true], center_and_edge: vec![false], default_spacing: (99, 99), ..Default::default() });
+        let mut without = t.clone();
+        prep_cut_spc_tbl(&mut t, &[None, None, None, Some(0), None]);
+        let tb = t.layers[3].cut_table.as_ref().unwrap();
+        assert_eq!((tb.default_spacing, tb.default_center_to_center), ((30, 40), true));
+        prep_cut_spc_tbl(&mut without, &[None, None, None, None, None]);
+        assert_eq!(without.layers[3].cut_table.as_ref().unwrap().default_spacing, (99, 99));
     }
 
     // Rule (`prep_via2viaForbiddenLen_lef58CutSpcTbl`): two cuts on one layer under its LEF58

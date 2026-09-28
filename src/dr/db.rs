@@ -23,6 +23,7 @@ pub use crate::dr::wire::InitialRouting;
 /// the maze's pin feedthrough); a multi-patterned layer, which io also gives it, stays refused.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
+    let has_block_master = db.inst_names().iter().any(|i| db.master_get_type(&db.inst_get_master(i)).unwrap_or_default().starts_with("BLOCK"));
     for l in &tech.layers {
         if l.kind == LayerKind::Placeholder {
             continue;
@@ -30,9 +31,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         if l.kind == LayerKind::Routing {
             if db.layer_get_num_masks(&l.name) > 1 {
                 out.push(format!("{}: multi-patterned", l.name));
-            }
-            if db.layer_v54_spacing_rules(&l.name).unwrap_or_default().iter().any(|r| r.1.is_some()) {
-                out.push(format!("{}: spacing with a width range", l.name));
             }
         }
         // Families the reference's io translates that the database census does not list, counted
@@ -42,7 +40,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         let name = l.name.as_str();
         let kept = |n: usize, keeps: &dyn Fn(usize) -> bool| (0..n).filter(|&k| keeps(k)).count();
         let untracked = [
-            ("lef58_cut_enclosure", kept(db.num_layer_get_tech_layer_cut_enclosure_rules(name), &|k| cut_enclosure_kept(db, name, k))),
             ("lef58_max_spacing", kept(db.num_layer_get_tech_layer_max_spacing_rules(name), &|k| db.maxspacingrule_has_cut_class(name, k))),
             ("lef58_two_wires_forbidden_spacing", db.num_layer_get_tech_layer_two_wires_forbidden_spc_rules(name)),
             ("lef58_width_table_orthogonal", kept(db.num_layer_get_tech_layer_width_table_rules(name), &|k| db.widthtablerule_is_orthogonal(name, k))),
@@ -63,15 +60,36 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 continue;
             }
             if family == "lef58_corner_spacing" {
-                // ⛔ The check models the subset, but the router's side does not exist yet: the
-                // worker's corner-spacing PATCH pass (`patchMetalShape_cornerSpacing`) and a block
-                // pin's corner-to-corner cost (`modCornerToCornerSpacing`). Refused until both are.
-                let clause = (0..n).find_map(|k| crate::tech::read::corner_spacing_rule(db, &l.name, k).err()).unwrap_or("the router's corner patch pass and block-pin cost");
-                out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                // Modelled rule by rule (the first clause outside the subset names the refusal),
+                // with the router's patch pass (`patchMetalShape_cornerSpacing`). ⛔ Not modelled: a
+                // BLOCK master pin's corner-to-corner cost (`modCornerToCornerSpacing`, block masters
+                // only) — refused while the design instantiates a block master (conservatively,
+                // whether or not its pins reach this layer).
+                if let Some(clause) = (0..n).find_map(|k| crate::tech::read::corner_spacing_rule(db, &l.name, k).err()) {
+                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                } else if has_block_master {
+                    out.push(format!("{}: {family} ({n}, a block master's pin corner cost)", l.name));
+                }
+                continue;
+            }
+            if family == "lef58_cut_spacing_table" {
+                // Modelled for the different-net table on the layer itself (check, maze cost,
+                // via-to-via and the default `prep_cutSpcTbl` sets); the reader names any other kind.
+                if let Err(clause) = crate::tech::read::cut_spacing_table(db, &l.name, &l.cut_classes) {
+                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                }
                 continue;
             }
             let modelled = match family.as_str() {
                 "cut_spacing" => n <= 1,
+                // Cut classes: read into the layer, looked up by a cut's width and length.
+                "lef58_cut_class" => true,
+                // MINSTEP: the check (`checkMetalShape_minStep`) and the via-to-via prep; a layer
+                // whose via pads break it is refused when the tables are built.
+                "min_step" => true,
+                // MINIMUMCUT: the check (`checkMinimumCut`), the maze cost around committed vias and
+                // macro pins (`modMinimumcutCostVia`) and the via-to-via prep.
+                "min_cut" => true,
                 "v55_influence" => true,
                 "lef58_eol_keepout" => true,
                 _ => false,
@@ -97,22 +115,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     out
 }
 
-/// Whether `io::Parser` keeps LEF58 enclosure rule `k` of cut layer `layer`: it skips EOL rules
-/// with SIDESPACING or ENDSPACING, HORIZONTAL/VERTICAL, INCLUDEABUTTED, OFFCENTERLINE, LENGTH,
-/// EXTRACUT, REDUNDANTCUT, PARALLEL, CONCAVECORNERS and any rule without a CUTCLASS.
-fn cut_enclosure_kept(db: &Db, layer: &str, k: usize) -> bool {
-    let ty = db.cutenclosurerule_get_type(layer, k);
-    !(ty == "EOL" && (db.cutenclosurerule_is_side_spacing_valid(layer, k) || db.cutenclosurerule_is_end_spacing_valid(layer, k)))
-        && ty != "HORZ_AND_VERT"
-        && !db.cutenclosurerule_is_include_abutted(layer, k)
-        && !db.cutenclosurerule_is_off_center_line(layer, k)
-        && !db.cutenclosurerule_is_length_valid(layer, k)
-        && !db.cutenclosurerule_is_extra_cut_valid(layer, k)
-        && !db.cutenclosurerule_is_redundant_cut_valid(layer, k)
-        && !db.cutenclosurerule_is_parallel_valid(layer, k)
-        && !db.cutenclosurerule_is_concave_corners_valid(layer, k)
-        && db.cutenclosurerule_is_cut_class_valid(layer, k)
-}
 
 /// The reason suffix for a master whose obstructions carry their own rule (pin access refuses it too).
 pub const OBS_RULE: &str = "an obstruction with DESIGNRULEWIDTH or SPACING";

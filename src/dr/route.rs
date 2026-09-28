@@ -371,6 +371,7 @@ pub fn maze_net_end(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet,
         mod_term_cost(w, &(cx.term_fixed)(t), true, true);
     }
     init_maze_cost_guide_helper(w, st, cx.guides, false);
+    crate::dr::cost::init_maze_cost_min_cut_helper(w, net, false);
     init_maze_cost_ap_helper(w, st, net, true, cx.is_macro_term, cx.is_port_term);
     for f in &net.ext {
         w.mod_path_cost(f, ModCost::AddRoute, false, false, cx.ndr_cost);
@@ -391,6 +392,7 @@ fn maze_net_init(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet, cx
         mod_term_cost(w, &(cx.term_fixed)(t), false, true);
     }
     init_maze_cost_guide_helper(w, st, cx.guides, true);
+    crate::dr::cost::init_maze_cost_min_cut_helper(w, net, true);
     init_maze_cost_ap_helper(w, st, net, false, cx.is_macro_term, cx.is_port_term);
     // Its committed shapes' route cost off (same-net spacing to them is not a violation).
     for f in &net.ext {
@@ -661,7 +663,7 @@ mod post_astar_tests {
             let mut g = GridGraph { xs: vec![0, 100, 200], ys: vec![0, 100, 200], zs: vec![2], nodes: vec![Node::default(); 9] };
             let mut st = MazeState::new(&t, &g, Rect::new(0, 0, 200, 200));
             let none = |_: &crate::dr::ta::Fixed| Vec::new();
-            let cx = CostCtx { tech: &t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &[], term_shapes: &none, port_aps: &|_| Vec::new(), inst_is_block: &|_| false, inst_term_aps: &|_, _| Vec::new() };
+            let cx = CostCtx { tech: &t, defaults: &[], eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &[], term_shapes: &none, port_aps: &|_| Vec::new(), inst_is_block: &|_| false, inst_is_macro: &|_| false, inst_term_aps: &|_, _| Vec::new() };
             let w = CostWorker { cx: &cx, g: &mut g, ap_svia: Default::default() };
             let mut conn = vec![(2, 2, 0)];
             st.set_src_i(w.g, (2, 2, 0), true);

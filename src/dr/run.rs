@@ -66,6 +66,14 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
     let d = init_design(db, tech, opts)?;
     let g = init_guide(db, &d)?;
     let p = prep(&d);
+    // A layer whose default vias' pads break its MINSTEP makes the reference patch such shapes in
+    // its check (`patchMetalShape_minStep`, not modelled).
+    if !opts.unchecked_rules {
+        let flagged: Vec<&str> = p.rules.min_step_via.iter().enumerate().filter(|(_, &f)| f).map(|(l, _)| p.tech.layers[l].name.as_str()).collect();
+        if !flagged.is_empty() {
+            return Err(format!("rule families not modelled: {}: via-to-via min step patching (patchMetalShape_minStep)", flagged.join(", ")));
+        }
+    }
     let t = ta(&d, &g, &p);
     let (routes, iterations) = dr(&d, &g, &p, &t)?;
     let markers = routes.markers().count();
@@ -301,6 +309,7 @@ pub fn prep(d: &DesignIn) -> Prep {
     let rcfg = RuleConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: d.cfg.top_routing_layer, enable_via_gen: true };
     let mut tech = d.tech.clone();
     let defaults = default_vias(&mut tech, &rcfg);
+    crate::dr::rules::prep_cut_spc_tbl(&mut tech, &defaults);
     let rules = rule_tables(&tech, &defaults, &d.ndrs, &rcfg);
     Prep { tech, defaults, rules }
 }
@@ -679,6 +688,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     let term_shapes = |f: &Fixed| cx.term_shapes(f);
     let port_aps = |k: usize| -> Vec<DrAp> { d.pa.port_aps[k].iter().flatten().map(|a| DrAp { point: a.point, layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect() };
     let inst_is_block = |i: usize| d.insts[i].is_block;
+    let inst_is_macro = |i: usize| d.insts[i].class == crate::pa::flow::MasterClass::Macro;
     // A terminal's access points per pin, in design coordinates: its class representative's,
     // shifted by the instance's offset from it (as the connected-terminal set is built).
     let inst_term_aps = |i: usize, k: usize| -> Vec<Vec<DrAp>> {
@@ -704,6 +714,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
         term_shapes: &term_shapes,
         port_aps: &port_aps,
         inst_is_block: &inst_is_block,
+        inst_is_macro: &inst_is_macro,
         inst_term_aps: &inst_term_aps,
     };
     let mut cw = CostWorker { cx: &ccx, g: &mut g, ap_svia: Default::default() };
