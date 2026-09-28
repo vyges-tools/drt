@@ -90,7 +90,9 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 // MINIMUMCUT: the check (`checkMinimumCut`), the maze cost around committed vias and
                 // macro pins (`modMinimumcutCostVia`) and the via-to-via prep.
                 "min_cut" => true,
-                "v55_influence" => true,
+                // ⛔ SPACINGTABLE INFLUENCE: the check (`checkMetalSpacingTableInfluence`) is not
+                // modelled — refused (it was counted modelled before; no corpus tech carries it).
+                "v55_influence" => false,
                 "lef58_eol_keepout" => true,
                 _ => false,
             };
@@ -99,30 +101,10 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             }
         }
     }
-    // A master obstruction with DESIGNRULEWIDTH or SPACING: the reference keeps it as a blockage of
-    // its OWN, with that rule (`io::Parser` master import: only an obstruction with both at -1 is
-    // merged into the layer's polygon set). Ours merges every obstruction and reads neither value,
-    // so such a master would be checked against the wrong shapes and the wrong rule — refused.
-    // ⚠️ Conservative: the reference first moves a cut obstruction enclosed by one pin into that
-    // pin, so a flagged cut there never becomes a blockage; it is refused here all the same.
-    let mut seen = std::collections::BTreeSet::new();
-    for inst in db.inst_names() {
-        let master = db.inst_get_master(&inst);
-        if seen.insert(master.clone()) && obstruction_has_rule(&db.master_obstruction_rules(&master).unwrap_or_default()) {
-            out.push(format!("{master}: {OBS_RULE}"));
-        }
-    }
     out
 }
 
 
-/// The reason suffix for a master whose obstructions carry their own rule (pin access refuses it too).
-pub const OBS_RULE: &str = "an obstruction with DESIGNRULEWIDTH or SPACING";
-
-/// Any obstruction with a DESIGNRULEWIDTH or SPACING (`-1` is the database's "none" for both).
-fn obstruction_has_rule(rules: &[(i32, i32)]) -> bool {
-    rules.iter().any(|&(w, s)| w != -1 || s != -1)
-}
 
 /// A regular net's routing read from the database (`None` without a wire). Refused: a FIXED wire
 /// (the router then rips up incrementally in every iteration), a wire type other than ROUTED, a
@@ -251,9 +233,9 @@ pub fn ta_design(db: &Db, tech: &Tech, masters: &HashMap<String, Master>, insts:
                 }
             }
         }
-        for &(l, r) in &m.blockages {
+        for (k, &(l, r)) in m.blockages.iter().enumerate() {
             fixed[l].push((inst.transform.apply(r), Fixed::InstBlockage { big: inst.class == MasterClass::Macro }));
-            owners[l].push(Owner::Inst(inst.name.clone()));
+            owners[l].push(crate::pa::verdict::blockage_owner(m, &inst.name, k));
         }
     }
     for (k, port) in ports.iter().enumerate() {
@@ -454,20 +436,4 @@ fn port_stacks(db: &Db, tech: &Tech, tech_vias: usize, names: &[String], wires: 
 /// The gcell grid the routing used, written to the database (one uniform pattern per axis).
 pub fn write_gcell_grid(db: &mut Db, grid: &crate::dr::guides::GCellGrid) -> Result<(), String> {
     db.block_set_gcell_grid(grid.x, grid.y).map_err(|e| e.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Rule (`io::Parser` master import): an obstruction is merged into its layer's shapes only when
-    // BOTH its DESIGNRULEWIDTH and its SPACING are -1 (the database's "none"); either one set makes
-    // it a blockage of its own, which is refused.
-    #[test]
-    fn an_obstruction_with_either_value_carries_a_rule() {
-        assert!(!obstruction_has_rule(&[]));
-        assert!(!obstruction_has_rule(&[(-1, -1), (-1, -1)]));
-        assert!(obstruction_has_rule(&[(-1, -1), (200, -1)]));
-        assert!(obstruction_has_rule(&[(-1, 0)]));
-    }
 }

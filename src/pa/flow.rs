@@ -377,7 +377,7 @@ mod tests {
     /// the second with its signal unconnected; one pattern choosing the signal's only point.
     fn fixture() -> (HashMap<String, Master>, Vec<DesignInst>, PinAccess) {
         let pin = || MasterPin { shapes: vec![(2, Rect::new(0, 0, 100, 100))] };
-        let master = Master { terms: vec![MasterTerm { name: "VPWR".into(), sig: "POWER".into(), pins: vec![pin()] }, MasterTerm { name: "A".into(), sig: "SIGNAL".into(), pins: vec![pin()] }], blockages: vec![] };
+        let master = Master { terms: vec![MasterTerm { name: "VPWR".into(), sig: "POWER".into(), pins: vec![pin()] }, MasterTerm { name: "A".into(), sig: "SIGNAL".into(), pins: vec![pin()] }], blockages: vec![], blockage_rules: vec![] };
         let masters: HashMap<String, Master> = [("m".to_string(), master)].into();
         let inst = |name: &str, x: i32, net: Option<&str>| DesignInst {
             name: name.into(),

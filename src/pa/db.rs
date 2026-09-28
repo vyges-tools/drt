@@ -33,8 +33,8 @@ pub fn read_design(db: &Db, tech: &Tech, top_routing_layer: usize) -> Res<Design
         let master = db.inst_get_master(&name);
         if !masters.contains_key(&master) {
             let terms = read::master_terms(db, tech, &master).map_err(|e| e.to_string())?;
-            let obs = read::master_obstructions(db, tech, &master).map_err(|e| e.to_string())?;
-            masters.insert(master.clone(), Master::import(tech, terms, &obs));
+            let obs = read::master_obstructions_with_rules(db, tech, &master).map_err(|e| e.to_string())?;
+            masters.insert(master.clone(), Master::import_with_rules(tech, terms, &obs));
         }
         let m = &masters[&master];
         let nets: Vec<Option<String>> = m

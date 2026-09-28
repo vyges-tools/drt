@@ -2,8 +2,9 @@
 //! The technology and design as the router reads them.
 //!
 //! Rules:
-//! - layers are numbered from the first routing layer, with a placeholder masterslice (0) and a
-//!   placeholder cut layer (1) below it; routing and cut layers then follow in technology order;
+//! - layers are numbered from a placeholder masterslice (0), then routing and cut layers in
+//!   technology order — a placeholder cut layer (1) below the first routing layer when no cut layer
+//!   came first (a cut layer read first, like asap7's V0, is layer 1 itself);
 //!   the masterslice placeholder takes the name of the last masterslice layer before the first
 //!   routing layer that is not a well or diffusion layer (LEF58 type), else `FR_MASTERSLICE`;
 //! - a routing layer's min width is `min(min width, width)`;
@@ -428,6 +429,9 @@ pub struct Master {
     pub terms: Vec<MasterTerm>,
     /// Blockage rectangles by layer number (master coordinates).
     pub blockages: Vec<(usize, Rect)>,
+    /// Per blockage: an obstruction's own DESIGNRULEWIDTH and SPACING (`-1` for none), when it
+    /// has either — such an obstruction is its own blockage, never merged.
+    pub blockage_rules: Vec<Option<(i32, i32)>>,
 }
 
 impl Master {
@@ -436,10 +440,19 @@ impl Master {
     ///   above becomes a shape of that pin (a contact drawn as an obstruction is the pin's own);
     /// - every other obstruction merges with the rest on its layer, and the merged shapes'
     ///   MAXIMAL rectangles are the blockages.
-    pub fn import(tech: &Tech, mut terms: Vec<MasterTerm>, obstructions: &[(usize, Rect)]) -> Master {
+    pub fn import(tech: &Tech, terms: Vec<MasterTerm>, obstructions: &[(usize, Rect)]) -> Master {
+        let with: Vec<(usize, Rect, Option<(i32, i32)>)> = obstructions.iter().map(|&(l, r)| (l, r, None)).collect();
+        Master::import_with_rules(tech, terms, &with)
+    }
+
+    /// [`Master::import`], each obstruction with its own DESIGNRULEWIDTH / SPACING (io's master
+    /// import): after the cut-to-pin rule, an obstruction carrying either is a blockage of its own,
+    /// in obstruction order, BEFORE the merged ones.
+    pub fn import_with_rules(tech: &Tech, mut terms: Vec<MasterTerm>, obstructions: &[(usize, Rect, Option<(i32, i32)>)]) -> Master {
+        let mut own: Vec<(usize, Rect, Option<(i32, i32)>)> = Vec::new();
         let touches = |a: &Rect, b: &Rect| a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh;
         let mut merged: Vec<Polygon90Set> = vec![Polygon90Set::new(); tech.layers.len()];
-        for &(layer, r) in obstructions {
+        for &(layer, r, rule) in obstructions {
             if tech.layers[layer].kind == LayerKind::Cut {
                 let mut owner: Option<(usize, usize)> = None;
                 let mut many = false;
@@ -459,19 +472,25 @@ impl Master {
                     continue;
                 }
             }
+            if rule.is_some() {
+                own.push((layer, r, rule));
+                continue;
+            }
             merged[layer].insert_rect(r);
         }
-        let mut blockages = Vec::new();
+        let mut blockages: Vec<(usize, Rect)> = own.iter().map(|&(l, r, _)| (l, r)).collect();
+        let mut blockage_rules: Vec<Option<(i32, i32)>> = own.iter().map(|&(_, _, rule)| rule).collect();
         // Per layer, per connected polygon (the reference's `get` order), that polygon's maximal
         // rectangles — NOT the layer's as one set: the order differs when a layer has two pieces.
         for (layer, set) in merged.iter_mut().enumerate() {
             for mut poly in set.polygons() {
                 for r in poly.max_rectangles() {
                     blockages.push((layer, r));
+                    blockage_rules.push(None);
                 }
             }
         }
-        Master { terms, blockages }
+        Master { terms, blockages, blockage_rules }
     }
 }
 
@@ -779,7 +798,16 @@ pub mod read {
                         .collect();
                     layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, min_cuts, min_step, spacing_ranges });
                 }
-                "CUT" if !layers.is_empty() => {
+                // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
+                // layer, the masterslice placeholder goes below it and the cut layer itself is
+                // layer 1 (no fake cut then); a cut layer right above another is not read.
+                "CUT" if db.layer_lef58_type(&name) != "MIMCAP" && {
+                    if layers.is_empty() {
+                        layers.push(placeholder(masterslice.as_deref().unwrap_or("FR_MASTERSLICE")));
+                    }
+                    let lower = db.layer_get_lower_layer(&name);
+                    lower.is_empty() || db.layer_get_type(&lower).map_or(true, |t| t != "CUT")
+                } => {
                     let width = db.layer_get_width(&name) as i32;
                     let cut_spacing = Some(db.layer_get_spacing(&name)).filter(|&s| s > 0);
                     let cut_classes = cut_classes(db, &name);
@@ -859,6 +887,21 @@ pub mod read {
         Ok(out)
     }
 
+    /// A master's obstructions with their own DESIGNRULEWIDTH / SPACING (`Some` when either is set),
+    /// by layer number (the technology's layers only; the rules paired in box order first).
+    pub fn master_obstructions_with_rules(db: &Db, tech: &Tech, master: &str) -> Res<Vec<(usize, Rect, Option<(i32, i32)>)>> {
+        let rules = db.master_obstruction_rules(master)?;
+        Ok(db
+            .master_obstruction_boxes(master)?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(k, (n, x0, y0, x1, y1))| {
+                let rule = rules.get(k).copied().filter(|&(w, sp)| w != -1 || sp != -1);
+                tech.layer_num(&db.layer_name_by_number(n)).map(|l| (l, Rect::new(x0, y0, x1, y1), rule))
+            })
+            .collect())
+    }
+
     /// A master's obstructions, by layer number (the technology's layers only).
     pub fn master_obstructions(db: &Db, tech: &Tech, master: &str) -> Res<Vec<(usize, Rect)>> {
         Ok(db
@@ -895,6 +938,19 @@ mod tests {
         let m = Master::import(&t, vec![term("A", vec![vec![(4, Rect::new(-50, -50, 400, 220))]])], &[(3, cut)]);
         assert!(m.blockages.is_empty());
         assert!(m.terms[0].pins[0].shapes.contains(&(3, cut)));
+    }
+
+    /// Rule (`io::Parser` master import): an obstruction with its own DESIGNRULEWIDTH or SPACING is
+    /// a blockage of its own — unmerged, in obstruction order, BEFORE the merged ones, with its rule;
+    /// the others merge (two overlapping here: one maximal rectangle each way).
+    #[test]
+    fn an_obstruction_with_its_own_rule_stays_its_own_blockage_first() {
+        let t = crate::gc::tests::tech();
+        let own = Rect::new(500, 0, 600, 100);
+        let m = Master::import_with_rules(&t, Vec::new(), &[(4, Rect::new(0, 0, 300, 100), None), (4, own, Some((200, -1))), (4, Rect::new(0, 0, 100, 300), None)]);
+        assert_eq!(m.blockages[0], (4, own));
+        assert_eq!(m.blockage_rules, vec![Some((200, -1)), None, None]);
+        assert_eq!(m.blockages.len(), 3);
     }
 
     /// Touching two pins it stays an obstruction.

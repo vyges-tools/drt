@@ -112,6 +112,9 @@ fn owner_key(q: &QueueCtx<'_>, o: &Owner) -> (i32, String, i64) {
         Owner::FloatingPower => (0, "frFakeVDD".into(), -1),
         Owner::BlockTerm(n) => (1, n.clone(), 0),
         Owner::Inst(n) => (3, String::new(), (q.inst_index)(n) as i64),
+        // `frcInstBlockage` (19); its id is not set by io — the blockage's place stands in (no
+        // corpus design carries one).
+        Owner::InstBlockage(_, k, _, _) => (19, String::new(), *k as i64),
         Owner::InstTerm(i, t) => (7, format!("{i}/{t}"), 0),
         Owner::Blockage(b) => (14, String::new(), *b as i64),
     }
@@ -600,6 +603,7 @@ fn owner_tag(o: &Owner) -> String {
         Owner::FloatingPower => "0:frFakeVDD".into(),
         Owner::BlockTerm(n) => format!("1:{n}"),
         Owner::Inst(n) => format!("3:{n}"),
+        Owner::InstBlockage(n, k, _, _) => format!("19:{n}#{k}"),
         Owner::InstTerm(i, t) => format!("7:{i}/{t}"),
         Owner::Blockage(b) => format!("14:#{b}"),
     }

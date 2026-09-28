@@ -40,6 +40,10 @@ pub enum Owner {
     BlockTerm(String),
     /// An instance: its obstructions.
     Inst(String),
+    /// One obstruction of an instance carrying its own DESIGNRULEWIDTH / SPACING (the check makes
+    /// it an owner of its own, `frInstBlockage`): instance, its place in the master's blockages,
+    /// the design rule width and the spacing (`-1` for none).
+    InstBlockage(String, usize, i32, i32),
     /// A routing blockage (each its own owner, by its index in the design).
     Blockage(usize),
     /// Every unconnected ground terminal's design shapes.
@@ -50,7 +54,15 @@ pub enum Owner {
 
 impl Owner {
     pub fn is_blockage(&self) -> bool {
-        matches!(self, Owner::Inst(_) | Owner::Blockage(_))
+        matches!(self, Owner::Inst(_) | Owner::InstBlockage(..) | Owner::Blockage(_))
+    }
+    /// `gcNet::getDesignRuleWidth`: an obstruction's own DESIGNRULEWIDTH, else -1.
+    pub fn design_rule_width(&self) -> i32 {
+        if let Owner::InstBlockage(_, _, w, _) = self { *w } else { -1 }
+    }
+    /// `gcNet::getMinSpacing`: an obstruction's own SPACING, else -1.
+    pub fn min_spacing(&self) -> i32 {
+        if let Owner::InstBlockage(_, _, _, s) = self { *s } else { -1 }
     }
 }
 
@@ -1430,6 +1442,10 @@ impl<'a> Worker<'a> {
         if e.fixed && ptr.fixed {
             return;
         }
+        // An obstruction with its own SPACING on either side: no end-of-line check.
+        if self.owner(e.net).min_spacing() != -1 || self.owner(ptr.net).min_spacing() != -1 {
+            return;
+        }
         let opposite = matches!((e.dir(), ptr.dir()), (EdgeDir::E, EdgeDir::W) | (EdgeDir::W, EdgeDir::E) | (EdgeDir::N, EdgeDir::S) | (EdgeDir::S, EdgeDir::N));
         if !opposite {
             return;
@@ -1839,8 +1855,23 @@ impl<'a> Worker<'a> {
     /// a SPACING … RANGE rule holding either width that asks more (and so names the marker).
     fn required_spacing_range(&self, layer: usize, r1: &Shape, r2: &Shape, prl: i32) -> (i32, bool) {
         let l = &self.tech.layers[layer];
-        let w = |s: &Shape| if self.owner(s.net).is_blockage() { l.width } else { width(&s.rect) };
-        let (w1, w2) = (w(r1), w(r2));
+        // A blockage: the layer's width (the obstruction's own DESIGNRULEWIDTH over that); its own
+        // SPACING is the answer outright (the first shape's, then the second's).
+        let mut ws = [0; 2];
+        for (k, s) in [r1, r2].into_iter().enumerate() {
+            let o = self.owner(s.net);
+            ws[k] = width(&s.rect);
+            if o.is_blockage() {
+                ws[k] = l.width;
+                if o.design_rule_width() != -1 {
+                    ws[k] = o.design_rule_width();
+                }
+                if o.min_spacing() != -1 {
+                    return (o.min_spacing(), false);
+                }
+            }
+        }
+        let (w1, w2) = (ws[0], ws[1]);
         let mut req = l.spacing.as_ref().map_or(0, |t| t.find(w1.max(w2), prl));
         let mut is_range = false;
         if r1.net != r2.net {
@@ -2999,6 +3030,32 @@ mod enclosure_range_tests {
 }
 
 #[cfg(test)]
+mod obstruction_rule_tests {
+    use super::*;
+
+    // Rule (`checkMetalSpacing_prl_getReqSpcVal`): an instance obstruction with its own SPACING
+    // needs exactly that from other shapes (not the table's); with its own DESIGNRULEWIDTH it is
+    // looked up at that width. Layer 4 table: 140 below width 3000, 280 from it.
+    #[test]
+    fn an_obstruction_with_its_own_rule_sets_the_spacing_it_needs() {
+        let run = |obs: Owner, gap: i32| {
+            let t = tests::tech();
+            let mut w = Worker::new(&t);
+            w.add(&obs, 4, Rect::new(0, 0, 1000, 140), true);
+            w.add(&Owner::Net("a".into()), 4, Rect::new(0, 140 + gap, 1000, 280 + gap), false);
+            w.init();
+            w.run().iter().filter(|m| m.rule == Rule::MetalSpacing).count()
+        };
+        // 200 apart: a plain obstruction (layer width → 140) is clean; its own SPACING 250 is not.
+        assert_eq!(run(Owner::Inst("u".into()), 200), 0);
+        assert_eq!(run(Owner::InstBlockage("u".into(), 0, -1, 250), 200), 1);
+        // Its own DESIGNRULEWIDTH 4000 takes the table's 280 row.
+        assert_eq!(run(Owner::InstBlockage("u".into(), 0, 4000, -1), 200), 1);
+        assert_eq!(run(Owner::InstBlockage("u".into(), 0, 4000, -1), 290), 0);
+    }
+}
+
+#[cfg(test)]
 mod patch_tests {
     use super::*;
 
@@ -3055,6 +3112,23 @@ mod eol_tests {
         let want = vec![(Some((net("a"), 4, Rect::new(1000, 0, 1000, 140), false)), Some((net("b"), 4, Rect::new(1150, -500, 1150, 640), false)))];
         assert_eq!(run(None), want);
         assert_eq!(run(Some("b")), want);
+    }
+
+    // Rule (`checkMetalEndOfLine_eol_hasEol_check`): no end-of-line check against — or from — an
+    // obstruction with its own SPACING (its spacing check covers it).
+    #[test]
+    fn an_obstruction_with_its_own_spacing_takes_no_end_of_line_check() {
+        let t = tech_with(rule());
+        let count = |b: Owner| {
+            let mut w = Worker::new(&t);
+            w.add(&net("a"), 4, Rect::new(0, 0, 1000, 140), false);
+            w.add(&b, 4, Rect::new(1150, -500, 1500, 640), true);
+            w.init();
+            w.run().iter().filter(|m| m.rule == Rule::EolSpacing).count()
+        };
+        assert_eq!(count(Owner::Inst("u".into())), 1);
+        assert_eq!(count(Owner::InstBlockage("u".into(), 0, -1, 100)), 0);
+        assert_eq!(count(Owner::InstBlockage("u".into(), 0, 300, -1)), 1, "a width alone does not skip it");
     }
 
     /// The end-of-line markers' boxes.

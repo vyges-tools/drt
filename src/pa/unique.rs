@@ -170,7 +170,7 @@ mod tests {
 
     fn master(pins: &[(&str, usize)]) -> Master {
         let terms = pins.iter().map(|&(sig, layer)| MasterTerm { name: "t".into(), sig: sig.into(), pins: vec![MasterPin { shapes: vec![(layer, Rect::new(0, 0, 10, 10))] }] }).collect();
-        Master { terms, blockages: vec![] }
+        Master { terms, blockages: vec![], blockage_rules: vec![] }
     }
 
     /// The range ignores supply pins and ends two layers above the highest signal pin, capped at

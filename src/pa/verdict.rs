@@ -49,10 +49,19 @@ pub fn instance_shapes(master: &Master, inst: &str, xf: &Transform, owner_of: im
             }
         }
     }
-    for &(layer, r) in &master.blockages {
-        out.push((Owner::Inst(inst.into()), layer, xf.apply(r)));
+    for (k, &(layer, r)) in master.blockages.iter().enumerate() {
+        out.push((blockage_owner(master, inst, k), layer, xf.apply(r)));
     }
     out
+}
+
+/// A master blockage's owner in the check (`FlexGCWorker::getNet`): the instance — or, for an
+/// obstruction with its own DESIGNRULEWIDTH / SPACING, that instance blockage itself.
+pub fn blockage_owner(master: &Master, inst: &str, k: usize) -> Owner {
+    match master.blockage_rules.get(k).copied().flatten() {
+        Some((w, s)) => Owner::InstBlockage(inst.into(), k, w, s),
+        None => Owner::Inst(inst.into()),
+    }
 }
 
 /// The window around an access point.
