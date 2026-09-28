@@ -12,5 +12,6 @@ pub mod dr;
 pub mod gc;
 pub mod pa;
 pub mod polygon90;
+pub mod polygon_formation;
 pub mod rtree;
 pub mod tech;

@@ -223,6 +223,8 @@ struct Seg {
     fixed: bool,
     prev: usize,
     next: usize,
+    /// A stable identity (the list is renumbered as nets are replaced): the edge tree's value.
+    uid: usize,
 }
 
 impl Seg {
@@ -243,58 +245,28 @@ fn orientation(a: &Seg, b: &Seg) -> i32 {
     (a1 * b2 - b1 * a2).signum() as i32
 }
 
-/// A region's polygon edges, with their polygon, whether fixed, and the ring order. At a point
-/// where two polygons touch only at a corner, an edge continues with the LEFT turn — each polygon
-/// stays its own.
+/// An edge's box (its two points, low to high).
+fn seg_box(e: &Seg) -> Rect {
+    Rect::new(e.from.0.min(e.to.0), e.from.1.min(e.to.1), e.from.0.max(e.to.0), e.from.1.max(e.to.1))
+}
+
 /// An edge as its two points.
 type EdgePoints = ((i32, i32), (i32, i32));
 
+/// A region's polygon edges, with their polygon, whether fixed, and the ring order.
 fn polygon_segs(out: &mut Vec<Seg>, slices: &[Rect], fixed_edges: &BTreeSet<EdgePoints>, net: usize) {
-    // The polygons: slices joined where they share a boundary of some length.
-    let mut parent: Vec<usize> = (0..slices.len()).collect();
-    fn find(p: &mut [usize], i: usize) -> usize {
-        let mut r = i;
-        while p[r] != r {
-            r = p[r];
-        }
-        p[i] = r;
-        r
-    }
-    for i in 0..slices.len() {
-        for j in i + 1..slices.len() {
-            let (a, b) = (&slices[i], &slices[j]);
-            let x_run = a.xh.min(b.xh) - a.xl.max(b.xl);
-            let y_run = a.yh.min(b.yh) - a.yl.max(b.yl);
-            let joined = ((a.xh == b.xl || b.xh == a.xl) && y_run > 0) || ((a.yh == b.yl || b.yh == a.yl) && x_run > 0);
-            if joined {
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                parent[ri] = rj;
+    // `initNet_pins_polygonEdges`: per polygon (the scan's order — `polygons()`'s, so a pin's
+    // number here is its shapes'), the outer ring then each hole, each from its first vertex as
+    // the polygon formation left it; linked around the ring.
+    for (pin, poly) in crate::polygon_formation::polygons_with_holes(slices).into_iter().enumerate() {
+        for ring in std::iter::once(&poly.outer).chain(&poly.holes) {
+            let base = out.len();
+            let n = ring.len();
+            for k in 0..n {
+                let (from, to) = (ring[k], ring[(k + 1) % n]);
+                out.push(Seg { from, to, net, pin, fixed: fixed_edges.contains(&(from, to)), prev: base + (k + n - 1) % n, next: base + (k + 1) % n, uid: 0 });
             }
         }
-    }
-    let base = out.len();
-    let raw = boundary(slices);
-    for &(from, to) in &raw {
-        let e = Edge { from, to, net };
-        // The slice on the edge's inside.
-        let inside = slices.iter().position(|s| match e.dir() {
-            EdgeDir::E => s.yl == from.1 && s.xl.max(from.0) < s.xh.min(to.0),
-            EdgeDir::W => s.yh == from.1 && s.xl.max(to.0) < s.xh.min(from.0),
-            EdgeDir::N => s.xh == from.0 && s.yl.max(from.1) < s.yh.min(to.1),
-            EdgeDir::S => s.xl == from.0 && s.yl.max(to.1) < s.yh.min(from.1),
-        });
-        let pin = inside.map_or(usize::MAX, |k| find(&mut parent, k));
-        out.push(Seg { from, to, net, pin, fixed: fixed_edges.contains(&(from, to)), prev: usize::MAX, next: usize::MAX });
-    }
-    let mut starts: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-    for (k, seg) in out.iter().enumerate().skip(base) {
-        starts.entry(seg.from).or_default().push(k);
-    }
-    for k in base..out.len() {
-        let cands = &starts[&out[k].to];
-        let next = if cands.len() == 1 { cands[0] } else { *cands.iter().find(|&&c| orientation(&out[k], &out[c]) == 1).unwrap_or(&cands[0]) };
-        out[k].next = next;
-        out[next].prev = k;
     }
 }
 
@@ -351,6 +323,13 @@ pub struct Worker<'a> {
     edges: Vec<Vec<Edge>>,
     /// Per layer, every owner's polygon edges (for end-of-line checks).
     segs: Vec<Vec<Seg>>,
+    /// Per layer, the polygon edges' query tree (`queryPolygonEdge`): each edge's box, by uid;
+    /// bulk-loaded at `init` in the list's order (owner, pin, ring), updated per owner after.
+    seg_rq: Vec<DynRTree<usize>>,
+    /// Per layer: uid → the edge's tree id and its place in the list.
+    seg_tree_id: Vec<HashMap<usize, usize>>,
+    seg_at: Vec<HashMap<usize, usize>>,
+    next_uid: usize,
     /// Skip end-of-line checks on edges running along the layer's direction above the first metal
     /// layer (the long sides of a wire): set for via and pattern trials, not planar ones.
     pub ignore_long_side_eol: bool,
@@ -619,7 +598,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, ignore_corner_spacing: false, drc_box: None, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), seg_rq: Vec::new(), seg_tree_id: Vec::new(), seg_at: Vec::new(), next_uid: 0, ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, ignore_corner_spacing: false, drc_box: None, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -724,6 +703,17 @@ impl<'a> Worker<'a> {
         self.rq = (0..n).map(|l| DynRTree::new(self.shapes[l].iter().enumerate().map(|(k, s)| (s.rect, k)).collect())).collect();
         self.rq_id = (0..n).map(|l| (0..self.shapes[l].len()).collect()).collect();
         self.spc_rq = (0..n).map(|l| DynRTree::new(self.spc[l].iter().enumerate().map(|(k, s)| (s.rect, k)).collect())).collect();
+        self.seg_rq = (0..n).map(|l| DynRTree::new(self.segs[l].iter().map(|e| (seg_box(e), e.uid)).collect())).collect();
+        self.seg_tree_id = (0..n).map(|l| self.segs[l].iter().enumerate().map(|(k, e)| (e.uid, k)).collect()).collect();
+        self.seg_at = vec![HashMap::new(); n];
+        for l in 0..n {
+            self.index_segs(l);
+        }
+    }
+
+    /// Where each edge of `layer` sits in the list now.
+    fn index_segs(&mut self, layer: usize) {
+        self.seg_at[layer] = self.segs[layer].iter().enumerate().map(|(k, e)| (e.uid, k)).collect();
     }
 
     /// One owner's pins, maximal rectangles, edges and special spacing rectangles, appended.
@@ -749,7 +739,12 @@ impl<'a> Worker<'a> {
                 for r in &net.fixed_rects[layer] {
                     fixed_edges.extend([((r.xl, r.yl), (r.xh, r.yl)), ((r.xh, r.yl), (r.xh, r.yh)), ((r.xh, r.yh), (r.xl, r.yh)), ((r.xl, r.yh), (r.xl, r.yl))]);
                 }
+                let from = self.segs[layer].len();
                 polygon_segs(&mut self.segs[layer], &slices, &fixed_edges, i);
+                for e in &mut self.segs[layer][from..] {
+                    e.uid = self.next_uid;
+                    self.next_uid += 1;
+                }
             }
             let mut new_shapes: Vec<Shape> = Vec::new();
             let mut pin_k: u32 = 0;
@@ -819,7 +814,13 @@ impl<'a> Worker<'a> {
                 }
             }
             self.edges[layer].retain(|e| e.net != i);
+            for e in self.segs[layer].iter().filter(|e| e.net == i) {
+                if let Some(id) = self.seg_tree_id[layer].remove(&e.uid) {
+                    self.seg_rq[layer].remove(id);
+                }
+            }
             retain_segs(&mut self.segs[layer], i);
+            self.index_segs(layer);
             for k in 0..self.spc[layer].len() {
                 if self.spc_listed[layer][k] && self.spc[layer][k].net == i {
                     self.spc_rq[layer].remove_eq(&self.spc[layer][k].rect);
@@ -835,6 +836,7 @@ impl<'a> Worker<'a> {
         let n = self.tech.layers.len();
         let old: Vec<usize> = self.shapes.iter().map(|v| v.len()).collect();
         let old_spc: Vec<usize> = self.spc.iter().map(|v| v.len()).collect();
+        let old_segs: Vec<usize> = self.segs.iter().map(|v| v.len()).collect();
         {
             let net = &mut self.nets[i];
             net.route = vec![Polygon90Set::new(); n];
@@ -860,6 +862,14 @@ impl<'a> Worker<'a> {
                 let r = self.spc[layer][k].rect;
                 self.spc_rq[layer].insert(r, k);
             }
+        }
+        for (layer, &from) in old_segs.iter().enumerate() {
+            for k in from..self.segs[layer].len() {
+                let e = self.segs[layer][k];
+                let id = self.seg_rq[layer].insert(seg_box(&e), e.uid);
+                self.seg_tree_id[layer].insert(e.uid, id);
+            }
+            self.index_segs(layer);
         }
     }
 
@@ -1181,12 +1191,7 @@ impl<'a> Worker<'a> {
 
     /// Every polygon edge on `layer` touching `q`.
     fn query_segs(&self, layer: usize, q: &Rect) -> Vec<usize> {
-        (0..self.segs[layer].len())
-            .filter(|&i| {
-                let s = &self.segs[layer][i];
-                touches(&Rect::new(s.from.0, s.from.1, s.to.0, s.to.1), q)
-            })
-            .collect()
+        self.seg_rq.get(layer).map_or(Vec::new(), |t| t.query(q).into_iter().map(|(_, v)| self.seg_at[layer][&v.1]).collect())
     }
 
     fn eol_parallel_edge_one_dir(&self, layer: usize, k: usize, r: &EolRule, p: &ParallelEdge, is_low: bool, has_route: &mut bool) -> bool {
