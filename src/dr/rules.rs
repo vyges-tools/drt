@@ -192,7 +192,7 @@ fn has_min_step_viol(a: &Rect, b: &Rect, con: &crate::tech::MinStep) -> bool {
         return false;
     }
     let o = &polys[0].outer;
-    let ring: Vec<((i32, i32), (i32, i32), bool)> = (0..o.len()).map(|k| (o[k], o[(k + 1) % o.len()], false)).collect();
+    let ring: Vec<crate::gc::RingEdge> = (0..o.len()).map(|k| (o[k], o[(k + 1) % o.len()], false)).collect();
     !crate::gc::min_step_boxes(&[ring], con).is_empty()
 }
 

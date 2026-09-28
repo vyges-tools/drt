@@ -72,7 +72,7 @@ impl Formation {
         self.lines[l].state & VERTICAL_HEAD != 0
     }
     fn odd_length(&self, l: usize) -> bool {
-        (self.lines[l].pt.len() - 1) % 2 != 0
+        !(self.lines[l].pt.len() - 1).is_multiple_of(2)
     }
     fn tail_orient(&self, l: usize) -> bool {
         self.vertical_head(l) ^ self.odd_length(l)

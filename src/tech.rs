@@ -423,6 +423,10 @@ pub struct MasterTerm {
     pub pins: Vec<MasterPin>,
 }
 
+/// A master obstruction as read: its layer, box, and its own (DESIGNRULEWIDTH, SPACING) if either
+/// is set.
+pub type Obstruction = (usize, Rect, Option<(i32, i32)>);
+
 /// A master as the router imports it: its terminals, and its obstructions as blockages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Master {
@@ -441,15 +445,15 @@ impl Master {
     /// - every other obstruction merges with the rest on its layer, and the merged shapes'
     ///   MAXIMAL rectangles are the blockages.
     pub fn import(tech: &Tech, terms: Vec<MasterTerm>, obstructions: &[(usize, Rect)]) -> Master {
-        let with: Vec<(usize, Rect, Option<(i32, i32)>)> = obstructions.iter().map(|&(l, r)| (l, r, None)).collect();
+        let with: Vec<Obstruction> = obstructions.iter().map(|&(l, r)| (l, r, None)).collect();
         Master::import_with_rules(tech, terms, &with)
     }
 
     /// [`Master::import`], each obstruction with its own DESIGNRULEWIDTH / SPACING (io's master
     /// import): after the cut-to-pin rule, an obstruction carrying either is a blockage of its own,
     /// in obstruction order, BEFORE the merged ones.
-    pub fn import_with_rules(tech: &Tech, mut terms: Vec<MasterTerm>, obstructions: &[(usize, Rect, Option<(i32, i32)>)]) -> Master {
-        let mut own: Vec<(usize, Rect, Option<(i32, i32)>)> = Vec::new();
+    pub fn import_with_rules(tech: &Tech, mut terms: Vec<MasterTerm>, obstructions: &[Obstruction]) -> Master {
+        let mut own: Vec<Obstruction> = Vec::new();
         let touches = |a: &Rect, b: &Rect| a.xl <= b.xh && b.xl <= a.xh && a.yl <= b.yh && b.yl <= a.yh;
         let mut merged: Vec<Polygon90Set> = vec![Polygon90Set::new(); tech.layers.len()];
         for &(layer, r, rule) in obstructions {
@@ -823,9 +827,9 @@ pub mod read {
                                 below_only: db.cutenclosurerule_is_below(&name, k),
                                 eol: ty == "EOL",
                                 endside: ty == "ENDSIDE",
-                                first: db.cutenclosurerule_get_first_overhang(&name, k) as i32,
-                                second: db.cutenclosurerule_get_second_overhang(&name, k) as i32,
-                                min_width: db.cutenclosurerule_get_min_width(&name, k) as i32,
+                                first: db.cutenclosurerule_get_first_overhang(&name, k),
+                                second: db.cutenclosurerule_get_second_overhang(&name, k),
+                                min_width: db.cutenclosurerule_get_min_width(&name, k),
                             })
                         })
                         .collect();
@@ -889,7 +893,7 @@ pub mod read {
 
     /// A master's obstructions with their own DESIGNRULEWIDTH / SPACING (`Some` when either is set),
     /// by layer number (the technology's layers only; the rules paired in box order first).
-    pub fn master_obstructions_with_rules(db: &Db, tech: &Tech, master: &str) -> Res<Vec<(usize, Rect, Option<(i32, i32)>)>> {
+    pub fn master_obstructions_with_rules(db: &Db, tech: &Tech, master: &str) -> Res<Vec<Obstruction>> {
         let rules = db.master_obstruction_rules(master)?;
         Ok(db
             .master_obstruction_boxes(master)?

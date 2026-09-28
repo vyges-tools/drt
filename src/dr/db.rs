@@ -28,10 +28,8 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         if l.kind == LayerKind::Placeholder {
             continue;
         }
-        if l.kind == LayerKind::Routing {
-            if db.layer_get_num_masks(&l.name) > 1 {
-                out.push(format!("{}: multi-patterned", l.name));
-            }
+        if l.kind == LayerKind::Routing && db.layer_get_num_masks(&l.name) > 1 {
+            out.push(format!("{}: multi-patterned", l.name));
         }
         // Families the reference's io translates that the database census does not list, counted
         // here from the generated accessors — only the rules io KEEPS (it drops the rest with a

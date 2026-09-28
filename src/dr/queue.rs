@@ -428,8 +428,8 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
                     continue;
                 }
             }
-            match if ext { &state[ni].ext[k] } else { &state[ni].figs[k] } {
-                &DrFig::Via { via, origin, .. } => {
+            match *if ext { &state[ni].ext[k] } else { &state[ni].figs[k] } {
+                DrFig::Via { via, origin, .. } => {
                     if in_rb(origin) {
                         let vd = &tech.via_defs[via];
                         let figs = if vd.layer1 == l { &vd.layer1_figs } else { &vd.layer2_figs };
@@ -438,7 +438,7 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
                         break;
                     }
                 }
-                &DrFig::Seg { begin, end, width, begin_ext, end_ext, .. } => {
+                DrFig::Seg { begin, end, width, begin_ext, end_ext, .. } => {
                     let dist = |p: (i32, i32)| (p.0.clamp(mb0.xl, mb0.xh) - p.0).abs() + (p.1.clamp(mb0.yl, mb0.yh) - p.1).abs();
                     let o = if dist(begin) < dist(end) { begin } else { end };
                     if in_rb(o) {
@@ -446,7 +446,7 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
                         break;
                     }
                 }
-                &DrFig::Patch { origin, offset, .. } => {
+                DrFig::Patch { origin, offset, .. } => {
                     if in_rb(origin) {
                         chosen = Some((ni, origin, shift(&offset, origin)));
                     }

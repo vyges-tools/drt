@@ -272,14 +272,17 @@ fn orientation(a: &Seg, b: &Seg) -> i32 {
 /// A point.
 type P = (i32, i32);
 
+/// A ring edge for the MINSTEP walk: its two points, and whether it is on the fixed shapes.
+pub(crate) type RingEdge = (P, P, bool);
+
 /// `checkMetalShape_minStep`'s walk over one pin's rings, each edge (from, to, fixed) in ring
 /// order: from the first edge at least MINSTEP long, each run of shorter edges up to the next long
 /// one is measured (its edges' end points boxed, its length summed, whether any edge — the closing
 /// long one included — is off the fixed shapes) and judged (`checkMetalShape_minStep_helper`).
 /// ⚠️ The corner flags are never set in the source, so an INSIDECORNER or OUTSIDECORNER rule
 /// never marks. The violations' boxes.
-pub(crate) fn min_step_boxes(rings: &[Vec<(P, P, bool)>], con: &crate::tech::MinStep) -> Vec<Rect> {
-    let len = |e: &(P, P, bool)| (e.1 .0 - e.0 .0).abs() + (e.1 .1 - e.0 .1).abs();
+pub(crate) fn min_step_boxes(rings: &[Vec<RingEdge>], con: &crate::tech::MinStep) -> Vec<Rect> {
+    let len = |e: &RingEdge| (e.1 .0 - e.0 .0).abs() + (e.1 .1 - e.0 .1).abs();
     let mut out = Vec::new();
     for ring in rings {
         let n = ring.len();
@@ -1323,7 +1326,7 @@ impl<'a> Worker<'a> {
     fn min_step(&mut self, layer: usize, net: usize, k: usize) {
         let Some(con) = self.tech.layers[layer].min_step else { return };
         let segs = &self.segs[layer];
-        let mut rings: Vec<Vec<(P, P, bool)>> = Vec::new();
+        let mut rings: Vec<Vec<RingEdge>> = Vec::new();
         let mut seen = vec![false; segs.len()];
         for s in 0..segs.len() {
             if seen[s] || segs[s].net != net || segs[s].pin != k {
@@ -2913,7 +2916,7 @@ mod min_step_tests {
     use super::*;
     use crate::tech::{MinStep, MinStepKind};
 
-    fn ring(pts: &[P], fixed: bool) -> Vec<(P, P, bool)> {
+    fn ring(pts: &[P], fixed: bool) -> Vec<RingEdge> {
         (0..pts.len()).map(|k| (pts[k], pts[(k + 1) % pts.len()], fixed)).collect()
     }
 
