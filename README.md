@@ -51,4 +51,5 @@ cargo test  --release --features odb
 Without `--features odb` the library builds with no C++ dependency: the geometry and every rule
 (candidates, design-rule checks, patterns, rows, the write plan) are tested on their own.
 
-Licensed under Apache-2.0; `src/polygon90.rs` also carries the Boost Software License notice.
+Licensed under Apache-2.0; `src/polygon90.rs` and `src/polygon_formation.rs` also carry the Boost
+Software License notice.

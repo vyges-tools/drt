@@ -5,6 +5,8 @@
 //! - [`polygon90`]: Manhattan polygon sets — union, slicing, maximal rectangles.
 //! - [`tech`]: the technology and design as the router reads them.
 //! - [`gc`]: design-rule checks over a small window.
+//! - [`polygon_formation`]: the polygons (with holes) of a rectangle set, each ring in the vertex
+//!   order the design-rule check reads its edges in.
 //! - [`pa`]: pin access — unique classes, access points, patterns, rows, the write-back.
 //! - [`dr`]: detailed routing after pin access — the route guides first.
 

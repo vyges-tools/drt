@@ -75,8 +75,8 @@ Refused: a nearby-track round (a pin no other round reaches), and every rule fam
 property detailed routing refuses, since the access points are judged by the same design-rule
 check.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
-with the rect-only and minimum-width rules. Not modelled, so a technology that has them is checked
-without them: a metal-width via map. The
+with the rect-only and minimum-width rules; so are right-way-on-grid-only layers, which take on-track
+access points only. The
 router settings are its defaults (via-access layer 2, three sparse points per pin, non-preferred
 tracks allowed); the top routing layer is the block's maximum routing layer.
 
@@ -107,14 +107,19 @@ ran, because rerouting everything writes the same DEF; the counts can.
 
 ### Limits
 
-Design rules modelled: shorts, non-sufficient metal, parallel-run spacing, cut spacing (one plain
-rule per cut layer), LEF 5.4 end-of-line spacing, minimum width, minimum area (patched, or reported
-where a patch cannot fix it), minimum enclosed area (`MINENCLOSEDAREA` without a width), and
-rect-only layers. A net the global router gave antenna jumpers is kept to its guides: off them it
-costs ten times as much.
-Refused rather than approximated: any other rule family a layer carries (named in the report's
-`reason`); a multi-patterned routing layer; spacing limited to a width range; a cell whose
-obstructions carry `DESIGNRULEWIDTH` or `SPACING`; a non-default rule with hard spacing, via
+Design rules modelled: shorts, non-sufficient metal, parallel-run spacing (with spacing limited to
+a width range), cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing, minimum
+width, minimum area (patched, or reported where a patch cannot fix it), minimum enclosed area
+(`MINENCLOSEDAREA` without a width), minimum step, minimum cut, rect-only and
+right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
+(its common clauses), corner spacing (convex corners, patched by the router), cut classes, the
+different-net cut spacing table and enclosure. A cell obstruction with its own `DESIGNRULEWIDTH`
+or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
+kept to its guides: off them it costs ten times as much.
+Refused rather than approximated: any other rule family or clause a layer carries (named in the
+report's `reason`), among them LEF58 minimum step and minimum cut, `SPACINGTABLE INFLUENCE` and a
+metal-width via map; corner spacing in a design with a block master; a layer whose via pads break
+its minimum step; a multi-patterned routing layer; a non-default rule with hard spacing, via
 generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
 the database; and congested input guides. Past iteration 7 the router widens the clip of
 congested workers, and from iteration 23 rips up the nets near each marker (NEARDRC); both follow

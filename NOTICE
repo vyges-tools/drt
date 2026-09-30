@@ -15,5 +15,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-src/polygon90.rs is derived from Boost.Polygon (Copyright 2008 Intel Corporation), distributed
-under the Boost Software License, Version 1.0 (http://www.boost.org/LICENSE_1_0.txt).
+src/polygon90.rs and src/polygon_formation.rs are derived from Boost.Polygon (Copyright 2008 Intel
+Corporation), distributed under the Boost Software License, Version 1.0
+(http://www.boost.org/LICENSE_1_0.txt).

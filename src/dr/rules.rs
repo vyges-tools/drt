@@ -6,8 +6,8 @@
 //! cut layer's default via — which may be a via GENERATED here ([`default_vias`]).
 //!
 //! Stages, in order ([`rule_tables`]): via-to-via → via-turn → via-planar → line-to-line →
-//! end-of-line → (cut-spacing-table defaults: not modelled) → via-through → per non-default rule:
-//! via-to-via, via-turn → (via-to-via min step: not modelled).
+//! end-of-line → via-through → per non-default rule: via-to-via, via-turn → the via-to-via min-step
+//! flags. The cut-spacing-table defaults are set before, by [`prep_cut_spc_tbl`].
 //!
 //! Rules:
 //! - layer numbers are the router's (placeholder masterslice 0, placeholder cut 1, then routing
@@ -19,10 +19,10 @@
 //!   empty — kept, low above high);
 //! - a via's shapes are its definition's, at the origin.
 //!
-//! Not modelled (the caller must refuse a technology that has them): min step, minimum cut,
-//! width-via maps, cut spacing tables and LEF58 cut spacing, cut spacing between layers, adjacent
-//! cuts, same-net and centre-to-centre cut spacing, two-width spacing tables, LEF58 end-of-line
-//! families.
+//! Not modelled (the caller must refuse a technology that has them): width-via maps, LEF58 cut
+//! spacing, cut spacing tables between layers or with SAMENET / SAMEMETAL, adjacent cuts, same-net
+//! and centre-to-centre cut spacing, two-width spacing tables, LEF58 min step and minimum cut, and
+//! the LEF58 end-of-line clauses outside the modelled subset.
 
 use crate::pa::stack::default_via;
 use crate::polygon90::Rect;

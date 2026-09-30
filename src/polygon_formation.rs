@@ -1,7 +1,8 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Apache-2.0 AND BSL-1.0
 //! The polygons (with holes) of a set of rectangles, each ring in the vertex order the design-rule
-//! check reads it: Boost.Polygon's scanline polygon formation (`polygon_formation.hpp`, Boost
-//! Software License 1.0) transcribed — partial polygons as chains of polylines hanging off
+//! check reads it: Boost.Polygon's scanline polygon formation (`polygon_formation.hpp`, Copyright
+//! 2008 Intel Corporation; Boost Software License 1.0, http://www.boost.org/LICENSE_1_0.txt)
+//! transcribed — partial polygons as chains of polylines hanging off
 //! "active tails" in a map keyed by coordinate, joined as the scan meets them; a polygon comes
 //! out when its two tails meet, and its ring is walked from the tail it closed on.
 //!
@@ -492,7 +493,7 @@ pub fn polygons_with_holes(rects: &[Rect]) -> Vec<PolygonWithHoles> {
 mod tests {
     use super::*;
 
-    /// Rings as the reference's own Boost.Polygon 1.89 `get` prints them (probe on the box).
+    /// Rings as the reference's own Boost.Polygon 1.89 `get` prints them (a probe compiled against Boost.Polygon 1.89).
     #[test]
     fn rings_start_where_the_scan_closed_them() {
         let r = |xl, yl, xh, yh| Rect::new(xl, yl, xh, yh);
