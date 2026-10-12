@@ -54,7 +54,7 @@ EXIT STATUS:
 ```json
 {
   "schema": "vyges-tool-descriptor/1.1",
-  "openroad_pin": "da9f29f18b6487825aa880597176e0fa97110b31",
+  "openroad_pin": "27288f5c90265ae5296b2f5a9fa6e8714fa191ad",
   "name": "drt",
   "summary": "detailed routing on the design's route guides: pin access, track assignment and search-and-repair until no design-rule marker stands, the routes written as a DEF or a database; pin access alone is its own command",
   "maturity": "structured",
