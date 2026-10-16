@@ -194,10 +194,36 @@ pub enum Flow {
     Skip,
 }
 
+/// `printIteration`'s ordinal: `st`/`nd`/`rd` for 1, 2, 3 and — past 20 only — any number ending in
+/// 1, 2, 3; else `th` (so 11th, 12th, 13th, but 21st, 22nd, 23rd; and 0th).
+pub fn iteration_suffix(iter: usize) -> &'static str {
+    match iter {
+        1 => "st",
+        2 => "nd",
+        3 => "rd",
+        i if i > 20 && i % 10 == 1 => "st",
+        i if i > 20 && i % 10 == 2 => "nd",
+        i if i > 20 && i % 10 == 3 => "rd",
+        _ => "th",
+    }
+}
+
+impl Flow {
+    /// `FlexDRFlow::getFlowName`, as the iteration header prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Flow::Optimization => "optimization",
+            Flow::Guides => "guides tiles",
+            Flow::Stubborn => "stubborn tiles",
+            Flow::Skip => "skip",
+        }
+    }
+}
+
 /// The flow chooser's memory.
 #[derive(Debug, Clone)]
 pub struct FlowState {
-    current: Flow,
+    pub(crate) current: Flow,
     pub last_effective: bool,
     last_args: Option<IterArgs>,
 }
@@ -573,6 +599,13 @@ pub fn worker_congested(pts: &[Vec<((i32, i32), usize)>], route: &Rect, zs: &[us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (printIteration): the ordinal's exceptions are 1-3 and, beyond 20, numbers ending in 1-3.
+    #[test]
+    fn iteration_ordinals_are_the_reference_s() {
+        let got: Vec<String> = [0, 1, 2, 3, 4, 11, 12, 13, 20, 21, 22, 23, 31, 111].iter().map(|&i| format!("{i}{}", iteration_suffix(i))).collect();
+        assert_eq!(got, ["0th", "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "20th", "21st", "22nd", "23rd", "31st", "111st"]);
+    }
 
     // Rule: a marker's sources are a `frOrderedIdSet` (type, then id), and the guide-tiles flow
     // pushes each source net's guides in that order — so a net earlier in the design comes first

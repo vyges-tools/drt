@@ -59,6 +59,8 @@ pub struct Summary {
     pub markers: usize,
     /// Markers standing after each iteration (the reference's per-iteration `Number of violations`).
     pub markers_by_iteration: Vec<usize>,
+    /// Each iteration's flow (`getFlowName`: optimization, guides tiles, stubborn tiles, skip).
+    pub flow_by_iteration: Vec<&'static str>,
     /// Nets whose routing was written.
     pub nets_written: usize,
     /// Nets routed before routing began (an incremental run), and the nets any worker rerouted.
@@ -81,12 +83,12 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
     }
     let t = ta(&d, &g, &p);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
-    let (routes, markers_by_iteration) = dr(&d, &g, &p, &t, end)?;
+    let (routes, markers_by_iteration, flow_by_iteration) = dr(&d, &g, &p, &t, end)?;
     let iterations = markers_by_iteration.len();
     let markers = routes.markers().count();
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
-    Ok(Summary { iterations, markers, markers_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len() })
+    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len() })
 }
 
 /// The design as the router reads it: technology, tracks, instances, ports, nets and their
@@ -442,8 +444,8 @@ struct DrCtx<'a> {
 
 /// The main loop: the strategy's rows in order until no marker stands, each row one
 /// search-and-repair iteration and the connectivity check after it, none past `end_iteration`.
-/// The routes and the markers standing after each iteration run.
-pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize) -> Res<(DesignRoutes, Vec<usize>)> {
+/// The routes, the markers standing after each iteration run, and each iteration's flow.
+pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>)> {
     let cx = dr_init(d, g, p, t);
     let incremental = d.initial.iter().any(Option::is_some);
     let mut routes = DesignRoutes::with_initial(&p.tech, crate::dr::db::initial_shapes(&p.tech, &d.design.nets, &d.insts, &d.masters, &d.ports, &d.initial)?);
@@ -451,6 +453,7 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize)
     let mut clip = ClipSize::default();
     let mut increase_clip = false;
     let mut markers_by_iteration = Vec::new();
+    let mut flow_by_iteration = Vec::new();
     for (iter, row) in strategy(ROUTE_SHAPE_COST, MARKER_COST).into_iter().enumerate() {
         if iter > end_iteration {
             break;
@@ -461,12 +464,13 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize)
         args.size = clip.size(&row, increase_clip);
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
         search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip)?;
+        flow_by_iteration.push(flow.current.name());
         markers_by_iteration.push(routes.markers().count());
         if markers_by_iteration[iter] == 0 {
             break;
         }
     }
-    Ok((routes, markers_by_iteration))
+    Ok((routes, markers_by_iteration, flow_by_iteration))
 }
 
 /// Routing's set-up: what the workers share.
