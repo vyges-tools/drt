@@ -18,6 +18,9 @@ categories = ["science", "command-line-utilities"]
 odb = ["dep:vyges-opendb", "dep:vyges-events"]
 
 [dependencies]
+# The search-and-repair batches: each batch's workers routed in parallel (they only read the
+# design), written back in batch order, as FlexDR::processWorkersBatch / endWorkersBatch do.
+rayon = "1"
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true, features = ["gen-write"] }
 

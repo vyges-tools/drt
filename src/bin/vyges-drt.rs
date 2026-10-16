@@ -340,6 +340,13 @@ fn run(a: &Args) -> Outcome {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Worker threads for the search-and-repair batches (`VYGES_DRT_THREADS`, default 1). The routes
+    // do not depend on it: workers only read the design and are written back in batch order.
+    let threads = std::env::var("VYGES_DRT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(1);
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global() {
+        eprintln!("vyges-drt: thread pool: {e}");
+        return ExitCode::from(2);
+    }
     match args.first().map(String::as_str) {
         Some("--version") => {
             println!("vyges-drt {} ({})\nCopyright (c) Vyges. Apache-2.0.", env!("CARGO_PKG_VERSION"), env!("VYGES_GIT_SHA"));

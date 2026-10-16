@@ -131,9 +131,10 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
     let uinsts: Vec<UniqueInst> = insts.iter().map(|i| i.unique.clone()).collect();
     let classes = compute_unique(tech, tracks, masters, &uinsts);
 
-    // Each class representative's access points.
-    let mut class_aps: Vec<Vec<Vec<Vec<AccessPoint>>>> = Vec::new();
-    for class in &classes {
+    // Each class representative's access points — one task per class, as the reference's
+    // `omp parallel for` over the unique classes; results kept in class order, the first error in
+    // that order returned.
+    let class_aps: Vec<Vec<Vec<Vec<AccessPoint>>>> = par_map(&classes, |class| -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
         let rep = &insts[class.insts[0]];
         let master = &masters[&class.key.master];
         let mut per_term: Vec<Vec<Vec<AccessPoint>>> = master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect();
@@ -155,8 +156,10 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
                 }
             }
         }
-        class_aps.push(per_term);
-    }
+        Ok(per_term)
+    })
+    .into_iter()
+    .collect::<Result<_, _>>()?;
 
     // Each routed port's.
     let mut port_aps = Vec::new();
@@ -175,18 +178,19 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
         port_aps.push(per_pin);
     }
 
-    // Patterns per standard-cell class.
-    let mut patterns: Vec<Vec<Pattern>> = Vec::new();
-    for (c, class) in classes.iter().enumerate() {
+    // Patterns per standard-cell class, one task per class (`prepPatternInst` in the reference's
+    // parallel loop).
+    let class_ids: Vec<usize> = (0..classes.len()).collect();
+    let patterns: Vec<Vec<Pattern>> = par_map(&class_ids, |&c| {
+        let class = &classes[c];
         let rep = &insts[class.insts[0]];
         if rep.class != MasterClass::StdCell {
-            patterns.push(Vec::new());
-            continue;
+            return Vec::new();
         }
         let master = &masters[&class.key.master];
         let inst = pattern_instance(tech, rep, master, class, &class_aps[c]);
-        patterns.push(prep_pattern_inst(&inst, &mut Trace(None)));
-    }
+        prep_pattern_inst(&inst, &mut Trace(None))
+    });
 
     // Rows.
     let mut class_of = vec![0usize; insts.len()];
@@ -207,7 +211,10 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
         })
         .collect();
     let mut picks = vec![None; insts.len()];
-    for row in compute_inst_rows(&boxes, &order) {
+    // One task per row cluster (`genInstRowPattern` in the reference's parallel loop); the picks
+    // written after, in row order.
+    let rows = compute_inst_rows(&boxes, &order);
+    let chosen_rows = par_map(&rows, |row| {
         let row_insts: Vec<RowInst<'_>> = row
             .iter()
             .map(|&k| {
@@ -218,12 +225,25 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
                 RowInst { class: &class_insts[c], patterns: &patterns[c], location: insts[i].unique.location, owners, target: insts[i].target.clone() }
             })
             .collect();
-        let chosen = gen_inst_row_pattern(tech, &row_insts, &mut None).ok_or_else(|| FlowError::NoRowPath(row.iter().map(|&k| insts[members[k]].name.clone()).collect::<Vec<_>>().join(" ")))?;
-        for (&k, p) in row.iter().zip(chosen) {
+        gen_inst_row_pattern(tech, &row_insts, &mut None).ok_or_else(|| FlowError::NoRowPath(row.iter().map(|&k| insts[members[k]].name.clone()).collect::<Vec<_>>().join(" ")))
+    });
+    for (row, chosen) in rows.iter().zip(chosen_rows) {
+        for (&k, p) in row.iter().zip(chosen?) {
             picks[members[k]] = Some(p);
         }
     }
     Ok(PinAccess { classes, class_aps, patterns, picks, port_aps })
+}
+
+/// `f` over `items` — on the rayon pool when it has more than one thread — the results in `items`'
+/// order, so what follows is the same at any thread count.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
+    use rayon::prelude::*;
+    if rayon::current_num_threads() > 1 {
+        items.par_iter().map(f).collect()
+    } else {
+        items.iter().map(f).collect()
+    }
 }
 
 /// A class point, as `(class, terminal, pin, index among the pin's points)`.

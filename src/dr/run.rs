@@ -571,10 +571,8 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         *increase_clip = false;
     }
     for group in batches {
-        let mut results = Vec::new();
-        for w in group {
-            results.push(route_worker(cx, routes, iter, args, ripup_all, &w)?);
-        }
+        let jobs: Vec<(WorkerBoxes, crate::dr::flow::IterArgs)> = group.into_iter().map(|w| (w, *args)).collect();
+        let results = route_batch(cx, routes, iter, ripup_all, &jobs)?;
         if flow == Flow::Optimization && results.iter().any(|r| r.4) {
             *increase_clip = true;
         }
@@ -605,18 +603,20 @@ fn stubborn_tiles_flow(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &m
     let marker_costs = [args.marker_cost, args.marker_cost / 2, args.marker_cost * 2];
     let mut changed = false;
     for batch in batches {
-        let mut results: Vec<(usize, WorkerResult)> = Vec::new();
+        let mut ids = Vec::new();
+        let mut jobs = Vec::new();
         for &id in &batch {
             for route in &boxes[id] {
                 for &drc_cost in &drc_costs {
                     for &marker_cost in &marker_costs {
                         let wargs = crate::dr::flow::IterArgs { drc_cost, marker_cost, ..*args };
-                        let w = WorkerBoxes { start: (0, 0), route: *route, ext: bloat(route, mt), drc: bloat(route, 500) };
-                        results.push((id, route_worker(cx, routes, iter, &wargs, ripup_all, &w)?));
+                        ids.push(id);
+                        jobs.push((WorkerBoxes { start: (0, 0), route: *route, ext: bloat(route, mt), drc: bloat(route, 500) }, wargs));
                     }
                 }
             }
         }
+        let results: Vec<(usize, WorkerResult)> = ids.into_iter().zip(route_batch(cx, routes, iter, ripup_all, &jobs)?).collect();
         // Per worker id, the first with the fewest markers in its check box.
         let mut best: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
         for (k, (id, (w, _, markers, _, _))) in results.iter().enumerate() {
@@ -636,6 +636,21 @@ fn stubborn_tiles_flow(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &m
     }
     flow_state.last_effective = changed;
     Ok(())
+}
+
+/// `FlexDR::processWorkersBatch`: one batch's workers routed — in parallel when the thread pool
+/// has more than one thread — each on the design as the batch found it (`route_worker` only reads
+/// it), the results in the batch's order. The write-back that follows is serial and in that order
+/// (`endWorkersBatch`), so the routes do not depend on the thread count. The first error in batch
+/// order is the one returned, as the serial loop would.
+fn route_batch(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, ripup_all: bool, jobs: &[(WorkerBoxes, crate::dr::flow::IterArgs)]) -> Res<Vec<WorkerResult>> {
+    use rayon::prelude::*;
+    let routed: Vec<Res<WorkerResult>> = if rayon::current_num_threads() > 1 {
+        jobs.par_iter().map(|(w, a)| route_worker(cx, routes, iter, a, ripup_all, w)).collect()
+    } else {
+        jobs.iter().map(|(w, a)| route_worker(cx, routes, iter, a, ripup_all, w)).collect()
+    };
+    routed.into_iter().collect()
 }
 
 /// A routed worker: its boxes, each net's routes, its markers, its starting markers, and whether
