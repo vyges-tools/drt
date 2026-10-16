@@ -276,6 +276,19 @@ fn touch(a: &Rect, b: &Rect) -> bool {
     a.xh >= b.xl && a.xl <= b.xh && a.yh >= b.yl && a.yl <= b.yh
 }
 
+/// A design marker's sources in the reference's order: a `frOrderedIdSet`, by object type, then
+/// id. A net's id is its place in the design's nets (`net_id`), not its name; the fake supply nets
+/// carry no id (-1) and come first. The other owners follow, in their own order: nothing that
+/// walks a marker's sources in order uses them (they have no guides).
+pub fn sources_in_id_order(owners: &mut [crate::gc::Owner], net_id: &dyn Fn(&str) -> Option<usize>) {
+    use crate::gc::Owner;
+    owners.sort_by_key(|o| match o {
+        Owner::FloatingGround | Owner::FloatingPower => (0, -1),
+        Owner::Net(n) => (0, net_id(n).map_or(i64::MAX, |i| i as i64)),
+        _ => (1, 0),
+    });
+}
+
 /// The guide-tiles flow's worker boxes: per marker (design order), per source net with original
 /// guides (`guides`), each of its guides touching the marker; a marker with a guided net that no
 /// guide covers takes `off_guide`'s boxes instead. Then boxes alike in direction that touch are
@@ -560,6 +573,28 @@ pub fn worker_congested(pts: &[Vec<((i32, i32), usize)>], route: &Rect, zs: &[us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule: a marker's sources are a `frOrderedIdSet` (type, then id), and the guide-tiles flow
+    // pushes each source net's guides in that order — so a net earlier in the design comes first
+    // whatever its name. ascon_core iteration 12: net298 before clknet_3_3_0_clk_i swapped two
+    // worker boxes when the sources were in name order.
+    #[test]
+    fn marker_sources_are_in_net_id_order_not_name_order() {
+        use crate::gc::Owner;
+        use std::collections::HashMap;
+        let ids: HashMap<&str, usize> = [("net298", 4), ("clknet_3_3_0_clk_i", 9), ("_07383_", 2), ("clk_i", 1)].into_iter().collect();
+        let id = |n: &str| ids.get(n).copied();
+        let mut a = vec![Owner::Net("clknet_3_3_0_clk_i".into()), Owner::Net("net298".into())];
+        sources_in_id_order(&mut a, &id);
+        assert_eq!(a, vec![Owner::Net("net298".into()), Owner::Net("clknet_3_3_0_clk_i".into())]);
+        let mut b = vec![Owner::Net("_07383_".into()), Owner::Net("clk_i".into())];
+        sources_in_id_order(&mut b, &id);
+        assert_eq!(b, vec![Owner::Net("clk_i".into()), Owner::Net("_07383_".into())]);
+        // The fake supply net (no id) first.
+        let mut c = vec![Owner::Net("clknet_3_3_0_clk_i".into()), Owner::FloatingPower];
+        sources_in_id_order(&mut c, &id);
+        assert_eq!(c[0], Owner::FloatingPower);
+    }
 
     // Rule: an incremental run rips up only the nets not routed before in iterations 0–2 where
     // the strategy rips up everything; later rows, and other modes, as the strategy says.

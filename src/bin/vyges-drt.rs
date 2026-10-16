@@ -11,8 +11,8 @@ const USAGE: &str = "vyges-drt — detailed routing
 USAGE:
   vyges-drt pin_access (--db IN.odb | --lef A.lef [--lef B.lef …] --def D.def)
                        [--max-routing-layer LAYER] --out OUT.odb [-o REPORT.json]
-  vyges-drt detailed_route --db IN.odb [--via-access-layer LAYER] --out OUT.def|OUT.odb
-                       [-o REPORT.json]
+  vyges-drt detailed_route --db IN.odb [--via-access-layer LAYER] [--end-iteration N]
+                       --out OUT.def|OUT.odb [-o REPORT.json]
   vyges-drt --describe
   vyges-drt --help
   vyges-drt --version
@@ -38,6 +38,8 @@ OPTIONS:
                               signal-layer range ending at LAYER does)
   --via-access-layer LAYER    detailed_route: the via-access layer (default the second
                               routing layer)
+  --end-iteration N           detailed_route: stop after search-and-repair iteration N
+                              (counted from 0), whatever markers stand
   --out OUT.odb               write the database here
   -o FILE                     write the JSON report to FILE instead of stdout
   --json                      accepted; the report is JSON either way
@@ -90,7 +92,7 @@ const DESCRIBE: &str = r#"{
   ],
   "invocation": {
     "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" } ],
+    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" } ],
     "emits_json": true
   },
   "commands": [
@@ -98,7 +100,7 @@ const DESCRIBE: &str = r#"{
       "name": "detailed_route",
       "summary": "route the design on its route guides and write the routes (a .def or .odb out)",
       "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" } ],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" } ],
       "assertion": { "id": "routed-clean", "field": "status", "pass_when": { "eq": "written" } }
     },
     {
@@ -116,6 +118,7 @@ const DESCRIBE: &str = r#"{
       "db": { "type": "string", "description": "the design database to read (detailed_route: placed, with route guides)" },
       "out": { "type": "string", "description": "where to write the result: detailed_route writes a DEF if the name ends in .def, else a database; pin_access writes a database" },
       "via_access_layer": { "type": "string", "description": "detailed_route: the via-access layer (default the second routing layer)" },
+      "end_iteration": { "type": "integer", "description": "detailed_route: stop after this search-and-repair iteration (counted from 0)" },
       "max_routing_layer": { "type": "string", "description": "pin_access: the block's maximum routing layer, set first" },
       "report": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
     }
@@ -135,7 +138,7 @@ const DESCRIBE: &str = r#"{
 ///
 /// | code | meaning |
 /// |---|---|
-/// | `DRT-DONE` | the run finished; a census of what it did (detailed_route: iterations, markers, nets written, routed before, rerouted; pin_access: unique classes, preferred points, port points). `warn` when the status is not the pass word |
+/// | `DRT-DONE` | the run finished; a census of what it did (detailed_route: iterations, markers, markers after each iteration, nets written, routed before, rerouted; pin_access: unique classes, preferred points, port points). `warn` when the status is not the pass word |
 /// | `DRT-REFUSED` | a step this engine does not model; the reason names it |
 /// | `DRT-ERROR` | usage, unreadable input, or a failed write |
 mod events {
@@ -167,10 +170,11 @@ struct Args {
     report: Option<String>,
     max_layer: Option<String>,
     via_access: Option<String>,
+    end_iteration: Option<String>,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
-    let mut a = Args { lefs: Vec::new(), def: None, db: None, out: None, report: None, max_layer: None, via_access: None };
+    let mut a = Args { lefs: Vec::new(), def: None, db: None, out: None, report: None, max_layer: None, via_access: None, end_iteration: None };
     let mut it = args.iter();
     while let Some(k) = it.next() {
         // ⚠️ Accepted and ignored — the report is JSON either way. The descriptor says
@@ -187,6 +191,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "-o" => a.report = Some(v),
             "--max-routing-layer" => a.max_layer = Some(v),
             "--via-access-layer" => a.via_access = Some(v),
+            "--end-iteration" => a.end_iteration = Some(v),
             _ => return None,
         }
     }
@@ -238,6 +243,12 @@ fn route(a: &Args) -> Outcome {
             None => return fail("error", 2, format!("no layer {l}")),
         }
     }
+    if let Some(n) = &a.end_iteration {
+        match n.parse() {
+            Ok(n) => opts.end_iteration = Some(n),
+            Err(_) => return fail("error", 2, format!("--end-iteration {n}: not an iteration number")),
+        }
+    }
     let s = match vyges_drt::dr::run::detailed_route(&mut db, &tech, &opts) {
         Ok(s) => s,
         Err(e) => return fail("refused", 3, e),
@@ -250,7 +261,7 @@ fn route(a: &Args) -> Outcome {
     Outcome {
         status: if s.markers == 0 { "written" } else { "markers" },
         code: u8::from(s.markers > 0),
-        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("nets_written", s.nets_written.to_string()), ("routed_before", s.routed_before.to_string()), ("rerouted", s.rerouted.to_string())],
+        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("markers_by_iteration", format!("[{}]", s.markers_by_iteration.iter().map(usize::to_string).collect::<Vec<_>>().join(","))), ("nets_written", s.nets_written.to_string()), ("routed_before", s.routed_before.to_string()), ("rerouted", s.rerouted.to_string())],
     }
 }
 

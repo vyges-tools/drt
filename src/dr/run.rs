@@ -14,7 +14,7 @@ use crate::dr::cost::{init_maze_cost, CostCtx, CostWorker, DrFig};
 use crate::dr::db::TaDesign;
 use crate::dr::design::{connectivity_check, DesignRoutes, WriteBack};
 use crate::dr::drw::{access_point_locations, gcell_boundary_pins, grid_maps, init_edges, init_nets_init_dr, init_nets_search_repair, localize_ext, merge_boundary_pins, mt_safe_dist, worker_batches, worker_groups, DrAp, DrNet, DrNetInput, DrPin, DrTerm, GridConfig, WorkerBoxes, BATCH_SIZE};
-use crate::dr::flow::{guide_tile_boxes, in_check_box, strategy, tile_batches, worker_markers, written_back, ClipSize, Flow, FlowState, RipUp, MARKER_COST, ROUTE_SHAPE_COST};
+use crate::dr::flow::{guide_tile_boxes, in_check_box, sources_in_id_order, strategy, tile_batches, worker_markers, written_back, ClipSize, Flow, FlowState, RipUp, MARKER_COST, ROUTE_SHAPE_COST};
 use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig, GuideNet, GuidePin};
 use crate::dr::maze::{MazeCfg, MazeState};
 use crate::dr::queue::{initial_marker_cost, recheck_markers, route_queue, Event, QueueCtx, Start};
@@ -45,6 +45,9 @@ pub struct Options {
     /// check can be scored against the reference's on them. The CLI never sets it: a user's run
     /// must refuse a rule it does not model, never route as if it were absent.
     pub unchecked_rules: bool,
+    /// The last iteration to run (the reference's `-droute_end_iter`; default `END_ITERATION`).
+    /// Routing stops after it with whatever markers stand.
+    pub end_iteration: Option<usize>,
 }
 
 /// What routing did.
@@ -54,6 +57,8 @@ pub struct Summary {
     pub iterations: usize,
     /// Markers standing at the end (0 when routing is clean).
     pub markers: usize,
+    /// Markers standing after each iteration (the reference's per-iteration `Number of violations`).
+    pub markers_by_iteration: Vec<usize>,
     /// Nets whose routing was written.
     pub nets_written: usize,
     /// Nets routed before routing began (an incremental run), and the nets any worker rerouted.
@@ -75,11 +80,13 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
         }
     }
     let t = ta(&d, &g, &p);
-    let (routes, iterations) = dr(&d, &g, &p, &t)?;
+    let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
+    let (routes, markers_by_iteration) = dr(&d, &g, &p, &t, end)?;
+    let iterations = markers_by_iteration.len();
     let markers = routes.markers().count();
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
-    Ok(Summary { iterations, markers, nets_written, routed_before, rerouted: routes.rerouted.len() })
+    Ok(Summary { iterations, markers, markers_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len() })
 }
 
 /// The design as the router reads it: technology, tracks, instances, ports, nets and their
@@ -434,18 +441,18 @@ struct DrCtx<'a> {
 }
 
 /// The main loop: the strategy's rows in order until no marker stands, each row one
-/// search-and-repair iteration and the connectivity check after it. The routes and the
-/// iterations run.
-pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut) -> Res<(DesignRoutes, usize)> {
+/// search-and-repair iteration and the connectivity check after it, none past `end_iteration`.
+/// The routes and the markers standing after each iteration run.
+pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize) -> Res<(DesignRoutes, Vec<usize>)> {
     let cx = dr_init(d, g, p, t);
     let incremental = d.initial.iter().any(Option::is_some);
     let mut routes = DesignRoutes::with_initial(&p.tech, crate::dr::db::initial_shapes(&p.tech, &d.design.nets, &d.insts, &d.masters, &d.ports, &d.initial)?);
     let mut flow = FlowState::default();
     let mut clip = ClipSize::default();
     let mut increase_clip = false;
-    let mut iterations = 0;
+    let mut markers_by_iteration = Vec::new();
     for (iter, row) in strategy(ROUTE_SHAPE_COST, MARKER_COST).into_iter().enumerate() {
-        if iter > crate::dr::flow::END_ITERATION {
+        if iter > end_iteration {
             break;
         }
         let mut args = row;
@@ -454,12 +461,12 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut) -> Res<(DesignRoutes,
         args.size = clip.size(&row, increase_clip);
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
         search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip)?;
-        iterations = iter + 1;
-        if routes.markers().next().is_none() {
+        markers_by_iteration.push(routes.markers().count());
+        if markers_by_iteration[iter] == 0 {
             break;
         }
     }
-    Ok((routes, iterations))
+    Ok((routes, markers_by_iteration))
 }
 
 /// Routing's set-up: what the workers share.
@@ -540,8 +547,15 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
     let batches: Vec<Vec<WorkerBoxes>> = match flow {
         Flow::Optimization => worker_batches(worker_groups(&cx.g.grid, args.size, args.offset, mt, 500), BATCH_SIZE),
         Flow::Guides => {
-            let markers: Vec<Marker> = routes.markers().cloned().collect();
             let net_of: HashMap<&str, usize> = cx.d.design.nets.iter().enumerate().map(|(i, n)| (n.name.as_str(), i)).collect();
+            let markers: Vec<Marker> = routes
+                .markers()
+                .cloned()
+                .map(|mut m| {
+                    sources_in_id_order(&mut m.owners, &|n| net_of.get(n).copied());
+                    m
+                })
+                .collect();
             let guides = |o: &Owner| -> Option<Vec<Rect>> {
                 match o {
                     Owner::Net(n) => Some(cx.g.raw.get(n).map_or(Vec::new(), |v| v.iter().map(|&(_, r)| r).collect())),
