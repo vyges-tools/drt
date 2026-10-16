@@ -356,6 +356,7 @@ mod tests {
                 l("via", LayerKind::Cut, Dir::None, 150),
                 l("met2", LayerKind::Routing, Dir::Vertical, 140),
             ],
+            obs_own_width: false,
             manufacturing_grid: 5,
             via_defs: vias,
         }

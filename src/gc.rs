@@ -1865,7 +1865,9 @@ impl<'a> Worker<'a> {
             let o = self.owner(s.net);
             ws[k] = width(&s.rect);
             if o.is_blockage() {
-                ws[k] = l.width;
+                if !self.tech.obs_own_width {
+                    ws[k] = l.width;
+                }
                 if o.design_rule_width() != -1 {
                     ws[k] = o.design_rule_width();
                 }
@@ -2444,6 +2446,7 @@ pub(crate) mod tests {
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
                 Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
             ],
+            obs_own_width: false,
             manufacturing_grid: 5,
             via_defs: Vec::new(),
         }
@@ -2711,12 +2714,23 @@ pub(crate) mod tests {
         m.iter().map(|m| m.rule).collect()
     }
 
-    /// A blockage's width in the table is the LAYER's width, not its own: a 4000-wide obstruction
-    /// 200 from a trial needs 140 (the first row), not 280.
+    /// A blockage's width in the table is the LAYER's width, not its own (`USEMINSPACING OBS ON`,
+    /// the default): a 4000-wide obstruction 200 from a trial needs 140 (the first row), not 280.
+    /// Rule (`checkMetalSpacing_prl_getReqSpcVal` under `USEMINSPACING_OBS` false — sky130's tech
+    /// LEF says OFF): the obstruction keeps its own width, needs 280, and the trial is marked
+    /// (sram_fifo: a macro's met4 OBS corner against a pin wire, and the routes at its edge pins).
     #[test]
     fn blockage_counts_as_layer_width() {
-        let m = markers(&[(Owner::Inst("u".into()), 4, Rect::new(0, 0, 4000, 4000), true), (net("a"), 4, Rect::new(0, 4200, 4000, 4340), false)]);
+        let shapes = [(Owner::Inst("u".into()), 4, Rect::new(0, 0, 4000, 4000), true), (net("a"), 4, Rect::new(0, 4200, 4000, 4340), false)];
+        let m = markers(&shapes);
         assert!(m.is_empty(), "{m:?}");
+        let t = Tech { obs_own_width: true, ..tech() };
+        let mut w = Worker::new(&t);
+        for (o, l, r, f) in &shapes {
+            w.add(o, *l, *r, *f);
+        }
+        w.init();
+        assert_eq!(rules(w.run()), vec![Rule::MetalSpacing], "USEMINSPACING OBS OFF: its own width");
     }
 
     /// Too close is not enough: some trial shape of either owner must lie within one width of the

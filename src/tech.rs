@@ -386,6 +386,10 @@ pub struct Tech {
     pub manufacturing_grid: i32,
     /// Technology vias, in technology order.
     pub via_defs: Vec<ViaDef>,
+    /// `USEMINSPACING OBS OFF`: an obstruction is spaced by its OWN width (the reference's
+    /// `USEMINSPACING_OBS`, read from `dbTech::getUseMinSpacingObs`, false); ON — the default —
+    /// by the layer's minimum width. Read by the check, the maze costs and track assignment.
+    pub obs_own_width: bool,
 }
 
 impl Tech {
@@ -852,7 +856,7 @@ pub mod read {
             let figs = |layer: usize| -> Vec<Rect> { boxes.iter().filter(|b| num_of(b.0) == Some(layer)).map(|b| Rect::new(b.1, b.2, b.3, b.4)).collect() };
             via_defs.push(ViaDef { name: via.clone(), is_default: db.techvia_is_default(&via), layer1: l1, cut, layer2: l2, layer1_figs: figs(l1), cut_figs: figs(cut), layer2_figs: figs(l2) });
         }
-        Ok(Tech { layers, manufacturing_grid: db.tech_get_manufacturing_grid(), via_defs })
+        Ok(Tech { layers, manufacturing_grid: db.tech_get_manufacturing_grid(), via_defs, obs_own_width: !db.tech_use_min_spacing_obs() })
     }
 
     /// Every track pattern of the block, per layer: x patterns (vertical tracks), then y.

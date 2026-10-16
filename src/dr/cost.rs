@@ -1255,7 +1255,7 @@ mod tests {
 
     fn tech(spacing: i32) -> Tech {
         let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, spacing: Some(SpacingTable { widths: vec![0], prls: vec![0], values: vec![vec![spacing]] }), ..Default::default() };
-        Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, ..Default::default() }, routing(Dir::Vertical)], manufacturing_grid: 5, via_defs: vec![] }
+        Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, ..Default::default() }, routing(Dir::Vertical)], manufacturing_grid: 5, via_defs: vec![], obs_own_width: false }
     }
 
     /// A 10 × 10 grid at a 100 pitch from 0, on layers 2 and 4, every edge present.
@@ -1280,7 +1280,7 @@ mod tests {
     fn tech_via(width: i32, via: Rect, min_area: i64, near: i32, far: i32, cut_spacing: Option<i32>) -> Tech {
         let routing = |dir| Layer { kind: LayerKind::Routing, dir, width, min_width: width, min_area, spacing: Some(SpacingTable { widths: vec![0], prls: vec![0, 500], values: vec![vec![near, far]] }), ..Default::default() };
         let vd = crate::tech::ViaDef { name: "V".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![via], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![via] };
-        Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing, ..Default::default() }, routing(Dir::Vertical)], manufacturing_grid: 5, via_defs: vec![vd] }
+        Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing, ..Default::default() }, routing(Dir::Vertical)], manufacturing_grid: 5, via_defs: vec![vd], obs_own_width: false }
     }
 
     fn with_defaults<R>(t: &Tech, g: &mut GridGraph, eol: &[EolTable], fixed: &[PackedRTree<Fixed>], f: impl FnOnce(&mut CostWorker<'_, '_>) -> R) -> R {

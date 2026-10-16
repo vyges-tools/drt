@@ -413,7 +413,7 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep) -> TaOut {
         fixed: &design.fixed,
         terms: &ta_terms,
         gr_pins: &gr_pins,
-        cfg: TaConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: d.cfg.top_routing_layer, ..TaConfig::default() },
+        cfg: TaConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: d.cfg.top_routing_layer, use_min_spacing_obs: !p.tech.obs_own_width, ..TaConfig::default() },
     };
     let mut st = TaState::new(input, guides);
     track_assignment(&mut st, &mut None);
@@ -736,7 +736,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
         defaults: &p.defaults,
         eol: &p.rules.eol,
         ndrs: ndr_of,
-        use_min_spacing_obs: true,
+        use_min_spacing_obs: !tech.obs_own_width,
         through: &cx.through,
         via_access_layer: d.cfg.via_access_layer,
         fixed: &cx.fixed_trees,

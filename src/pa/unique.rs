@@ -165,7 +165,7 @@ mod tests {
 
     fn tech() -> Tech {
         let l = |dir| Layer { kind: LayerKind::Routing, dir, ..Layer::default() };
-        Tech { layers: vec![Layer::default(), Layer::default(), l(Dir::Vertical), Layer { kind: LayerKind::Cut, ..Layer::default() }, l(Dir::Horizontal)], manufacturing_grid: 5, via_defs: vec![] }
+        Tech { layers: vec![Layer::default(), Layer::default(), l(Dir::Vertical), Layer { kind: LayerKind::Cut, ..Layer::default() }, l(Dir::Horizontal)], manufacturing_grid: 5, via_defs: vec![], obs_own_width: false }
     }
 
     fn master(pins: &[(&str, usize)]) -> Master {
