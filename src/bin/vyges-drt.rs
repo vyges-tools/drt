@@ -68,7 +68,7 @@ const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
 const PIN_TOKEN: &str = "@OPENROAD_PIN@";
 
 fn describe() -> String {
-    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN).replace("@THREADS@", vyges_loom::threads::DESCRIBE_THREADS)
 }
 
 /// ⚠️ **Two commands, one descriptor.** `invocation` is `detailed_route` — what a caller that
@@ -127,6 +127,7 @@ const DESCRIBE: &str = r#"{
     }
   },
   "consumes": ["odb"],
+  "threads": @THREADS@,
   "artifacts": [ { "role": "routed_design", "field": "out" } ],
   "assertion": {
     "id": "routed-clean",

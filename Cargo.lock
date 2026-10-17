@@ -475,7 +475,7 @@ dependencies = [
 [[package]]
 name = "vyges-loom"
 version = "0.1.41"
-source = "git+https://github.com/vyges-tools/loom?branch=main#f028a5d5a0977b14fc9977835a27020e580a8dbb"
+source = "git+https://github.com/vyges-tools/loom?branch=main#506c687d2159132645814623dd9f0344939cce66"
 
 [[package]]
 name = "vyges-opendb"
