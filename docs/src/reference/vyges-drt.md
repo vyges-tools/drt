@@ -6,8 +6,8 @@ vyges-drt — detailed routing
 USAGE:
   vyges-drt pin_access (--db IN.odb | --lef A.lef [--lef B.lef …] --def D.def)
                        [--max-routing-layer LAYER] --out OUT.odb [-o REPORT.json]
-  vyges-drt detailed_route --db IN.odb [--via-access-layer LAYER] --out OUT.def|OUT.odb
-                       [-o REPORT.json]
+  vyges-drt detailed_route --db IN.odb [--via-access-layer LAYER] [--end-iteration N]
+                       --out OUT.def|OUT.odb [-o REPORT.json]
   vyges-drt --describe
   vyges-drt --help
   vyges-drt --version
@@ -33,8 +33,13 @@ OPTIONS:
                               signal-layer range ending at LAYER does)
   --via-access-layer LAYER    detailed_route: the via-access layer (default the second
                               routing layer)
+  --end-iteration N           detailed_route: stop after search-and-repair iteration N
+                              (counted from 0), whatever markers stand
   --out OUT.odb               write the database here
   -o FILE                     write the JSON report to FILE instead of stdout
+  --threads N                 worker threads (also VYGES_THREADS); default a balanced count
+                              from the machine's physical cores; 1 is serial. The routes are
+                              the same at any count
   --json                      accepted; the report is JSON either way
   --describe                  print a machine-readable JSON description of the command
 
@@ -71,7 +76,7 @@ EXIT STATUS:
   ],
   "invocation": {
     "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" } ],
+    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" }, { "arg": "threads", "flag": "--threads" } ],
     "emits_json": true
   },
   "commands": [
@@ -79,14 +84,14 @@ EXIT STATUS:
       "name": "detailed_route",
       "summary": "route the design on its route guides and write the routes (a .def or .odb out)",
       "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" } ],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" }, { "arg": "threads", "flag": "--threads" } ],
       "assertion": { "id": "routed-clean", "field": "status", "pass_when": { "eq": "written" } }
     },
     {
       "name": "pin_access",
       "summary": "compute every pin's access points and write them into the database",
       "args_template": ["pin_access", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" } ],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" }, { "arg": "threads", "flag": "--threads" } ],
       "assertion": { "id": "pin-access-written", "field": "status", "pass_when": { "eq": "written" } }
     }
   ],
@@ -97,11 +102,24 @@ EXIT STATUS:
       "db": { "type": "string", "description": "the design database to read (detailed_route: placed, with route guides)" },
       "out": { "type": "string", "description": "where to write the result: detailed_route writes a DEF if the name ends in .def, else a database; pin_access writes a database" },
       "via_access_layer": { "type": "string", "description": "detailed_route: the via-access layer (default the second routing layer)" },
+      "end_iteration": { "type": "integer", "description": "detailed_route: stop after this search-and-repair iteration (counted from 0)" },
       "max_routing_layer": { "type": "string", "description": "pin_access: the block's maximum routing layer, set first" },
       "report": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
     }
   },
   "consumes": ["odb"],
+  "threads": {
+    "parallel": true,
+    "flag": "--threads",
+    "env": "VYGES_THREADS",
+    "default": "balanced",
+    "default_rule": "the machine's physical cores (within this process's CPU affinity), one fewer when there are more than four, at most 16",
+    "zero": "the default",
+    "serial": 1,
+    "deterministic": true,
+    "reported": "the run logs the count it chose and why",
+    "guidance": "Leave it unset: the default is chosen from the machine and the results are identical at any count. Pass --threads N only to bound CPU or memory, for example when running several jobs at once (give each a share of the cores)."
+  },
   "artifacts": [ { "role": "routed_design", "field": "out" } ],
   "assertion": {
     "id": "routed-clean",
