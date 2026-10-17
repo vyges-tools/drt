@@ -42,6 +42,9 @@ OPTIONS:
                               (counted from 0), whatever markers stand
   --out OUT.odb               write the database here
   -o FILE                     write the JSON report to FILE instead of stdout
+  --threads N                 worker threads (also VYGES_THREADS); default a balanced count
+                              from the machine's physical cores; 1 is serial. The routes are
+                              the same at any count
   --json                      accepted; the report is JSON either way
   --describe                  print a machine-readable JSON description of the command
 
@@ -92,7 +95,7 @@ const DESCRIBE: &str = r#"{
   ],
   "invocation": {
     "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" } ],
+    "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" }, { "arg": "threads", "flag": "--threads" } ],
     "emits_json": true
   },
   "commands": [
@@ -100,14 +103,14 @@ const DESCRIBE: &str = r#"{
       "name": "detailed_route",
       "summary": "route the design on its route guides and write the routes (a .def or .odb out)",
       "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" } ],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" }, { "arg": "threads", "flag": "--threads" } ],
       "assertion": { "id": "routed-clean", "field": "status", "pass_when": { "eq": "written" } }
     },
     {
       "name": "pin_access",
       "summary": "compute every pin's access points and write them into the database",
       "args_template": ["pin_access", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" } ],
+      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" }, { "arg": "threads", "flag": "--threads" } ],
       "assertion": { "id": "pin-access-written", "field": "status", "pass_when": { "eq": "written" } }
     }
   ],
@@ -366,11 +369,21 @@ fn run(a: &Args) -> Outcome {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // Worker threads for the search-and-repair batches (`VYGES_DRT_THREADS`, default 1). The routes
-    // do not depend on it: workers only read the design and are written back in batch order.
-    let threads = std::env::var("VYGES_DRT_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(1);
-    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // Worker threads for the search-and-repair batches: `--threads N`, else `VYGES_THREADS` (or
+    // the older `VYGES_DRT_THREADS`), else the suite's balanced default (`vyges_loom::threads`).
+    // The routes do not depend on it — workers only read the design and are written back in batch
+    // order; the route gate is identical at 1 and at 16 — which is what makes a default other
+    // than 1 safe.
+    let flag = match vyges_loom::threads::take_flag(&mut args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("vyges-drt: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let choice = vyges_loom::threads::pick(flag, &["VYGES_DRT_THREADS"]);
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(choice.threads).build_global() {
         eprintln!("vyges-drt: thread pool: {e}");
         return ExitCode::from(2);
     }
@@ -396,12 +409,14 @@ fn main() -> ExitCode {
     // ⛔ Before any database exists: libodb then logs to the events trail (stderr) only, and
     // stdout carries nothing but the JSON report a caller parses.
     vyges_opendb::init_events_logging();
+    // what was chosen, and why — stderr, with the rest of the trail
+    eprintln!("vyges-drt: {}", choice.line());
     let Some(a) = parse(&args[1..]) else {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
     let o = if args[0] == "detailed_route" { route(&a) } else { run(&a) };
-    let mut report = format!("{{\"tool\":\"drt\",\"status\":{}", json_str(o.status));
+    let mut report = format!("{{\"tool\":\"drt\",\"status\":{},\"threads\":{}", json_str(o.status), choice.threads);
     for (k, v) in &o.fields {
         report.push_str(&format!(",\"{k}\":{v}"));
     }

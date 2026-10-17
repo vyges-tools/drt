@@ -15,7 +15,7 @@ categories = ["science", "command-line-utilities"]
 [features]
 # The design database reader. OFF by default: the geometry and the access-point rules build and
 # test with no C++ dependency.
-odb = ["dep:vyges-opendb", "dep:vyges-events"]
+odb = ["dep:vyges-opendb", "dep:vyges-events", "dep:vyges-loom"]
 
 [dependencies]
 # The search-and-repair batches: each batch's workers routed in parallel (they only read the
@@ -23,6 +23,8 @@ odb = ["dep:vyges-opendb", "dep:vyges-events"]
 rayon = "1"
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
 vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true, features = ["gen-write"] }
+# The suite's one rule for the worker-thread count (`vyges_loom::threads`).
+vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main", optional = true }
 
 [dev-dependencies]
 # The `--describe` contract tests parse the descriptor.
