@@ -440,7 +440,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vyges-drt"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "rayon",
  "serde_json",
@@ -451,8 +451,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-events"
-version = "0.1.43"
-source = "git+https://github.com/vyges-tools/events?branch=main#7bdc20f0dce09932e68d6c39e2502e99fd14bbd9"
+version = "0.1.44"
+source = "git+https://github.com/vyges-tools/events?branch=main#01165bedc9208abc345044cfc7ae705d2cf75666"
 dependencies = [
  "serde",
  "serde_json",
@@ -460,13 +460,13 @@ dependencies = [
 
 [[package]]
 name = "vyges-geom"
-version = "0.1.43"
-source = "git+https://github.com/vyges-tools/geom?branch=main#8a39d069babdebcb082d5f9448e49c1872762b0a"
+version = "0.1.44"
+source = "git+https://github.com/vyges-tools/geom?branch=main#d77a20edc7e3f2369685545acc0c4bf9cd4bbaee"
 
 [[package]]
 name = "vyges-layout"
-version = "0.1.43"
-source = "git+https://github.com/vyges-tools/layout?branch=main#9b9fd4dc2427f15475db10306ddb91f3f74236d6"
+version = "0.1.44"
+source = "git+https://github.com/vyges-tools/layout?branch=main#3e10e743186a45c8027177a1373a949e1c214039"
 dependencies = [
  "miniz_oxide",
  "vyges-geom",
@@ -474,12 +474,12 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.43"
-source = "git+https://github.com/vyges-tools/loom?branch=main#c1c10a3a75272127c5aebec261c0501d9f03022c"
+version = "0.1.44"
+source = "git+https://github.com/vyges-tools/loom?branch=main#928395f70d2c79c034e7fcd33ec6b3bef44edd59"
 
 [[package]]
 name = "vyges-opendb"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "cxx",
  "serde",
@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-opendb-lib"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "cmake",
  "cxx",
