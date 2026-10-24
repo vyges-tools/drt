@@ -22,15 +22,19 @@ fn info(id: u16, text: String) -> Line {
     Line::Info(id, text)
 }
 
-/// The generated vias' warnings, then the default-via list (`printDefaultVias`). `first_generated`
-/// is the via count before generation: every via from it on was generated, in layer order. The
-/// list runs over the cut layers from the bottom routing layer up.
-pub fn default_vias(tech: &Tech, defaults: &[Option<usize>], first_generated: usize, bottom_routing_layer: usize) -> Vec<Line> {
-    let mut out: Vec<Line> = tech.via_defs[first_generated..]
-        .iter()
-        .map(|v| Line::Warn(160, format!("Warning: {} does not have viaDef aligned with layer direction, generating new viaDef {}.", tech.layers[v.layer1].name, v.name)))
-        .collect();
-    out.push(info(167, "List of default vias:".into()));
+/// The reader's opening lines (`readTechAndLibs`, then `readDesign`): `149`, the generated vias'
+/// warnings (`initDefaultVias` runs inside the tech read), then `150`. `first_generated` is the
+/// via count before generation: every via from it on was generated, in layer order.
+pub fn reading(tech: &Tech, first_generated: usize) -> Vec<Line> {
+    let mut out = vec![info(149, "Reading tech and libs.".into())];
+    out.extend(tech.via_defs[first_generated..].iter().map(|v| Line::Warn(160, format!("Warning: {} does not have viaDef aligned with layer direction, generating new viaDef {}.", tech.layers[v.layer1].name, v.name))));
+    out.push(info(150, "Reading design.".into()));
+    out
+}
+
+/// The default-via list (`printDefaultVias`), over the cut layers from the bottom routing layer up.
+pub fn default_vias(tech: &Tech, defaults: &[Option<usize>], bottom_routing_layer: usize) -> Vec<Line> {
+    let mut out = vec![info(167, "List of default vias:".into())];
     for (l, layer) in tech.layers.iter().enumerate() {
         if layer.kind != LayerKind::Cut || l < bottom_routing_layer {
             continue;
@@ -47,9 +51,14 @@ pub fn layers_complete(tech: &Tech, id: u16, suffix: &str) -> Vec<Line> {
     tech.layers.iter().map(|l| info(id, format!("  Complete {}{suffix}.", l.name))).collect()
 }
 
-/// One `<layer> <what> region query size = N.` line per layer, in layer order.
+/// One `<layer> <what> region query size = N.` line per layer, in layer order. The layer name is
+/// `frLayer::getName(out)`, which spells the fake cut layer `FR_VIA`; the by-value `getName()`
+/// (the `Complete` lines, and our layer name) spells it `Fr_VIA`.
 pub fn region_query_sizes(tech: &Tech, id: u16, what: &str, sizes: &[usize]) -> Vec<Line> {
-    tech.layers.iter().enumerate().map(|(l, x)| info(id, format!("{} {what} region query size = {}.", x.name, sizes.get(l).copied().unwrap_or(0)))).collect()
+    tech.layers.iter().enumerate().map(|(l, x)| {
+        let name = if x.kind == LayerKind::Placeholder && x.name == "Fr_VIA" { "FR_VIA" } else { x.name.as_str() };
+        info(id, format!("{name} {what} region query size = {}.", sizes.get(l).copied().unwrap_or(0)))
+    }).collect()
 }
 
 /// A counter's progress lines: counting 1..=`n`, a line at each multiple of `small`, or of `big`
@@ -119,9 +128,10 @@ mod tests {
         }
     }
 
-    /// Rule (initDefaultVias, printDefaultVias): a generated via's warning names the layer BELOW
-    /// its cut; the list skips cut layers under the bottom routing layer and says `none` for a
-    /// cut layer without a default.
+    /// Rule (readTechAndLibs, initDefaultVias, readDesign, printDefaultVias): the generated vias'
+    /// warnings come inside the tech read, between `149` and `150`, and each names the layer
+    /// BELOW its cut; the list skips cut layers under the bottom routing layer and says `none`
+    /// for a cut layer without a default.
     #[test]
     fn default_vias_warn_then_list() {
         let l = |name: &str, kind| Layer { name: name.into(), kind, ..Layer::default() };
@@ -131,8 +141,21 @@ mod tests {
             via_defs: vec![v("V1", 2), v("via_FR", 2)],
             ..Tech::default()
         };
-        let got: Vec<String> = default_vias(&tech, &[None, None, None, Some(1), None, None, None], 1, 2).iter().map(text).collect();
-        assert_eq!(got, ["W160 Warning: m1 does not have viaDef aligned with layer direction, generating new viaDef via_FR.", "I167 List of default vias:", "R   Layer via", "R     default via: via_FR", "R   Layer via2", "R     default via: none"]);
+        let got: Vec<String> = reading(&tech, 1).iter().map(text).collect();
+        assert_eq!(got, ["I149 Reading tech and libs.", "W160 Warning: m1 does not have viaDef aligned with layer direction, generating new viaDef via_FR.", "I150 Reading design."]);
+        let got: Vec<String> = default_vias(&tech, &[None, None, None, Some(1), None, None, None], 2).iter().map(text).collect();
+        assert_eq!(got, ["I167 List of default vias:", "R   Layer via", "R     default via: via_FR", "R   Layer via2", "R     default via: none"]);
+    }
+
+    /// Rule (frRegionQuery::print, frLayer::getName): the size lines name the fake cut layer
+    /// `FR_VIA` (the out-parameter overload); every other layer by its own name.
+    #[test]
+    fn region_query_names_the_fake_cut_fr_via() {
+        let l = |name: &str, kind| Layer { name: name.into(), kind, ..Layer::default() };
+        let tech = Tech { layers: vec![l("FR_MASTERSLICE", LayerKind::Placeholder), l("Fr_VIA", LayerKind::Placeholder), l("m1", LayerKind::Routing)], ..Tech::default() };
+        let got: Vec<String> = region_query_sizes(&tech, 33, "shape", &[0, 0, 4]).iter().map(text).collect();
+        assert_eq!(got, ["I33 FR_MASTERSLICE shape region query size = 0.", "I33 FR_VIA shape region query size = 0.", "I33 m1 shape region query size = 4."]);
+        assert_eq!(text(&layers_complete(&tech, 24, "")[1]), "I24   Complete Fr_VIA.");
     }
 
     /// Rule (genAllAccessPoints, prepPattern, prepPatternInstRows): a progress line at every

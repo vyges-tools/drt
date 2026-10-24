@@ -128,22 +128,20 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     if !unmodelled.is_empty() && !opts.unchecked_rules {
         return Err(format!("rule families not modelled: {}", unmodelled.join("; ")));
     }
-    log(Line::Info(149, "Reading tech and libs.".into()));
     let tracks = read::tracks(db, tech).map_err(|e| e.to_string())?;
     let mut cfg = crate::pa::db::config(db, tech);
-    log(Line::Info(150, "Reading design.".into()));
+    let min_level = db.block_get_min_routing_layer();
+    let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
+    // The tech read generates the default vias (and warns), then the design read.
+    let mut t = tech.clone();
+    let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
+    crate::dr::log::reading(&t, tech.via_defs.len()).into_iter().for_each(&mut *log);
     let (masters, insts, ports) = crate::pa::db::read_design(db, tech, cfg.top_routing_layer)?;
     if let Some(v) = opts.via_access_layer {
         cfg.via_access_layer = v;
     }
-    let min_level = db.block_get_min_routing_layer();
-    let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
-    // The reader's post-process: default vias, instance analysis, the shape region query.
-    {
-        let mut t = tech.clone();
-        let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
-        crate::dr::log::default_vias(&t, &defaults, tech.via_defs.len(), bottom_layer).into_iter().for_each(&mut *log);
-    }
+    // The reader's post-process: the default-via list, instance analysis, the shape region query.
+    crate::dr::log::default_vias(&t, &defaults, bottom_layer).into_iter().for_each(&mut *log);
     log(Line::Info(162, "Library cell analysis.".into()));
     log(Line::Info(163, "Instance analysis.".into()));
     let uinsts: Vec<_> = insts.iter().map(|i| i.unique.clone()).collect();
