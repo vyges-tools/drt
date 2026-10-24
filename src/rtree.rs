@@ -125,6 +125,79 @@ impl<T> PackedRTree<T> {
         out
     }
 
+    /// The ONE value nearest the point `p` among those `keep` accepts — Boost.Geometry 1.89's
+    /// `nearest(p, 1) && satisfies(keep)` query (`visitors/distance_query.hpp`), in its order:
+    ///
+    /// - distances are COMPARABLE ones (squared, as `f64`): point to a value's box, point to a
+    ///   child's box (0 inside);
+    /// - best first: the root's children, then repeatedly the closest pending branch — a
+    ///   `std::priority_queue` (libc++ 22's heap moves, [`BranchHeap`]) ranked by distance, then
+    ///   the LOWER level first — skipping a branch once the kept value is no farther than it;
+    /// - `keep` is asked of values only, never of branches;
+    /// - a later value replaces the kept one only when STRICTLY nearer, so on a tie the first
+    ///   value reached wins.
+    pub fn nearest_one(&self, p: (i32, i32), keep: impl Fn(&T) -> bool) -> Option<&(Rect, T)> {
+        let root = self.root?;
+        let comparable = |r: &Rect| -> f64 {
+            let axis = |v: i32, lo: i32, hi: i32| -> f64 {
+                if v < lo {
+                    f64::from(lo) - f64::from(v)
+                } else if v > hi {
+                    f64::from(v) - f64::from(hi)
+                } else {
+                    0.0
+                }
+            };
+            let (dx, dy) = (axis(p.0, r.xl, r.xh), axis(p.1, r.yl, r.yh));
+            dx * dx + dy * dy
+        };
+        let mut best: Option<(f64, usize)> = None;
+        let ignore = |best: &Option<(f64, usize)>, d: f64| matches!(best, Some((b, _)) if *b <= d);
+        let mut branches = BranchHeap::default();
+        let (mut node, mut level) = (root, self.leaf_level());
+        loop {
+            match &self.nodes[node] {
+                Node::Internal(children) => {
+                    for (b, c) in children {
+                        let d = comparable(b);
+                        if !ignore(&best, d) {
+                            branches.push((d, level - 1, *c));
+                        }
+                    }
+                }
+                Node::Leaf(ids) => {
+                    for &i in ids {
+                        if !keep(&self.values[i].1) {
+                            continue;
+                        }
+                        let d = comparable(&self.values[i].0);
+                        if best.is_none_or(|(b, _)| d < b) {
+                            best = Some((d, i));
+                        }
+                    }
+                }
+            }
+            match branches.top() {
+                Some(&(d, _, _)) if !ignore(&best, d) => {}
+                _ => break,
+            }
+            let (_, l, n) = branches.pop();
+            node = n;
+            level = l;
+        }
+        best.map(|(_, i)| &self.values[i])
+    }
+
+    /// The root's level counted up from the leaves (a root that is a leaf is level 0).
+    fn leaf_level(&self) -> usize {
+        let (mut node, mut level) = (self.root.expect("a root"), 0);
+        while let Node::Internal(children) = &self.nodes[node] {
+            node = children[0].1;
+            level += 1;
+        }
+        level
+    }
+
     fn walk<'a>(&'a self, node: usize, q: &Rect, out: &mut Vec<&'a (Rect, T)>) {
         match &self.nodes[node] {
             Node::Internal(children) => {
@@ -142,6 +215,80 @@ impl<T> PackedRTree<T> {
                 }
             }
         }
+    }
+}
+
+/// The pending branches of a nearest query: `std::priority_queue<branch_data, vector,
+/// branch_data_comp>` as libc++ 22 runs it. `comp(a, b)` — `a` ranks BELOW `b` — is "farther, or
+/// as far and higher up", so the top is the nearest, lowest branch; branches equal on both are
+/// ordered by the heap's moves alone (`push_heap` sifts up; `pop_heap` drives the hole to a leaf
+/// through the larger child, Floyd's way, fills it with the last element and sifts that up).
+#[derive(Default)]
+struct BranchHeap {
+    v: Vec<(f64, usize, usize)>,
+}
+
+impl BranchHeap {
+    fn below(a: &(f64, usize, usize), b: &(f64, usize, usize)) -> bool {
+        a.0 > b.0 || (a.0 == b.0 && a.1 > b.1)
+    }
+    fn sift_up(&mut self, len: usize) {
+        if len <= 1 {
+            return;
+        }
+        let mut last = len - 1;
+        let mut parent = (len - 2) / 2;
+        if Self::below(&self.v[parent], &self.v[last]) {
+            let t = self.v[last];
+            loop {
+                self.v[last] = self.v[parent];
+                last = parent;
+                if parent == 0 {
+                    break;
+                }
+                parent = (parent - 1) / 2;
+                if !Self::below(&self.v[parent], &t) {
+                    break;
+                }
+            }
+            self.v[last] = t;
+        }
+    }
+    fn push(&mut self, x: (f64, usize, usize)) {
+        self.v.push(x);
+        let n = self.v.len();
+        self.sift_up(n);
+    }
+    fn top(&self) -> Option<&(f64, usize, usize)> {
+        self.v.first()
+    }
+    fn pop(&mut self) -> (f64, usize, usize) {
+        let len = self.v.len();
+        let top = self.v[0];
+        if len > 1 {
+            let mut hole = 0usize;
+            loop {
+                let mut child = 2 * hole + 1;
+                if child + 1 < len && Self::below(&self.v[child], &self.v[child + 1]) {
+                    child += 1;
+                }
+                self.v[hole] = self.v[child];
+                hole = child;
+                if child > (len - 2) / 2 {
+                    break;
+                }
+            }
+            let last = len - 1;
+            if hole == last {
+                self.v[hole] = top;
+            } else {
+                self.v[hole] = self.v[last];
+                self.v[last] = top;
+                self.sift_up(hole + 1);
+            }
+        }
+        self.v.pop();
+        top
     }
 }
 
@@ -826,6 +973,106 @@ mod tests {
         assert!(t.remove(2));
         let got: Vec<char> = t.query(&r(-100, -100, 100, 100)).iter().map(|(_, v)| v.1).collect();
         assert_eq!(got, vec!['x', 'y']);
+    }
+
+    // The nearest kept value is the nearest one: against a brute-force scan, on scattered boxes
+    // over several tree heights, with a filter that drops every third value.
+    #[test]
+    fn nearest_one_finds_the_nearest_kept_value() {
+        for n in [1usize, 5, 16, 17, 40, 300] {
+            let vals: Vec<(Rect, usize)> = (0..n)
+                .map(|i| {
+                    let (x, y) = (((i * 7919) % 997) as i32, ((i * 104_729) % 991) as i32);
+                    (r(x, y, x + (i % 5) as i32, y + (i % 3) as i32), i)
+                })
+                .collect();
+            let t = PackedRTree::new(vals.clone());
+            let keep = |v: &usize| v % 3 != 1;
+            let d = |p: (i32, i32), b: &Rect| -> i64 {
+                let ax = |v: i32, lo: i32, hi: i32| i64::from((lo - v).max(v - hi).max(0));
+                ax(p.0, b.xl, b.xh).pow(2) + ax(p.1, b.yl, b.yh).pow(2)
+            };
+            for p in [(0, 0), (500, 500), (996, 3), (-50, 1200), (311, 77)] {
+                let want = vals.iter().filter(|v| keep(&v.1)).map(|v| d(p, &v.0)).min();
+                let got = t.nearest_one(p, keep);
+                assert_eq!(got.map(|v| d(p, &v.0)), want, "n={n} p={p:?}");
+                assert!(got.is_none_or(|v| keep(&v.1)));
+            }
+        }
+    }
+
+    // Equally near values: the FIRST one reached wins (a later one replaces only when strictly
+    // nearer). In one leaf that is the stored order; across leaves, the nearer branch is opened
+    // first, and of two equally near branches the one pushed first sits on top of the heap.
+    #[test]
+    fn nearest_one_ties_go_to_the_first_reached() {
+        let t = PackedRTree::new(vec![(r(10, 0, 10, 0), 'a'), (r(-10, 0, -10, 0), 'b'), (r(0, 10, 0, 10), 'c')]);
+        assert_eq!(t.nearest_one((0, 0), |_| true).map(|v| v.1), Some('a'));
+        assert_eq!(t.nearest_one((0, 0), |c| *c != 'a').map(|v| v.1), Some('b'));
+        // Two leaves along x: low x [0, 150] and high x [160, 190]; the point at 155 is 5 from
+        // both leaf boxes and from the values at 150 and 160.
+        let vals: Vec<(Rect, usize)> = (0..20).map(|i| (r(i as i32 * 10, 0, i as i32 * 10, 0), i)).collect();
+        let t = PackedRTree::new(vals);
+        assert_eq!(t.nearest_one((155, 0), |_| true).map(|v| v.1), Some(15));
+        // Nearer to the high leaf's box: it is opened first, and its value at the same distance
+        // as one in the other leaf wins.
+        assert_eq!(t.nearest_one((156, 0), |_| true).map(|v| v.1), Some(16));
+    }
+
+    // Equally near branches on DIFFERENT levels: the lower one is opened first, so a tie is won
+    // inside the subtree already entered. 257 points on a 3 x 3 grid make a three-level tree with
+    // every distance tied many ways; the answers are Boost.Geometry 1.89's own, run on the same
+    // points in the same loop (each point in turn, nearest of the points not yet visited).
+    #[test]
+    fn nearest_one_ties_prefer_the_lower_branch() {
+        let mut s = 1u32;
+        let pts: Vec<(i32, i32)> = (0..257)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (((s >> 16) % 3) as i32 * 10, ((s >> 20) % 3) as i32 * 10)
+            })
+            .collect();
+        let t = PackedRTree::new(pts.iter().enumerate().map(|(i, &(x, y))| (r(x, y, x, y), i)).collect());
+        let mut picks = vec![];
+        for (i, &p) in pts.iter().enumerate() {
+            picks.push(t.nearest_one(p, |v| *v > i).map(|v| v.1));
+        }
+        for (i, want) in [(0, 182), (13, 182), (104, 182), (182, 190), (188, 244), (228, 244)] {
+            assert_eq!(picks[i], Some(want), "query {i}");
+        }
+        assert_eq!(picks[256], None);
+    }
+
+    // libc++'s heap moves: equal keys come off in the order these moves leave them, which is
+    // NOT insertion order. Both sequences are what `std::priority_queue` with this comparator
+    // printed under libc++ (Apple clang 17), the second with a pop after every seventh push.
+    #[test]
+    fn branch_heap_pops_in_libcxx_order() {
+        let mut h = BranchHeap::default();
+        for (i, d) in [3.0, 1.0, 1.0, 2.0, 1.0, 0.5].into_iter().enumerate() {
+            h.push((d, 0, i));
+        }
+        let mut got = vec![];
+        while h.top().is_some() {
+            got.push(h.pop().2);
+        }
+        assert_eq!(got, [5, 4, 2, 1, 3, 0]);
+        let (mut h, mut got, mut s) = (BranchHeap::default(), vec![], 1u32);
+        for i in 0..40usize {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            h.push((f64::from((s >> 16) % 4), ((s >> 8) % 3) as usize, i));
+            if i % 7 == 6 {
+                got.push(h.pop().2);
+            }
+        }
+        while h.top().is_some() {
+            got.push(h.pop().2);
+        }
+        let want = [
+            2, 8, 12, 13, 29, 39, 30, 18, 38, 10, 27, 31, 37, 16, 14, 19, 21, 9, 6, 36, 25, 28, 20, 32, 33, 1, 0, 5,
+            11, 26, 17, 23, 4, 34, 3, 24, 22, 7, 35, 15,
+        ];
+        assert_eq!(got, want);
     }
 
     #[test]
