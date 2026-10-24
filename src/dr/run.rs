@@ -15,6 +15,7 @@ use crate::dr::db::TaDesign;
 use crate::dr::design::{connectivity_check, DesignRoutes, WriteBack};
 use crate::dr::drw::{access_point_locations, gcell_boundary_pins, grid_maps, init_edges, init_nets_init_dr, init_nets_search_repair, localize_ext, merge_boundary_pins, mt_safe_dist, worker_batches, worker_groups, DrAp, DrNet, DrNetInput, DrPin, DrTerm, GridConfig, WorkerBoxes, BATCH_SIZE};
 use crate::dr::flow::{guide_tile_boxes, in_check_box, sources_in_id_order, strategy, tile_batches, worker_markers, written_back, ClipSize, Flow, FlowState, RipUp, MARKER_COST, ROUTE_SHAPE_COST};
+use crate::dr::log::{Line, Sink};
 use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig, GuideNet, GuidePin};
 use crate::dr::maze::{MazeCfg, MazeState};
 use crate::dr::queue::{initial_marker_cost, recheck_markers, route_queue, Event, QueueCtx, Start};
@@ -70,8 +71,13 @@ pub struct Summary {
 
 /// Route the design and write the routes into the database.
 pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> {
-    let d = init_design(db, tech, opts)?;
-    let g = init_guide(db, &d)?;
+    detailed_route_logged(db, tech, opts, &mut |_| {})
+}
+
+/// [`detailed_route`], each stage writing its log lines to `log` as it runs.
+pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Summary> {
+    let d = init_design(db, tech, opts, log)?;
+    let g = init_guide(db, &d, log)?;
     let p = prep(&d);
     // A layer whose default vias' pads break its MINSTEP makes the reference patch such shapes in
     // its check (`patchMetalShape_minStep`, not modelled).
@@ -81,11 +87,13 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
             return Err(format!("rule families not modelled: {}: via-to-via min step patching (patchMetalShape_minStep)", flagged.join(", ")));
         }
     }
-    let t = ta(&d, &g, &p);
+    let t = ta(&d, &g, &p, log);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
-    let (routes, markers_by_iteration, flow_by_iteration) = dr(&d, &g, &p, &t, end)?;
+    let (routes, markers_by_iteration, flow_by_iteration) = dr(&d, &g, &p, &t, end, log)?;
     let iterations = markers_by_iteration.len();
     let markers = routes.markers().count();
+    // The writer's (`fillConnFigs`).
+    log(Line::Info(180, "Post processing.".into()));
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
     Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len() })
@@ -115,24 +123,48 @@ pub struct DesignIn {
 }
 
 /// The reader, then pin access.
-pub fn init_design(db: &Db, tech: &Tech, opts: &Options) -> Res<DesignIn> {
+pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<DesignIn> {
     let unmodelled = crate::dr::db::unmodelled_rules(db, tech);
     if !unmodelled.is_empty() && !opts.unchecked_rules {
         return Err(format!("rule families not modelled: {}", unmodelled.join("; ")));
     }
+    log(Line::Info(149, "Reading tech and libs.".into()));
     let tracks = read::tracks(db, tech).map_err(|e| e.to_string())?;
     let mut cfg = crate::pa::db::config(db, tech);
+    log(Line::Info(150, "Reading design.".into()));
     let (masters, insts, ports) = crate::pa::db::read_design(db, tech, cfg.top_routing_layer)?;
     if let Some(v) = opts.via_access_layer {
         cfg.via_access_layer = v;
     }
+    let min_level = db.block_get_min_routing_layer();
+    let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
+    // The reader's post-process: default vias, instance analysis, the shape region query.
+    {
+        let mut t = tech.clone();
+        let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
+        crate::dr::log::default_vias(&t, &defaults, tech.via_defs.len(), bottom_layer).into_iter().for_each(&mut *log);
+    }
+    log(Line::Info(162, "Library cell analysis.".into()));
+    log(Line::Info(163, "Instance analysis.".into()));
+    let uinsts: Vec<_> = insts.iter().map(|i| i.unique.clone()).collect();
+    log(Line::Info(164, format!("Number of unique instances = {}.", crate::pa::unique::inst_analysis_count(tech, &tracks, &masters, &uinsts))));
+    log(Line::Info(168, "Init region query.".into()));
+    crate::dr::log::layers_complete(tech, 24, "").into_iter().for_each(&mut *log);
     let mut design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
     // Every design shape with its check owner: what a via trial of a pin on a non-default-rule
     // net without auto-taper is checked against.
     let shapes: Vec<crate::pa::verdict::TargetShape> = design.fixed.iter().zip(&design.owners).enumerate().flat_map(|(l, (v, o))| v.iter().zip(o).map(move |((r, _), o)| (o.clone(), l, *r))).collect();
+    log(Line::Info(165, "Start pin access.".into()));
     let pa = pin_access_with(tech, &tracks, &cfg, &masters, &insts, &ports, Some(&shapes)).map_err(|e| format!("pin access: {e:?}"))?;
-    let min_level = db.block_get_min_routing_layer();
-    let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
+    {
+        let reps = pa.classes.iter().map(|c| (&insts[c.insts[0]], &masters[&c.key.master]));
+        let (mut pins, mut patterns) = (0, 0);
+        for (rep, m) in reps {
+            pins += if rep.class == MasterClass::Other { 0 } else { m.terms.len() };
+            patterns += usize::from(rep.class == MasterClass::StdCell);
+        }
+        crate::dr::log::pin_access(pins, patterns, pa.rows).into_iter().for_each(&mut *log);
+    }
     let ndrs = read_ndrs(db, tech)?;
     for n in &mut design.nets {
         let r = db.net_get_non_default_rule(&n.name);
@@ -202,7 +234,7 @@ pub struct GuidesIn {
 
 /// Guides read from the database (the layer check), the gcell grid (the database's single
 /// pattern per axis, else built from the guides), each net's guides generated.
-pub fn init_guide(db: &Db, d: &DesignIn) -> Res<GuidesIn> {
+pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
     let tech = &d.tech;
     let top = d.cfg.top_routing_layer;
     let grid_db = db.gcell_grid_pattern_x(0).is_ok() && db.gcell_grid_pattern_x(1).is_err() && db.gcell_grid_pattern_y(0).is_ok() && db.gcell_grid_pattern_y(1).is_err();
@@ -258,17 +290,23 @@ pub fn init_guide(db: &Db, d: &DesignIn) -> Res<GuidesIn> {
             raw.entry(net.clone()).or_default().push((l, r));
         }
     }
+    crate::dr::log::guides_read(order.iter().map(|n| raw[n].len()).sum()).into_iter().for_each(&mut *log);
+    if !order.is_empty() {
+        log(Line::Info(169, "Post process guides.".into()));
+    }
     let grid = if grid_db {
         GCellGrid { x: db.gcell_grid_pattern_x(0).map_err(|e| e.to_string())?, y: db.gcell_grid_pattern_y(0).map_err(|e| e.to_string())?, die: d.die }
     } else {
         let all: Vec<(usize, Rect)> = order.iter().flat_map(|n| raw[n].iter().copied()).collect();
         build_gcell_patterns(tech, d.die, &all).ok_or("no gcell grid from the guides")?
     };
+    crate::dr::log::gcell_grid(grid.x, grid.y).into_iter().for_each(&mut *log);
+    crate::dr::log::layers_complete(tech, 28, "").into_iter().for_each(&mut *log);
     let gcfg = GuideConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: top, via_access_layer: d.cfg.via_access_layer, allow_pin_feedthrough: tech.allow_pin_feedthrough() };
     let inst_index: HashMap<&str, usize> = d.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
     let port_index: HashMap<&str, usize> = d.ports.iter().enumerate().map(|(k, p)| (p.name.as_str(), k)).collect();
     let class_of = classes_of(d);
-    let mut by_net = HashMap::new();
+    let mut by_net: HashMap<String, NetGuides> = HashMap::new();
     for name in &order {
         let mut pins: Vec<GuidePin> = Vec::new();
         for it in db.net_iterms(name) {
@@ -293,6 +331,18 @@ pub fn init_guide(db: &Db, d: &DesignIn) -> Res<GuidesIn> {
         let gps = gr.iter().map(|&(p, pt)| (net.pins[p].name.clone(), pt)).collect();
         by_net.insert(name.clone(), (gs, gps));
     }
+    // The guide region query: per layer, the committed guides.
+    let mut sizes = vec![0; tech.layers.len()];
+    for (gs, _) in by_net.values() {
+        for &(l, ..) in gs {
+            sizes[l] += 1;
+        }
+    }
+    log(Line::Info(178, "Init guide query.".into()));
+    crate::dr::log::layers_complete(tech, 35, " (guide)").into_iter().for_each(&mut *log);
+    crate::dr::log::region_query_sizes(tech, 36, "guide", &sizes).into_iter().for_each(&mut *log);
+    log(Line::Info(179, "Init gr pin query.".into()));
+    log(Line::Info(245, "skipped writing guide updates to database.".into()));
     Ok(GuidesIn { grid, raw, by_net })
 }
 
@@ -332,7 +382,7 @@ pub struct TaOut {
     pub term_fixed: Vec<Fixed>,
 }
 
-pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep) -> TaOut {
+pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
     let (masters, insts, ports, pa, design) = (&d.masters, &d.insts, &d.ports, &d.pa, &d.design);
     let inst_index: HashMap<&str, usize> = insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
     let port_index: HashMap<&str, usize> = ports.iter().enumerate().map(|(k, p)| (p.name.as_str(), k)).collect();
@@ -418,7 +468,12 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep) -> TaOut {
         cfg: TaConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: d.cfg.top_routing_layer, use_min_spacing_obs: !p.tech.obs_own_width, ..TaConfig::default() },
     };
     let mut st = TaState::new(input, guides);
-    track_assignment(&mut st, &mut None);
+    log(Line::Info(181, "Start track assignment.".into()));
+    let counts = track_assignment(&mut st, &mut None);
+    for (iter, [a, b]) in counts.passes.iter().enumerate() {
+        log(crate::dr::log::ta_pass(iter, counts.h_first, *a, *b));
+    }
+    log(Line::Info(182, "Complete track assignment.".into()));
     TaOut { guides: st.guides, gr_pins, dr_terms, macro_term, term_fixed }
 }
 
@@ -445,8 +500,10 @@ struct DrCtx<'a> {
 /// The main loop: the strategy's rows in order until no marker stands, each row one
 /// search-and-repair iteration and the connectivity check after it, none past `end_iteration`.
 /// The routes, the markers standing after each iteration run, and each iteration's flow.
-pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>)> {
+pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>)> {
+    log(Line::Info(187, "Start routing data preparation.".into()));
     let cx = dr_init(d, g, p, t);
+    log(Line::Info(194, "Start detail routing.".into()));
     let incremental = d.initial.iter().any(Option::is_some);
     let mut routes = DesignRoutes::with_initial(&p.tech, crate::dr::db::initial_shapes(&p.tech, &d.design.nets, &d.insts, &d.masters, &d.ports, &d.initial)?);
     let mut flow = FlowState::default();
@@ -466,10 +523,12 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize)
         search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip)?;
         flow_by_iteration.push(flow.current.name());
         markers_by_iteration.push(routes.markers().count());
+        crate::dr::log::iteration(iter, flow.current.name(), markers_by_iteration[iter]).into_iter().for_each(&mut *log);
         if markers_by_iteration[iter] == 0 {
             break;
         }
     }
+    log(Line::Info(198, "Complete detail routing.".into()));
     Ok((routes, markers_by_iteration, flow_by_iteration))
 }
 

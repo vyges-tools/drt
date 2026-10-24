@@ -9,6 +9,7 @@ pub mod design;
 pub mod drw;
 pub mod flow;
 pub mod guides;
+pub mod log;
 pub mod maze;
 pub mod queue;
 pub mod route;

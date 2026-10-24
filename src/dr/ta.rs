@@ -310,6 +310,8 @@ pub struct Worker<'s, 'a> {
     route_costs: Vec<TrackIndex<(Owner, Con)>>,
     via_costs: Vec<TrackIndex<(Owner, Con)>>,
     reassign: BTreeSet<(std::cmp::Reverse<u32>, usize)>,
+    /// Iroutes assigned (each pop that is assigned, re-assignments too): the log's wire count.
+    num_assigned: usize,
     pub trace: Option<Vec<TaEvent>>,
 }
 
@@ -1385,6 +1387,7 @@ impl<'s, 'a> Worker<'s, 'a> {
             self.assign_iroute(id);
             buffers[cur] = Some(id);
             cur = (cur + 1) % 20;
+            self.num_assigned += 1;
         }
     }
 
@@ -1454,12 +1457,14 @@ fn panels(grid: &GCellGrid, size: i32, offset: i32, horizontal: bool) -> Vec<Rec
     out
 }
 
-fn run_pass(st: &mut TaState<'_>, iter: usize, horizontal: bool, trace: &mut Option<Vec<TaEvent>>) {
+/// One pass; returns the wires its workers assigned and its panel count.
+fn run_pass(st: &mut TaState<'_>, iter: usize, horizontal: bool, trace: &mut Option<Vec<TaEvent>>) -> (usize, usize) {
     let size = 50;
     let grid = *st.input.grid;
     let boxes = panels(&grid, size, 0, horizontal);
     let half = if horizontal { grid.y.2 / 2 } else { grid.x.2 / 2 };
     let bs = st.input.cfg.batch_size;
+    let mut assigned = 0;
     for (b, chunk) in boxes.chunks(bs).enumerate() {
         let mut saves: Vec<Vec<(usize, (P, P))>> = Vec::new();
         let mut logs: Vec<Vec<TaEvent>> = Vec::new();
@@ -1478,9 +1483,11 @@ fn run_pass(st: &mut TaState<'_>, iter: usize, horizontal: bool, trace: &mut Opt
                 route_costs: Vec::new(),
                 via_costs: Vec::new(),
                 reassign: BTreeSet::new(),
+                num_assigned: 0,
                 trace: trace.as_ref().map(|_| vec![TaEvent::Worker { iter, horizontal, batch: b, index: k, route_box: *rb }]),
             };
             w.main_mt();
+            assigned += w.num_assigned;
             let s = w.save_to_guides();
             let mut log = w.trace.take().unwrap_or_default();
             for &(g, (sb, se)) in &s {
@@ -1502,20 +1509,31 @@ fn run_pass(st: &mut TaState<'_>, iter: usize, horizontal: bool, trace: &mut Opt
             }
         }
     }
+    (assigned, boxes.len())
+}
+
+/// What the passes did, for the log: which direction ran first, and per iteration each pass's
+/// wires assigned and panels, in the order run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaCounts {
+    pub h_first: bool,
+    pub passes: Vec<[(usize, usize); 2]>,
 }
 
 /// Track assignment: the initial pass and one repair pass; the guides' routes are the result.
-pub fn track_assignment(st: &mut TaState<'_>, trace: &mut Option<Vec<TaEvent>>) {
+pub fn track_assignment(st: &mut TaState<'_>, trace: &mut Option<Vec<TaEvent>>) -> TaCounts {
     // ⚠️ "The bottom layer" is layer 0, or layer 1 when layer 0 is not a routing layer — the
     // placeholder cut layer, which is never horizontal: vertical panels go first.
     let tech = st.input.tech;
     let bottom = if tech.layers[0].kind == LayerKind::Routing { 0 } else { 1 };
     let h_first = tech.layers[bottom].is_horizontal();
+    let mut passes = Vec::new();
     for iter in [0, 1] {
-        for h in if h_first { [true, false] } else { [false, true] } {
-            run_pass(st, iter, h, trace);
-        }
+        let [a, b] = if h_first { [true, false] } else { [false, true] };
+        let first = run_pass(st, iter, a, trace);
+        passes.push([first, run_pass(st, iter, b, trace)]);
     }
+    TaCounts { h_first, passes }
 }
 
 
@@ -1569,7 +1587,7 @@ mod tests {
 
     fn worker<'s, 'a>(st: &'s TaState<'a>, iter: usize) -> Worker<'s, 'a> {
         let rb = st.input.grid.die;
-        let mut w = Worker { st, route_box: rb, ext_box: rb, horizontal: true, iter, hard: false, track_locs: Vec::new(), iroutes: Vec::new(), own: Vec::new(), shapes: Vec::new(), route_costs: Vec::new(), via_costs: Vec::new(), reassign: BTreeSet::new(), trace: None };
+        let mut w = Worker { st, route_box: rb, ext_box: rb, horizontal: true, iter, hard: false, track_locs: Vec::new(), iroutes: Vec::new(), own: Vec::new(), shapes: Vec::new(), route_costs: Vec::new(), via_costs: Vec::new(), reassign: BTreeSet::new(), num_assigned: 0, trace: None };
         let n = st.input.tech.layers.len();
         w.shapes = (0..n).map(|_| TrackIndex::new(true)).collect();
         w.route_costs = (0..n).map(|_| TrackIndex::new(true)).collect();

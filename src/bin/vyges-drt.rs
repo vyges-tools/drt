@@ -142,7 +142,7 @@ const DESCRIBE: &str = r#"{
 ///
 /// | code | meaning |
 /// |---|---|
-/// | `DRT-0195` / `DRT-0200`, `DRT-0199` | detailed_route, per iteration: the reference's header (`Start Nth <flow> iteration.`, or `Skipping iteration N`) and `  Number of violations = M.` |
+/// | `DRT-nnnn` | detailed_route: the reference's own log lines, each printed on stderr as `[INFO DRT-nnnn] text` as its stage runs — reading, default vias, instance analysis, pin access, guides, track assignment, and per iteration its header (`Start Nth <flow> iteration.`, or `Skipping iteration N`) and `  Number of violations = M.` |
 /// | `DRT-DONE` | the run finished; a census of what it did (detailed_route: iterations, markers, markers after each iteration, nets written, routed before, rerouted; pin_access: unique classes, preferred points, port points). `warn` when the status is not the pass word |
 /// | `DRT-REFUSED` | a step this engine does not model; the reason names it |
 /// | `DRT-ERROR` | usage, unreadable input, or a failed write |
@@ -151,9 +151,22 @@ mod events {
 
     const TOOL: &str = "vyges-drt";
 
-    /// One of the reference's own lines (information), under its code.
-    pub fn reference_line(code: &str, text: String) {
-        emit(&Event::new(TOOL, Severity::Info, text).with_code(code));
+    /// One of the run's log lines, through the process's one logger: printed on stderr as it is
+    /// logged, and an event under its code.
+    pub fn line(l: vyges_drt::dr::log::Line) {
+        use std::sync::{Mutex, OnceLock};
+        use vyges_drt::dr::log::Line;
+        use vyges_events::logger::Logger;
+        static LOG: OnceLock<Mutex<Logger>> = OnceLock::new();
+        let mut log = LOG.get_or_init(|| Mutex::new(Logger::new().events(TOOL))).lock().unwrap_or_else(|e| e.into_inner());
+        match l {
+            Line::Info(id, t) => log.info("DRT", id, &t),
+            Line::Warn(id, t) => log.warn("DRT", id, &t),
+            Line::Report(t) => log.report(&t),
+        }
+        for l in log.take_lines() {
+            eprintln!("{l}");
+        }
     }
 
     /// One event for the run's outcome, from its status word and the report's own fields.
@@ -259,20 +272,10 @@ fn route(a: &Args) -> Outcome {
             Err(_) => return fail("error", 2, format!("--end-iteration {n}: not an iteration number")),
         }
     }
-    let s = match vyges_drt::dr::run::detailed_route(&mut db, &tech, &opts) {
+    let s = match vyges_drt::dr::run::detailed_route_logged(&mut db, &tech, &opts, &mut events::line) {
         Ok(s) => s,
         Err(e) => return fail("refused", 3, e),
     };
-    // The reference's per-iteration lines: the header (`DRT-0195`, or `DRT-0200` for a skipped
-    // iteration), then `DRT-0199` with the markers standing after it.
-    for (i, (&m, flow)) in s.markers_by_iteration.iter().zip(&s.flow_by_iteration).enumerate() {
-        if *flow == "skip" {
-            events::reference_line("DRT-0200", format!("Skipping iteration {i}"));
-        } else {
-            events::reference_line("DRT-0195", format!("Start {i}{} {flow} iteration.", vyges_drt::dr::flow::iteration_suffix(i)));
-        }
-        events::reference_line("DRT-0199", format!("  Number of violations = {m}."));
-    }
     let out = a.out.as_ref().expect("--out");
     let written = if out.ends_with(".def") { db.write_def(out) } else { db.write(out) };
     if let Err(e) = written {

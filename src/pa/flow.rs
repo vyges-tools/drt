@@ -87,6 +87,8 @@ pub struct PinAccess {
     pub picks: Vec<Option<usize>>,
     /// Per port, per pin: its access points (routed ports).
     pub port_aps: Vec<Vec<Vec<AccessPoint>>>,
+    /// The instance rows the pattern search ran over (the reference's groups).
+    pub rows: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +234,7 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
             picks[members[k]] = Some(p);
         }
     }
-    Ok(PinAccess { classes, class_aps, patterns, picks, port_aps })
+    Ok(PinAccess { classes, class_aps, patterns, picks, port_aps, rows: rows.len() })
 }
 
 /// `f` over `items` — on the rayon pool when it has more than one thread — the results in `items`'
@@ -418,6 +420,7 @@ mod tests {
             patterns: vec![vec![Pattern { aps: vec![Some((0, 0))], left: Some((0, 0)), right: Some((0, 0)), cost: 0 }]],
             picks: vec![Some(0), Some(0)],
             port_aps: vec![],
+            rows: 1,
         };
         (masters, insts, pa)
     }

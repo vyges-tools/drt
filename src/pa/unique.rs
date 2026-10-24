@@ -152,6 +152,41 @@ pub fn compute_unique(tech: &Tech, tracks: &[TrackPattern], masters: &HashMap<St
     classes
 }
 
+/// The reader's instance analysis (`instAnalysis`, logged as the number of unique instances) —
+/// NOT pin access's classes, which it resembles. Rules:
+/// - a master's range runs from its lowest pin-shape layer to two above its highest, capped at the
+///   layer count, over EVERY terminal (supplies too), with no bottom-layer clamp; a master
+///   without pin shapes has an empty range;
+/// - per instance, one offset per preferred pattern whose layer is in the range — the location
+///   modulo the spacing (x for vertical tracks, y for horizontal) — and NONE for the others (no
+///   track-span test, no stand-in value);
+/// - the count is of distinct (master, orientation, offsets); no instance is split off for a
+///   non-default rule.
+pub fn inst_analysis_count(tech: &Tech, tracks: &[TrackPattern], masters: &HashMap<String, Master>, insts: &[UniqueInst]) -> usize {
+    let pref = compute_pref_track_patterns(tech, tracks);
+    let n = tech.layers.len() as i32;
+    let range = |m: &Master| {
+        let (mut lo, mut hi) = (n, 0);
+        for &(l, _) in m.terms.iter().flat_map(|t| &t.pins).flat_map(|p| &p.shapes) {
+            lo = lo.min(l as i32);
+            hi = hi.max(l as i32);
+        }
+        (lo, (hi + 2).min(n))
+    };
+    let ranges: HashMap<&str, (i32, i32)> = masters.iter().map(|(k, m)| (k.as_str(), range(m))).collect();
+    let mut keys: std::collections::HashSet<(&str, &str, Vec<i32>)> = std::collections::HashSet::new();
+    for inst in insts {
+        let (lo, hi) = ranges[inst.master.as_str()];
+        let offsets = pref
+            .iter()
+            .filter(|tp| (lo..=hi).contains(&(tp.layer as i32)))
+            .map(|tp| if tp.vertical_tracks { inst.location.0 % tp.spacing } else { inst.location.1 % tp.spacing })
+            .collect();
+        keys.insert((inst.master.as_str(), inst.orient.as_str(), offsets));
+    }
+    keys.len()
+}
+
 /// A class routes a terminal when any of its instances does.
 pub fn init_skip_inst_term(class: &mut UniqueClass, insts: &[UniqueInst]) {
     let n = insts[class.insts[0]].routes.len();
@@ -182,6 +217,23 @@ mod tests {
         assert_eq!(master_pin_layer_range(&t, &master(&[("SIGNAL", 4)])), (4, 5));
         let (lo, hi) = master_pin_layer_range(&t, &master(&[("GROUND", 2)]));
         assert!(lo > hi);
+    }
+
+    /// Rule (instAnalysis): the reader's range counts SUPPLY pins and its offsets skip the
+    /// track-span test. A power pin on the patterned layer splits two placements pin access
+    /// groups together; a pattern far from the instances still splits them.
+    #[test]
+    fn the_readers_unique_count_is_not_pin_access_classes() {
+        let t = tech();
+        let masters: HashMap<String, Master> = [("a".to_string(), master(&[("SIGNAL", 4), ("POWER", 2)]))].into();
+        let inst = |x| UniqueInst { master: "a".into(), orient: "R0".into(), location: (x, 0), bbox: Rect::new(x, 0, x + 10, 10), routes: vec![true, false], ndr_no_taper: false };
+        let insts = [inst(0), inst(50), inst(100)];
+        let far = [TrackPattern { layer: 2, vertical_tracks: true, start: 100_000, num: 1, spacing: 100 }];
+        assert_eq!(inst_analysis_count(&t, &far, &masters, &insts), 2);
+        assert_eq!(compute_unique(&t, &far, &masters, &insts).len(), 1);
+        // Without the supply pin the layer is out of range: one.
+        let masters: HashMap<String, Master> = [("a".to_string(), master(&[("SIGNAL", 4)]))].into();
+        assert_eq!(inst_analysis_count(&t, &far, &masters, &insts), 1);
     }
 
     /// Only tracks along their layer's direction are preferred.
