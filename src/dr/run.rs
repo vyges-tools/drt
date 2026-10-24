@@ -148,9 +148,12 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     log(Line::Info(163, "Instance analysis.".into()));
     let uinsts: Vec<_> = insts.iter().map(|i| i.unique.clone()).collect();
     log(Line::Info(164, format!("Number of unique instances = {}.", crate::pa::unique::inst_analysis_count(tech, &tracks, &masters, &uinsts))));
+    // The shape region query holds exactly the fixed shapes.
+    let mut design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
     log(Line::Info(168, "Init region query.".into()));
     crate::dr::log::layers_complete(tech, 24, "").into_iter().for_each(&mut *log);
-    let mut design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
+    let sizes: Vec<usize> = design.fixed.iter().map(Vec::len).collect();
+    crate::dr::log::region_query_sizes(tech, 33, "shape", &sizes).into_iter().for_each(&mut *log);
     // Every design shape with its check owner: what a via trial of a pin on a non-default-rule
     // net without auto-taper is checked against.
     let shapes: Vec<crate::pa::verdict::TargetShape> = design.fixed.iter().zip(&design.owners).enumerate().flat_map(|(l, (v, o))| v.iter().zip(o).map(move |((r, _), o)| (o.clone(), l, *r))).collect();
