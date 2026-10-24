@@ -9,7 +9,7 @@
 //! order decides results (it numbers the objects, and numbers break ties). So the tree is built
 //! exactly one way and queried exactly one way:
 //!
-//! - nodes hold at most 16 entries (at least 4);
+//! - nodes hold at most 16 entries (at least 4) — other limits through [`Limits`];
 //! - building: every value's box centre (integer halves, truncated) is an entry; the entries are
 //!   split recursively — at a median count of whole subtrees, along the LONGER side of the
 //!   current bounding box (x on a tie), by a selection that leaves the entries in one particular
@@ -20,8 +20,23 @@
 
 use crate::polygon90::Rect;
 
-const MAX: usize = 16;
-const MIN: usize = 4;
+/// A node's entry limits: at most `max`, at least `min` (below it a node underflows on removal).
+/// The router's trees are 16/4 ([`Limits::DEFAULT`]); an R*-tree of `n` keeps `max = n`,
+/// `min = (n * 3) / 10` (at least 1) — `rstar<4>` is 4/1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max: usize,
+    pub min: usize,
+}
+
+impl Limits {
+    pub const DEFAULT: Limits = Limits { max: 16, min: 4 };
+
+    /// The limits of an R*-tree of at most `max` entries.
+    pub fn rstar(max: usize) -> Limits {
+        Limits { max, min: ((max * 3) / 10).max(1) }
+    }
+}
 
 enum Node {
     Internal(Vec<(Rect, usize)>),
@@ -32,6 +47,7 @@ pub struct PackedRTree<T> {
     values: Vec<(Rect, T)>,
     nodes: Vec<Node>,
     root: Option<usize>,
+    limits: Limits,
 }
 
 fn touches(a: &Rect, b: &Rect) -> bool {
@@ -54,21 +70,28 @@ struct Counts {
 impl<T> PackedRTree<T> {
     /// Built from `values` in the order given.
     pub fn new(values: Vec<(Rect, T)>) -> PackedRTree<T> {
-        let mut t = PackedRTree { values, nodes: Vec::new(), root: None };
+        PackedRTree::with_limits(values, Limits::DEFAULT)
+    }
+
+    /// Built from `values` in the order given, nodes held to `limits` (the packing is the same
+    /// for every split algorithm).
+    pub fn with_limits(values: Vec<(Rect, T)>, limits: Limits) -> PackedRTree<T> {
+        let mut t = PackedRTree { values, nodes: Vec::new(), root: None, limits };
         let n = t.values.len();
         if n == 0 {
             return t;
         }
+        let Limits { max, min } = limits;
         // Each centre: half the SUM of the sides, truncated.
         let mut entries: Vec<((i32, i32), usize)> = t.values.iter().enumerate().map(|(i, (r, _))| (((r.xl + r.xh) / 2, (r.yl + r.yh) / 2), i)).collect();
         let hint = t.values.iter().fold(None, |b, (r, _)| Some(expand(b, r))).expect("a value");
         let mut counts = Counts { maxc: 1, minc: 1 };
-        let mut smax = MAX;
+        let mut smax = max;
         while smax < n {
             counts.maxc = smax;
-            smax *= MAX;
+            smax *= max;
         }
-        counts.minc = MIN * (counts.maxc / MAX);
+        counts.minc = min * (counts.maxc / max);
         let (_, root) = t.per_level(&mut entries, hint, counts);
         t.root = Some(root);
         t
@@ -81,7 +104,8 @@ impl<T> PackedRTree<T> {
             self.nodes.push(Node::Leaf(ids));
             return (b, self.nodes.len() - 1);
         }
-        let next = Counts { maxc: counts.maxc / MAX, minc: counts.minc / MAX };
+        let max = self.limits.max;
+        let next = Counts { maxc: counts.maxc / max, minc: counts.minc / max };
         let mut children = Vec::new();
         let mut b = None;
         self.per_level_packets(entries, hint, counts, next, &mut children, &mut b);
@@ -138,19 +162,7 @@ impl<T> PackedRTree<T> {
     ///   value reached wins.
     pub fn nearest_one(&self, p: (i32, i32), keep: impl Fn(&T) -> bool) -> Option<&(Rect, T)> {
         let root = self.root?;
-        let comparable = |r: &Rect| -> f64 {
-            let axis = |v: i32, lo: i32, hi: i32| -> f64 {
-                if v < lo {
-                    f64::from(lo) - f64::from(v)
-                } else if v > hi {
-                    f64::from(v) - f64::from(hi)
-                } else {
-                    0.0
-                }
-            };
-            let (dx, dy) = (axis(p.0, r.xl, r.xh), axis(p.1, r.yl, r.yh));
-            dx * dx + dy * dy
-        };
+        let comparable = |r: &Rect| comparable(p, r);
         let mut best: Option<(f64, usize)> = None;
         let ignore = |best: &Option<(f64, usize)>, d: f64| matches!(best, Some((b, _)) if *b <= d);
         let mut branches = BranchHeap::default();
@@ -218,7 +230,22 @@ impl<T> PackedRTree<T> {
     }
 }
 
-/// The pending branches of a nearest query: `std::priority_queue<branch_data, vector,
+/// The comparable (squared, as `f64`) distance from the point `p` to the box `r`, 0 inside.
+fn comparable(p: (i32, i32), r: &Rect) -> f64 {
+    let axis = |v: i32, lo: i32, hi: i32| -> f64 {
+        if v < lo {
+            f64::from(lo) - f64::from(v)
+        } else if v > hi {
+            f64::from(v) - f64::from(hi)
+        } else {
+            0.0
+        }
+    };
+    let (dx, dy) = (axis(p.0, r.xl, r.xh), axis(p.1, r.yl, r.yh));
+    dx * dx + dy * dy
+}
+
+/// The pending branches of a nearest query:`std::priority_queue<branch_data, vector,
 /// branch_data_comp>` as libc++ 22 runs it. `comp(a, b)` — `a` ranks BELOW `b` — is "farther, or
 /// as far and higher up", so the top is the nearest, lowest branch; branches equal on both are
 /// ordered by the heap's moves alone (`push_heap` sifts up; `pop_heap` drives the hole to a leaf
@@ -261,6 +288,9 @@ impl BranchHeap {
     }
     fn top(&self) -> Option<&(f64, usize, usize)> {
         self.v.first()
+    }
+    fn clear(&mut self) {
+        self.v.clear();
     }
     fn pop(&mut self) -> (f64, usize, usize) {
         let len = self.v.len();
@@ -513,15 +543,15 @@ pub fn nth_element<E>(v: &mut [E], nth: usize, less: impl Fn(&E, &E) -> bool) {
 /// License 1.0):
 ///
 /// - insert: from the root, into the child whose box grows least in area (then the smaller
-///   area; the first on a tie), that child's box grown on the way down; a node over 16 entries
+///   area; the first on a tie), that child's box grown on the way down; a node over the maximum (16)
 ///   splits — the two seeds are the pair wasting the most area together (the first such pair),
 ///   then entries are taken from the BACK, each the one whose area increase differs most
 ///   between the groups (the last scanned on a tie, scanning back to front), to the group it
 ///   grows less (then the smaller group box, then the group with fewer entries), a group that
-///   needs every remaining entry to reach 4 taking them; the node keeps the first group, a new
+///   needs every remaining entry to reach the minimum (4) taking them; the node keeps the first group, a new
 ///   node takes the second — appended to the parent (a new root above a split root);
 /// - remove: down every child whose box covers the value's box, the first match removed by
-///   moving the node's LAST entry into its place; a node left under 4 entries is taken out of
+///   moving the node's LAST entry into its place; a node left under the minimum is taken out of
 ///   its parent the same way and its entries reinserted after the removal, highest level first,
 ///   at their own level; every box on the path shrinks to its entries; a root left with one
 ///   child is replaced by it.
@@ -532,6 +562,7 @@ pub struct DynRTree<T> {
     root: Option<usize>,
     /// The level of the leaves (the root is level 0).
     leafs_level: usize,
+    limits: Limits,
 }
 
 /// An entry being inserted: a value, or a subtree (reinserted after a removal).
@@ -552,7 +583,13 @@ fn covered(a: &Rect, b: &Rect) -> bool {
 impl<T> DynRTree<T> {
     /// Bulk-loaded as [`PackedRTree::new`].
     pub fn new(values: Vec<(Rect, T)>) -> DynRTree<T> {
-        let p = PackedRTree::new(values);
+        DynRTree::with_limits(values, Limits::DEFAULT)
+    }
+
+    /// Bulk-loaded as [`PackedRTree::with_limits`]. ⚠️ Insertion is the QUADRATIC tree's at any
+    /// limits; an R*-tree's removals and queries are reproduced, its insertions are not.
+    pub fn with_limits(values: Vec<(Rect, T)>, limits: Limits) -> DynRTree<T> {
+        let p = PackedRTree::with_limits(values, limits);
         let mut depth = 0;
         if let Some(mut n) = p.root {
             while let Node::Internal(ch) = &p.nodes[n] {
@@ -561,7 +598,7 @@ impl<T> DynRTree<T> {
             }
         }
         let alive = vec![true; p.values.len()];
-        DynRTree { values: p.values, alive, nodes: p.nodes, root: p.root, leafs_level: depth }
+        DynRTree { values: p.values, alive, nodes: p.nodes, root: p.root, leafs_level: depth, limits }
     }
 
     pub fn value(&self, id: usize) -> &(Rect, T) {
@@ -648,7 +685,7 @@ impl<T> DynRTree<T> {
     }
 
     fn post_traverse(&mut self, node: usize, path: &[(usize, usize)]) {
-        if self.node_len(node) <= MAX {
+        if self.node_len(node) <= self.limits.max {
             return;
         }
         let (b1, b2, n2) = self.split(node);
@@ -671,7 +708,7 @@ impl<T> DynRTree<T> {
             Node::Internal(c) => c.clone(),
             Node::Leaf(v) => v.iter().map(|&i| (self.values[i].0, i)).collect(),
         };
-        let (g1, g2, b1, b2) = quadratic_split(elems);
+        let (g1, g2, b1, b2) = quadratic_split(elems, self.limits.min);
         let n2 = if leaf { Node::Leaf(g2.iter().map(|e| e.1).collect()) } else { Node::Internal(g2) };
         self.nodes[node] = if leaf { Node::Leaf(g1.iter().map(|e| e.1).collect()) } else { Node::Internal(g1) };
         self.nodes.push(n2);
@@ -733,7 +770,7 @@ impl<T> DynRTree<T> {
                     let last = ch.len() - 1;
                     ch.swap(idx, last);
                     ch.pop();
-                    st.underflow = ch.len() < MIN;
+                    st.underflow = ch.len() < self.limits.min;
                 }
                 if let Some((p, pi)) = parent {
                     let b = self.node_box(node);
@@ -763,12 +800,13 @@ impl<T> DynRTree<T> {
             Node::Leaf(v) => {
                 let Some(pos) = v.iter().position(|&i| id.map_or(self.values[i].0 == *vbox, |id| i == id)) else { return };
                 st.id = Some(v[pos]);
+                let min = self.limits.min;
                 let Node::Leaf(v) = &mut self.nodes[node] else { unreachable!() };
                 let last = v.len() - 1;
                 v.swap(pos, last);
                 v.pop();
                 st.removed = true;
-                st.underflow = v.len() < MIN;
+                st.underflow = v.len() < min;
                 if let Some((p, pi)) = parent {
                     let b = self.node_box(node);
                     let Node::Internal(pc) = &mut self.nodes[p] else { unreachable!() };
@@ -785,6 +823,25 @@ impl<T> DynRTree<T> {
             Node::Leaf(v) => v.iter().fold(None, |b, &i| Some(expand(b, &self.values[i].0))),
         };
         b.unwrap_or(Rect { xl: i32::MAX, yl: i32::MAX, xh: i32::MIN, yh: i32::MIN })
+    }
+
+    /// The `k` values nearest the point `p`, nearest first, by id — Boost.Geometry 1.89's
+    /// incremental `qbegin(nearest(p, k))` (`visitors/distance_query.hpp`,
+    /// `distance_query_incremental`), in its order:
+    ///
+    /// - distances are comparable ones (squared, as `f64`), as in [`PackedRTree::nearest_one`];
+    /// - pending branches in [`BranchHeap`]; candidate values in a min-max heap ([`MinMaxHeap`]),
+    ///   at most `k` held or already returned — once that many, the FARTHEST held is dropped for
+    ///   a nearer one, and a branch or value no nearer than it is skipped;
+    /// - each step returns the nearest held value as soon as it is no farther than the closest
+    ///   pending branch (`<=`), else opens that branch; so on a tie the heaps' moves decide.
+    pub fn nearest(&self, p: (i32, i32), k: usize) -> Nearest<'_, T> {
+        let mut q = Nearest { tree: self, p, k, branches: BranchHeap::default(), neighbors: MinMaxHeap::default(), count: 0, done: false };
+        match self.root {
+            Some(root) if k > 0 => q.apply(root, self.leafs_level),
+            _ => q.done = true,
+        }
+        q
     }
 
     /// Every live value whose box touches `q`, in the tree's order, with its id.
@@ -816,6 +873,251 @@ impl<T> DynRTree<T> {
     }
 }
 
+/// An incremental nearest query over a [`DynRTree`] ([`DynRTree::nearest`]): value ids.
+pub struct Nearest<'a, T> {
+    tree: &'a DynRTree<T>,
+    p: (i32, i32),
+    k: usize,
+    branches: BranchHeap,
+    neighbors: MinMaxHeap,
+    /// Values returned so far.
+    count: usize,
+    done: bool,
+}
+
+impl<T> Nearest<'_, T> {
+    /// Open a node: its children become pending branches, its values candidates.
+    fn apply(&mut self, node: usize, reverse_level: usize) {
+        match &self.tree.nodes[node] {
+            Node::Internal(children) => {
+                for (b, c) in children {
+                    let d = comparable(self.p, b);
+                    if !self.ignore(d) {
+                        self.branches.push((d, reverse_level - 1, *c));
+                    }
+                }
+            }
+            Node::Leaf(ids) => {
+                for &i in ids {
+                    let d = comparable(self.p, &self.tree.values[i].0);
+                    if !self.ignore(d) {
+                        self.neighbors.push((d, i));
+                        if self.count + self.neighbors.len() > self.k {
+                            self.neighbors.pop_bottom();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `k` values are held or returned and the farthest held is no farther than `d`.
+    fn ignore(&self, d: f64) -> bool {
+        self.count + self.neighbors.len() == self.k && self.neighbors.bottom().is_none_or(|b| b.0 <= d)
+    }
+}
+
+impl<T> Iterator for Nearest<'_, T> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let Some(&(bd, _, _)) = self.branches.top() else {
+                // No branch left: the nearest held value, or the end.
+                if let Some(&(_, id)) = self.neighbors.top() {
+                    self.count += 1;
+                    self.neighbors.pop_top();
+                    return Some(id);
+                }
+                self.count = self.k;
+                self.done = true;
+                return None;
+            };
+            if let Some(&(nd, id)) = self.neighbors.top() {
+                if nd <= bd {
+                    self.count += 1;
+                    self.neighbors.pop_top();
+                    return Some(id);
+                }
+            }
+            if self.ignore(bd) {
+                self.branches.clear();
+                continue;
+            }
+            let (_, level, node) = self.branches.pop();
+            self.apply(node, level);
+        }
+    }
+}
+
+/// The candidate values of an incremental nearest query: Boost.Geometry's `priority_dequeue`
+/// (`index/detail/priority_dequeue.hpp`, `minmax_heap.hpp` — Boost Software License 1.0) of
+/// `(distance, id)` ordered by distance alone: a min-max heap, the nearest at the root, the
+/// farthest at one of its two children. Values as far apart are ordered by the heap's moves,
+/// transcribed: a push climbs by parent then by grandparent; a pop moves the back element into
+/// the hole and drives it down by grandchildren (the best of four, else of what exists), swapping
+/// with a parent it passes the wrong way.
+#[derive(Default)]
+struct MinMaxHeap {
+    v: Vec<(f64, usize)>,
+}
+
+impl MinMaxHeap {
+    /// Position `i` is on a min level: an even one, the root's level being 0.
+    fn min_level(i: usize) -> bool {
+        (i + 1).ilog2().is_multiple_of(2)
+    }
+
+    /// `a` ranks before `b` on a min level (`min`) or a max level (`!min`).
+    fn call(min: bool, a: &(f64, usize), b: &(f64, usize)) -> bool {
+        if min {
+            a.0 < b.0
+        } else {
+            b.0 < a.0
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    fn top(&self) -> Option<&(f64, usize)> {
+        self.v.first()
+    }
+
+    fn bottom_index(&self) -> usize {
+        match self.v.len() {
+            0 | 1 => 0,
+            2 => 1,
+            _ if Self::call(true, &self.v[1], &self.v[2]) => 2,
+            _ => 1,
+        }
+    }
+
+    fn bottom(&self) -> Option<&(f64, usize)> {
+        self.v.get(self.bottom_index())
+    }
+
+    fn push(&mut self, x: (f64, usize)) {
+        self.v.push(x);
+        let size = self.v.len();
+        if size < 2 {
+            return;
+        }
+        let c = size - 1;
+        let min = Self::min_level(c);
+        let val = self.v[c];
+        let p = (c - 1) >> 1;
+        if Self::call(min, &self.v[p], &val) {
+            self.v[c] = self.v[p];
+            self.push_up(!min, p, val);
+        } else {
+            self.push_up(min, c, val);
+        }
+    }
+
+    /// Climb by grandparents.
+    fn push_up(&mut self, min: bool, mut c: usize, val: (f64, usize)) {
+        while c > 2 {
+            let g = (c - 3) >> 2;
+            if !Self::call(min, &val, &self.v[g]) {
+                break;
+            }
+            self.v[c] = self.v[g];
+            c = g;
+        }
+        self.v[c] = val;
+    }
+
+    fn pop_top(&mut self) {
+        self.pop_at(0);
+    }
+
+    fn pop_bottom(&mut self) {
+        let b = self.bottom_index();
+        self.pop_at(b);
+    }
+
+    /// Remove position `el`: the back element moved into its hole and driven down.
+    fn pop_at(&mut self, el: usize) {
+        let size = self.v.len();
+        if size >= 2 {
+            let last = size - 1;
+            let val = self.v[last];
+            self.v[last] = self.v[el];
+            let min = Self::min_level(el);
+            self.pop_down(min, el, size - 1, val);
+        }
+        self.v.pop();
+    }
+
+    fn pick_grandchild4(&self, min: bool, f: usize) -> usize {
+        let v = &self.v;
+        let m1 = if Self::call(min, &v[f], &v[f + 1]) { f } else { f + 1 };
+        let m2 = if Self::call(min, &v[f + 2], &v[f + 3]) { f + 2 } else { f + 3 };
+        if Self::call(min, &v[m1], &v[m2]) {
+            m1
+        } else {
+            m2
+        }
+    }
+
+    /// Drive `val` down from the hole `p` over the first `size` positions.
+    fn pop_down(&mut self, min: bool, mut p: usize, size: usize, mut val: (f64, usize)) {
+        if size >= 7 {
+            // While p has four grandchildren.
+            let last_g = (size - 3) >> 2;
+            while p < last_g {
+                let ll = 4 * p + 3;
+                let m = self.pick_grandchild4(min, ll);
+                if !Self::call(min, &self.v[m], &val) {
+                    break;
+                }
+                self.v[p] = self.v[m];
+                let par = (m - 1) >> 1;
+                if Self::call(min, &self.v[par], &val) {
+                    std::mem::swap(&mut self.v[par], &mut val);
+                }
+                p = m;
+            }
+        }
+        if size >= 2 && p <= ((size - 2) >> 1) {
+            // At least one child: the best of the children and grandchildren that exist.
+            let l = 2 * p + 1;
+            let mut m = l;
+            if size >= 3 && p <= ((size - 3) >> 1) {
+                let mut m2 = l + 1;
+                if size >= 4 && p <= ((size - 4) >> 2) {
+                    let ll = 2 * l + 1;
+                    m = ll;
+                    if size >= 5 && p <= ((size - 5) >> 2) {
+                        m = if Self::call(min, &self.v[ll], &self.v[ll + 1]) { ll } else { ll + 1 };
+                        if size >= 6 && p <= ((size - 6) >> 2) {
+                            m2 = ll + 2;
+                        }
+                    }
+                }
+                m = if Self::call(min, &self.v[m], &self.v[m2]) { m } else { m2 };
+            }
+            if Self::call(min, &self.v[m], &val) {
+                self.v[p] = self.v[m];
+                if m >= 3 && p <= ((m - 3) >> 2) {
+                    // m is a grandchild.
+                    let par = (m - 1) >> 1;
+                    if Self::call(min, &self.v[par], &val) {
+                        std::mem::swap(&mut self.v[par], &mut val);
+                    }
+                }
+                p = m;
+            }
+        }
+        self.v[p] = val;
+    }
+}
+
 struct RemoveState {
     removed: bool,
     underflow: bool,
@@ -826,8 +1128,9 @@ struct RemoveState {
 
 type Groups = (Vec<(Rect, usize)>, Vec<(Rect, usize)>, Rect, Rect);
 
-/// The quadratic redistribution of 17 entries into two groups (boxes after).
-fn quadratic_split(elems: Vec<(Rect, usize)>) -> Groups {
+/// The quadratic redistribution of an overfull node's entries into two groups of at least `min`
+/// (boxes after).
+fn quadratic_split(elems: Vec<(Rect, usize)>, min: usize) -> Groups {
     let n = elems.len();
     let (mut seed1, mut seed2) = (0usize, 1usize);
     let mut greatest: i64 = 0;
@@ -865,9 +1168,9 @@ fn quadratic_split(elems: Vec<(Rect, usize)>) -> Groups {
     let mut remaining = copy.len();
     while !copy.is_empty() {
         let mut pick = copy.len() - 1;
-        let group1 = if g1.len() + remaining <= MIN {
+        let group1 = if g1.len() + remaining <= min {
             true
-        } else if g2.len() + remaining <= MIN {
+        } else if g2.len() + remaining <= min {
             false
         } else {
             // Scanning from the back: the entry whose two increases differ most.
@@ -1083,5 +1386,159 @@ mod tests {
         assert_eq!(median_count(33, c), 16);
         assert_eq!(median_count(64, c), 32);
         assert_eq!(median_count(18, c), 14);
+    }
+
+    // An R*-tree's minimum is 30% of its maximum, truncated, never below 1: 4 → 1, 16 → 4.
+    #[test]
+    fn rstar_limits_keep_thirty_percent() {
+        assert_eq!(Limits::rstar(4), Limits { max: 4, min: 1 });
+        assert_eq!(Limits::rstar(2), Limits { max: 2, min: 1 });
+        assert_eq!(Limits::rstar(16), Limits::DEFAULT);
+    }
+
+    /// The candidate heap driven as the reference's `priority_dequeue<…, pair_first_greater>` was
+    /// for the goldens: `pushes` pushes of pseudo-random distances `0..keys`, the bottom dropped
+    /// past `cap`, then drained top, bottom, top, … — the ids, `t` or `b` for the end taken.
+    fn heap_trace(pushes: usize, keys: u32, cap: usize) -> String {
+        let mut h = MinMaxHeap::default();
+        let mut s: u32 = 12345;
+        let mut got = Vec::new();
+        for i in 0..pushes {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            h.push((f64::from((s >> 16) % keys), i));
+            if h.len() > cap {
+                got.push(format!("b{}", h.bottom().unwrap().1));
+                h.pop_bottom();
+            }
+        }
+        let mut top = true;
+        while let Some(&(_, t)) = h.top() {
+            if top {
+                got.push(format!("t{t}"));
+                h.pop_top();
+            } else {
+                got.push(format!("b{}", h.bottom().unwrap().1));
+                h.pop_bottom();
+            }
+            top = !top;
+        }
+        got.join(" ")
+    }
+
+    // The candidate heap is a min-max heap on distance alone; among equal distances its moves
+    // decide which value is the top and which the bottom. Heavy ties (distances 0..3), at most 9.
+    #[test]
+    fn min_max_heap_ties_in_the_reference_order() {
+        let want = "b4 b3 b11 b8 b13 b14 b12 b7 b16 b9 b18 b20 b21 b22 b2 b24 b6 b5 b19 b28 b29 b30 b31 b27 \
+                    b33 b34 b35 b36 b37 b38 b39 t0 b32 t17 b15 t23 b25 t10 b1 t26";
+        assert_eq!(heap_trace(40, 4, 9), want);
+    }
+
+    // The same past 7 entries, where a pop moves down by the best of four grandchildren and
+    // swaps with a parent it passes the wrong way (distances 0..5, at most 60).
+    #[test]
+    fn min_max_heap_deep_ties_in_the_reference_order() {
+        let want = "b9 b22 b44 b41 b42 b36 b33 b28 b30 b49 b10 b71 b45 b43 b7 b38 b8 b17 b78 b15 b69 b67 b29 b27 \
+                    b84 b83 b56 b55 b50 b47 b61 b46 b14 b62 b94 b95 b20 b18 b98 b99 b100 b37 b16 b4 b104 b59 \
+                    b106 b92 b6 b2 b82 b111 b112 b113 b13 b114 b51 b53 b52 b48 t1 b11 t57 b79 t80 b90 t60 b0 \
+                    t108 b70 t25 b93 t26 b23 t117 b73 t91 b89 t118 b40 t66 b19 t72 b97 t103 b102 t3 b77 t65 \
+                    b86 t74 b107 t32 b109 t96 b87 t35 b58 t34 b110 t31 b12 t39 b119 t116 b24 t88 b105 t21 b63 \
+                    t75 b64 t85 b76 t101 b115 t54 b81 t68 b5";
+        assert_eq!(heap_trace(120, 6, 60), want);
+    }
+
+    // Spread distances (0..36): a pop's last step to a GRANDCHILD also swaps with the parent
+    // between when the moved value ranks past it — without that swap the heap order breaks.
+    #[test]
+    fn min_max_heap_spread_distances_in_the_reference_order() {
+        let want = "b41 b26 b13 b53 b60 b65 b35 b29 b44 b46 b70 b0 b15 b73 b34 b66 \
+                    b45 b17 b78 b12 b32 b79 b58 b54 b52 b42 b86 b87 b76 b89 b80 b91 \
+                    b92 b93 b88 b55 b5 b97 b98 b71 b16 b84 b28 b103 b104 b63 b106 b36 \
+                    b33 b109 b19 b111 b39 b113 b114 b115 b116 b100 b11 b49 b120 b1 b122 b68 \
+                    b3 b61 b82 b67 b31 b124 b102 b131 b132 b123 b134 b135 b136 b57 b138 b94 \
+                    b121 b141 b142 b143 b23 b145 b146 b147 b148 b149 b77 b48 b62 b152 b154 b150 \
+                    b156 b157 b158 b59 b160 b161 b162 b163 b164 b21 b166 b167 b2 b169 b127 b81 \
+                    b172 b22 b64 b175 b130 b75 b178 b18 b180 b37 b14 b183 b99 b168 b186 b159 \
+                    b8 b189 b190 b191 b185 b139 b194 b96 b196 b197 b198 b199 t9 b170 t112 b101 \
+                    t173 b140 t24 b47 t20 b118 t179 b85 t187 b7 t155 b90 t192 b72 t30 b27 \
+                    t40 b153 t38 b195 t174 b133 t151 b184 t50 b74 t144 b177 t128 b182 t43 b110 \
+                    t165 b69 t181 b125 t4 b105 t176 b108 t117 b193 t83 b56 t119 b171 t25 b6 \
+                    t95 b129 t51 b188 t137 b107 t126 b10";
+        assert_eq!(heap_trace(200, 37, 60), want);
+    }
+
+    // Every size and both ends: 20000 random steps — push twice as often as pop the top or the
+    // bottom — of distances 0..keys; FNV-1a 64 over the ids popped (a bottom's offset by 10^6).
+    // The digests are the reference's on the same steps, tied (5 values) and spread (1000).
+    #[test]
+    fn min_max_heap_random_steps_in_the_reference_order() {
+        let digest = |keys: u32| {
+            let mut q = MinMaxHeap::default();
+            let mut s: u32 = 777;
+            let mut h: u64 = 1_469_598_103_934_665_603;
+            let mut mix = |v: u64| h = (h ^ v).wrapping_mul(1_099_511_628_211);
+            for i in 0..20000usize {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                let op = (s >> 16) % 4;
+                if op < 2 || q.len() == 0 {
+                    s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    q.push((f64::from((s >> 16) % keys), i));
+                } else if op == 2 {
+                    mix(q.top().unwrap().1 as u64);
+                    q.pop_top();
+                } else {
+                    mix(q.bottom().unwrap().1 as u64 + 1_000_000);
+                    q.pop_bottom();
+                }
+            }
+            h
+        };
+        assert_eq!(digest(5), 7_424_331_541_090_690_868);
+        assert_eq!(digest(1000), 6_467_840_096_304_922_571);
+    }
+
+    // The walk on an 8 x 6 grid of pitch 10 at limits 4/1 (three levels): emptied leaves and
+    // then emptied internal nodes leave the tree as the walk goes — the reference's order.
+    #[test]
+    fn the_walk_over_a_deeper_tree_in_the_reference_order() {
+        let pts: Vec<(i32, i32)> = (0..48).map(|i| (i % 8 * 10, i / 8 * 10)).collect();
+        let values: Vec<(Rect, usize)> = pts.iter().enumerate().map(|(i, &(x, y))| (r(x, y, x, y), i)).collect();
+        let mut t = DynRTree::with_limits(values, Limits::rstar(4));
+        let mut order = vec![0usize];
+        while order.len() < pts.len() {
+            let cursor = *order.last().unwrap();
+            let next = t.nearest(pts[cursor], 10).find(|&i| i != cursor).expect("another cell");
+            assert!(t.remove(cursor));
+            order.push(next);
+        }
+        let want = [
+            0, 8, 16, 17, 9, 1, 2, 10, 18, 19, 20, 12, 4, 3, 11, 13, 21, 22, 14, 6, 7, 15, 23, 31, 30, 38, 39, 47,
+            46, 45, 44, 43, 35, 36, 28, 27, 26, 25, 24, 32, 40, 41, 42, 34, 33, 37, 29, 5,
+        ];
+        assert_eq!(order, want);
+    }
+
+    // The placed-cell walk at R*-tree limits 4/1 on a 4 x 3 grid of pitch 10 with two extra
+    // cells on (10, 10): from cell 0, each step lists the 4 nearest, takes the first that is not
+    // the current cell, then removes the current one. Every list is full of distance ties; the
+    // reference's lists, in order — packing, removal (a node underflows only when EMPTY at
+    // minimum 1) and the incremental query's tie order all show in them.
+    #[test]
+    fn nearest_lists_at_rstar_limits_in_the_reference_order() {
+        let pts = [(0, 0), (10, 0), (20, 0), (30, 0), (0, 10), (10, 10), (20, 10), (30, 10), (0, 20), (10, 20), (20, 20), (30, 20), (10, 10), (10, 10)];
+        let values: Vec<(Rect, usize)> = pts.iter().enumerate().map(|(i, &(x, y))| (r(x, y, x, y), i)).collect();
+        let mut t = DynRTree::with_limits(values, Limits::rstar(4));
+        let (mut cursor, mut out) = (0usize, String::new());
+        for _ in 1..pts.len() {
+            let ids: Vec<usize> = t.nearest(pts[cursor], 4).collect();
+            out += &ids.iter().map(|i| format!("{i} ")).collect::<String>();
+            out += "; ";
+            let next = *ids.iter().find(|&&i| i != cursor).expect("another cell");
+            assert!(t.remove(cursor));
+            cursor = next;
+        }
+        let want = "0 1 4 13 ; 1 13 5 12 ; 13 5 12 4 ; 5 12 9 4 ; 12 9 4 6 ; 9 8 10 4 ; 8 4 10 6 ; \
+                    4 6 2 10 ; 6 7 2 10 ; 7 3 11 2 ; 3 2 11 10 ; 2 10 11 ; 10 11 ; ";
+        assert_eq!(out, want);
     }
 }
