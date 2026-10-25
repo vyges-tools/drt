@@ -48,6 +48,7 @@ pub struct PackedRTree<T> {
     nodes: Vec<Node>,
     root: Option<usize>,
     limits: Limits,
+    stdlib: StdLib,
 }
 
 fn touches(a: &Rect, b: &Rect) -> bool {
@@ -76,7 +77,18 @@ impl<T> PackedRTree<T> {
     /// Built from `values` in the order given, nodes held to `limits` (the packing is the same
     /// for every split algorithm).
     pub fn with_limits(values: Vec<(Rect, T)>, limits: Limits) -> PackedRTree<T> {
-        let mut t = PackedRTree { values, nodes: Vec::new(), root: None, limits };
+        PackedRTree::packed(values, limits, StdLib::LibCxx)
+    }
+
+    /// Built from `values` in the order given, as a reference built against `stdlib` packs them:
+    /// the slices' selection permutes with that library's `nth_element`, and the nearest query
+    /// orders its pending branches with that library's heap.
+    pub fn new_in(values: Vec<(Rect, T)>, stdlib: StdLib) -> PackedRTree<T> {
+        PackedRTree::packed(values, Limits::DEFAULT, stdlib)
+    }
+
+    fn packed(values: Vec<(Rect, T)>, limits: Limits, stdlib: StdLib) -> PackedRTree<T> {
+        let mut t = PackedRTree { values, nodes: Vec::new(), root: None, limits, stdlib };
         let n = t.values.len();
         if n == 0 {
             return t;
@@ -125,12 +137,12 @@ impl<T> PackedRTree<T> {
         let along_y = hint.yh - hint.yl > hint.xh - hint.xl;
         let (mut left, mut right) = (hint, hint);
         if along_y {
-            nth_element(entries, median, |a, b| a.0 .1 < b.0 .1);
+            nth_element_in(entries, median, |a, b| a.0 .1 < b.0 .1, self.stdlib);
             let c = hint.yl + (hint.yh - hint.yl) / 2;
             left.yh = c;
             right.yl = c;
         } else {
-            nth_element(entries, median, |a, b| a.0 .0 < b.0 .0);
+            nth_element_in(entries, median, |a, b| a.0 .0 < b.0 .0, self.stdlib);
             let c = hint.xl + (hint.xh - hint.xl) / 2;
             left.xh = c;
             right.xl = c;
@@ -160,12 +172,15 @@ impl<T> PackedRTree<T> {
     /// - `keep` is asked of values only, never of branches;
     /// - a later value replaces the kept one only when STRICTLY nearer, so on a tie the first
     ///   value reached wins.
+    ///
+    /// The heap's moves are the tree's library's ([`new_in`](Self::new_in)): two branches equal in
+    /// distance and level come off in an order only those moves decide.
     pub fn nearest_one(&self, p: (i32, i32), keep: impl Fn(&T) -> bool) -> Option<&(Rect, T)> {
         let root = self.root?;
         let comparable = |r: &Rect| comparable(p, r);
         let mut best: Option<(f64, usize)> = None;
         let ignore = |best: &Option<(f64, usize)>, d: f64| matches!(best, Some((b, _)) if *b <= d);
-        let mut branches = BranchHeap::default();
+        let mut branches = BranchHeap { v: Vec::new(), stdlib: self.stdlib };
         let (mut node, mut level) = (root, self.leaf_level());
         loop {
             match &self.nodes[node] {
@@ -250,9 +265,32 @@ fn comparable(p: (i32, i32), r: &Rect) -> f64 {
 /// as far and higher up", so the top is the nearest, lowest branch; branches equal on both are
 /// ordered by the heap's moves alone (`push_heap` sifts up; `pop_heap` drives the hole to a leaf
 /// through the larger child, Floyd's way, fills it with the last element and sifts that up).
-#[derive(Default)]
+///
+/// With [`StdLib::LibStdCxx`], libstdc++'s `pop_heap` instead (GCC 13 `bits/stl_heap.h`; its
+/// `push_heap` climbs as libc++'s does): it moves the last element
+/// out, drives the hole from the root through the larger child — the RIGHT one unless it ranks
+/// below the left — to the bottom (a lone left child at the end taken too), then sifts the moved
+/// element up from there.
 struct BranchHeap {
     v: Vec<(f64, usize, usize)>,
+    stdlib: StdLib,
+}
+
+/// Whose `std::priority_queue` a query's pending branches follow: the C++ standard library the
+/// reference was built against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StdLib {
+    /// LLVM's libc++.
+    #[default]
+    LibCxx,
+    /// GCC's libstdc++.
+    LibStdCxx,
+}
+
+impl Default for BranchHeap {
+    fn default() -> Self {
+        Self { v: Vec::new(), stdlib: StdLib::LibCxx }
+    }
 }
 
 impl BranchHeap {
@@ -284,7 +322,51 @@ impl BranchHeap {
     fn push(&mut self, x: (f64, usize, usize)) {
         self.v.push(x);
         let n = self.v.len();
+        // Both libraries' `push_heap` climb the same way; only `pop_heap` differs.
         self.sift_up(n);
+    }
+
+    /// libstdc++ `__push_heap`: the value climbs from `hole` while its parent ranks below it.
+    fn gnu_push_heap(&mut self, mut hole: usize, top: usize, value: (f64, usize, usize)) {
+        while hole > top {
+            let parent = (hole - 1) / 2;
+            if !Self::below(&self.v[parent], &value) {
+                break;
+            }
+            self.v[hole] = self.v[parent];
+            hole = parent;
+        }
+        self.v[hole] = value;
+    }
+
+    /// libstdc++ `pop_heap` + `pop_back`: the root out, the last element re-seated by
+    /// `__adjust_heap` over the first `len - 1` slots.
+    fn gnu_pop(&mut self) -> (f64, usize, usize) {
+        let len = self.v.len();
+        let top = self.v[0];
+        if len > 1 {
+            let l = len - 1;
+            let value = self.v[l];
+            self.v[l] = top;
+            let mut hole = 0usize;
+            let mut second = 0usize;
+            while l >= 1 && second < (l - 1) / 2 {
+                second = 2 * (second + 1);
+                if Self::below(&self.v[second], &self.v[second - 1]) {
+                    second -= 1;
+                }
+                self.v[hole] = self.v[second];
+                hole = second;
+            }
+            if l.is_multiple_of(2) && l >= 2 && second == (l - 2) / 2 {
+                second = 2 * (second + 1);
+                self.v[hole] = self.v[second - 1];
+                hole = second - 1;
+            }
+            self.gnu_push_heap(hole, 0, value);
+        }
+        self.v.pop();
+        top
     }
     fn top(&self) -> Option<&(f64, usize, usize)> {
         self.v.first()
@@ -293,6 +375,9 @@ impl BranchHeap {
         self.v.clear();
     }
     fn pop(&mut self) -> (f64, usize, usize) {
+        if self.stdlib == StdLib::LibStdCxx {
+            return self.gnu_pop();
+        }
         let len = self.v.len();
         let top = self.v[0];
         if len > 1 {
@@ -383,6 +468,150 @@ fn selection_sort<E>(v: &mut [E], first: usize, last: usize, less: &impl Fn(&E, 
             v.swap(f, m);
         }
         f += 1;
+    }
+}
+
+/// [`nth_element`] as `stdlib`'s.
+pub fn nth_element_in<E>(v: &mut [E], nth: usize, less: impl Fn(&E, &E) -> bool, stdlib: StdLib) {
+    match stdlib {
+        StdLib::LibCxx => nth_element(v, nth, less),
+        StdLib::LibStdCxx => gnu_nth_element(v, nth, &less),
+    }
+}
+
+/// libstdc++'s `nth_element` (GCC 13 `bits/stl_algo.h`): introselect with a depth limit of twice
+/// the floor log2 of the length. While more than 3 remain: median of (second, middle, last)
+/// moved to the front, an unguarded Hoare partition around it, keep the side holding `nth`; at
+/// the depth limit a heap selection instead. Then an insertion sort of what is left.
+fn gnu_nth_element<E>(v: &mut [E], nth: usize, less: &impl Fn(&E, &E) -> bool) {
+    let (mut first, mut last) = (0usize, v.len());
+    if first == last || nth == last {
+        return;
+    }
+    let mut depth_limit = 2 * (usize::BITS - 1 - (last - first).leading_zeros()) as usize;
+    while last - first > 3 {
+        if depth_limit == 0 {
+            gnu_heap_select(v, first, nth + 1, last, less);
+            v.swap(first, nth);
+            return;
+        }
+        depth_limit -= 1;
+        let cut = gnu_partition_pivot(v, first, last, less);
+        if cut <= nth {
+            first = cut;
+        } else {
+            last = cut;
+        }
+    }
+    gnu_insertion_sort(v, first, last, less);
+}
+
+/// `__unguarded_partition_pivot`: the median of `first + 1`, the middle and `last - 1` swapped
+/// to `first`, then the partition of `first + 1 .. last` around it; returns the cut.
+fn gnu_partition_pivot<E>(v: &mut [E], first: usize, last: usize, less: &impl Fn(&E, &E) -> bool) -> usize {
+    let mid = first + (last - first) / 2;
+    let (a, b, c) = (first + 1, mid, last - 1);
+    let m = if less(&v[a], &v[b]) {
+        if less(&v[b], &v[c]) {
+            b
+        } else if less(&v[a], &v[c]) {
+            c
+        } else {
+            a
+        }
+    } else if less(&v[a], &v[c]) {
+        a
+    } else if less(&v[b], &v[c]) {
+        c
+    } else {
+        b
+    };
+    v.swap(first, m);
+    let (mut lo, mut hi) = (first + 1, last);
+    loop {
+        while less(&v[lo], &v[first]) {
+            lo += 1;
+        }
+        hi -= 1;
+        while less(&v[first], &v[hi]) {
+            hi -= 1;
+        }
+        if lo >= hi {
+            return lo;
+        }
+        v.swap(lo, hi);
+        lo += 1;
+    }
+}
+
+/// `__insertion_sort`: an element below the first rotates to the front; any other sinks left
+/// past every element it is below.
+fn gnu_insertion_sort<E>(v: &mut [E], first: usize, last: usize, less: &impl Fn(&E, &E) -> bool) {
+    if first == last {
+        return;
+    }
+    for i in first + 1..last {
+        if less(&v[i], &v[first]) {
+            v[first..=i].rotate_right(1);
+        } else {
+            let mut j = i;
+            while less(&v[j], &v[j - 1]) {
+                v.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+    }
+}
+
+/// `__heap_select`: a max-heap of `first .. middle`, each later element below its top popped in.
+fn gnu_heap_select<E>(v: &mut [E], first: usize, middle: usize, last: usize, less: &impl Fn(&E, &E) -> bool) {
+    let len = middle - first;
+    if len >= 2 {
+        let mut parent = (len - 2) / 2;
+        loop {
+            gnu_adjust_heap(v, first, parent, len, less);
+            if parent == 0 {
+                break;
+            }
+            parent -= 1;
+        }
+    }
+    for i in middle..last {
+        if less(&v[i], &v[first]) {
+            // `__pop_heap(first, middle, i)`: the top goes to `i`, `i`'s value re-seats from the root.
+            v.swap(first, i);
+            gnu_adjust_heap(v, first, 0, len, less);
+        }
+    }
+}
+
+/// `__adjust_heap` on `v[first ..][.. len]`, the value at `hole` re-seated: the hole driven to the
+/// bottom through the larger child (the right one unless it is below the left), a lone left
+/// child at the end taken too, then the value sifted up no higher than where it started.
+fn gnu_adjust_heap<E>(v: &mut [E], first: usize, mut hole: usize, len: usize, less: &impl Fn(&E, &E) -> bool) {
+    let top = hole;
+    // The value travels as a swap chain: it sits at `hole` throughout.
+    let mut second = hole;
+    while second < len.saturating_sub(1) / 2 {
+        second = 2 * (second + 1);
+        if less(&v[first + second], &v[first + second - 1]) {
+            second -= 1;
+        }
+        v.swap(first + hole, first + second);
+        hole = second;
+    }
+    if len.is_multiple_of(2) && len >= 2 && second == (len - 2) / 2 {
+        second = 2 * (second + 1);
+        v.swap(first + hole, first + second - 1);
+        hole = second - 1;
+    }
+    while hole > top {
+        let parent = (hole - 1) / 2;
+        if !less(&v[first + parent], &v[first + hole]) {
+            break;
+        }
+        v.swap(first + hole, first + parent);
+        hole = parent;
     }
 }
 
@@ -1214,6 +1443,39 @@ mod tests {
     }
 
     // The partition property, on every position of shuffled, duplicated inputs.
+    // libstdc++'s `nth_element` permutations: what g++ 13.3 (-O3) left on LCG sequences of 1..300
+    // (key, index) pairs with few, some and many distinct keys, keyed on the key alone, hashed
+    // (FNV-1a over the indices) — and one printed in full.
+    #[test]
+    fn nth_element_matches_libstdcxx() {
+        let (mut s, mut h) = (7u32, 1_469_598_103_934_665_603u64);
+        let mut len = 1u32;
+        while len <= 300 {
+            for rep in 0..6u32 {
+                let range = [3, 17, 100_000][(rep % 3) as usize];
+                let mut v: Vec<(u32, u32)> = (0..len)
+                    .map(|i| {
+                        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                        ((s >> 8) % range, i)
+                    })
+                    .collect();
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                let nth = ((s >> 8) % len) as usize;
+                nth_element_in(&mut v, nth, |a, b| a.0 < b.0, StdLib::LibStdCxx);
+                if len == 23 && rep == 0 {
+                    let want = [22, 20, 19, 18, 4, 5, 6, 16, 15, 9, 10, 11, 13, 1, 3, 2, 0, 21, 12, 17, 7, 8, 14];
+                    assert_eq!(v.iter().map(|e| e.1).collect::<Vec<_>>(), want);
+                }
+                for e in &v {
+                    h ^= u64::from(e.1);
+                    h = h.wrapping_mul(1_099_511_628_211);
+                }
+            }
+            len += if len < 40 { 1 } else { 37 };
+        }
+        assert_eq!(h, 12_126_737_910_485_052_397);
+    }
+
     #[test]
     fn nth_element_partitions() {
         let base: Vec<i32> = (0..40).map(|i| (i * 7919) % 23).collect();
@@ -1374,6 +1636,38 @@ mod tests {
         let want = [
             2, 8, 12, 13, 29, 39, 30, 18, 38, 10, 27, 31, 37, 16, 14, 19, 21, 9, 6, 36, 25, 28, 20, 32, 33, 1, 0, 5,
             11, 26, 17, 23, 4, 34, 3, 24, 22, 7, 35, 15,
+        ];
+        assert_eq!(got, want);
+    }
+
+    // libstdc++'s heap moves on the same two sequences: `pop_heap` drives the hole through the
+    // RIGHT child on a tie, so equal keys come off differently. What `std::priority_queue` with
+    // this comparator printed under libstdc++ (g++ 13.3, -O3).
+    #[test]
+    fn branch_heap_pops_in_libstdcxx_order() {
+        let mut h = BranchHeap { v: Vec::new(), stdlib: StdLib::LibStdCxx };
+        for (i, d) in [3.0, 1.0, 1.0, 2.0, 1.0, 0.5].into_iter().enumerate() {
+            h.push((d, 0, i));
+        }
+        let mut got = vec![];
+        while h.top().is_some() {
+            got.push(h.pop().2);
+        }
+        assert_eq!(got, [5, 1, 2, 4, 3, 0]);
+        let (mut h, mut got, mut s) = (BranchHeap { v: Vec::new(), stdlib: StdLib::LibStdCxx }, vec![], 1u32);
+        for i in 0..40usize {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            h.push((f64::from((s >> 16) % 4), ((s >> 8) % 3) as usize, i));
+            if i % 7 == 6 {
+                got.push(h.pop().2);
+            }
+        }
+        while h.top().is_some() {
+            got.push(h.pop().2);
+        }
+        let want = [
+            2, 8, 12, 13, 29, 39, 30, 31, 27, 10, 18, 38, 16, 37, 14, 9, 19, 21, 33, 20, 36, 32, 28, 25, 6, 1, 0, 11,
+            5, 26, 34, 17, 23, 4, 22, 7, 24, 35, 15, 3,
         ];
         assert_eq!(got, want);
     }
@@ -1542,3 +1836,4 @@ mod tests {
         assert_eq!(out, want);
     }
 }
+
