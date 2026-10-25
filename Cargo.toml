@@ -13,6 +13,9 @@ keywords = ["eda", "routing", "asic", "pin-access"]
 categories = ["science", "command-line-utilities"]
 
 [features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = ["odb"]
 # The design database reader. OFF by default: the geometry and the access-point rules build and
 # test with no C++ dependency.
 odb = ["dep:vyges-opendb", "dep:vyges-events", "dep:vyges-loom"]

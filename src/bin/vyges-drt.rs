@@ -372,7 +372,7 @@ fn run(a: &Args) -> Outcome {
     }
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // Worker threads for the search-and-repair batches: `--threads N`, else `VYGES_THREADS` (or
     // the older `VYGES_DRT_THREADS`), else the suite's balanced default (`vyges_loom::threads`).
