@@ -561,17 +561,36 @@ pub mod read {
     /// VERTICAL, INCLUDEABUTTED, OFFCENTERLINE, LENGTH, EXTRACUT, REDUNDANTCUT, PARALLEL or
     /// CONCAVECORNERS, and with a CUTCLASS.
     pub fn cut_enclosure_kept(db: &Db, layer: &str, k: usize) -> bool {
+        cut_enclosure_skip(db, layer, k).is_none()
+    }
+
+    /// Why the reader skips a LEF58_ENCLOSURE rule: its warning code and the unsupported form,
+    /// tested in the reader's order (the first that holds is the one warned).
+    pub fn cut_enclosure_skip(db: &Db, layer: &str, k: usize) -> Option<(u16, &'static str)> {
         let ty = db.cutenclosurerule_get_type(layer, k);
-        !(ty == "EOL" && (db.cutenclosurerule_is_side_spacing_valid(layer, k) || db.cutenclosurerule_is_end_spacing_valid(layer, k)))
-            && ty != "HORZ_AND_VERT"
-            && !db.cutenclosurerule_is_include_abutted(layer, k)
-            && !db.cutenclosurerule_is_off_center_line(layer, k)
-            && !db.cutenclosurerule_is_length_valid(layer, k)
-            && !db.cutenclosurerule_is_extra_cut_valid(layer, k)
-            && !db.cutenclosurerule_is_redundant_cut_valid(layer, k)
-            && !db.cutenclosurerule_is_parallel_valid(layer, k)
-            && !db.cutenclosurerule_is_concave_corners_valid(layer, k)
-            && db.cutenclosurerule_is_cut_class_valid(layer, k)
+        if ty == "EOL" && (db.cutenclosurerule_is_side_spacing_valid(layer, k) || db.cutenclosurerule_is_end_spacing_valid(layer, k)) {
+            Some((340, "EOL SIDESPACING/ENDSPACING is not supported"))
+        } else if ty == "HORZ_AND_VERT" {
+            Some((341, "HORIZONTAL/VERTICAL is not supported"))
+        } else if db.cutenclosurerule_is_include_abutted(layer, k) {
+            Some((342, "INCLUDEABUTTED is not supported"))
+        } else if db.cutenclosurerule_is_off_center_line(layer, k) {
+            Some((343, "OFFCENTERLINE is not supported"))
+        } else if db.cutenclosurerule_is_length_valid(layer, k) {
+            Some((344, "LENGTH is not supported"))
+        } else if db.cutenclosurerule_is_extra_cut_valid(layer, k) {
+            Some((345, "EXTRACUT is not supported"))
+        } else if db.cutenclosurerule_is_redundant_cut_valid(layer, k) {
+            Some((346, "REDUNDANTCUT is not supported"))
+        } else if db.cutenclosurerule_is_parallel_valid(layer, k) {
+            Some((347, "PARALLEL is not supported"))
+        } else if db.cutenclosurerule_is_concave_corners_valid(layer, k) {
+            Some((348, "CONCAVECORNERS is not supported"))
+        } else if !db.cutenclosurerule_is_cut_class_valid(layer, k) {
+            Some((349, "with no CUTCLASS is not supported"))
+        } else {
+            None
+        }
     }
 
     pub fn cut_spacing_table(db: &Db, layer: &str, classes: &[CutClass]) -> Result<Option<CutSpacingTable>, &'static str> {

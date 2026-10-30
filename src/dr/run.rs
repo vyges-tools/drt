@@ -120,6 +120,8 @@ pub struct DesignIn {
     /// Nets the global router gave antenna jumpers (`dbNet::hasJumpers`, read as `addNet` does):
     /// routing them costs ten times more off their guides.
     pub jumpers: HashSet<usize>,
+    /// Database units per micron (the wire-length report's divisor).
+    pub dbu: i64,
 }
 
 /// The reader, then pin access.
@@ -135,8 +137,39 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     // The tech read generates the default vias (and warns), then the design read.
     let mut t = tech.clone();
     let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
-    crate::dr::log::reading(&t, tech.via_defs.len()).into_iter().for_each(&mut *log);
+    // setLayers' skipped LEF58_ENCLOSURE rules, cut layer by cut layer.
+    let skipped: Vec<(u16, String)> = t.layers.iter().filter(|l| l.kind == LayerKind::Cut)
+        .flat_map(|l| (0..db.num_layer_get_tech_layer_cut_enclosure_rules(&l.name))
+            .filter_map(|k| crate::tech::read::cut_enclosure_skip(db, &l.name, k))
+            .map(|(id, what)| (id, format!("LEF58_ENCLOSURE {what}. Skipping for layer {}", l.name)))
+            .collect::<Vec<_>>())
+        .collect();
+    // The block's vias join the technology's (`setVias`), skipping one on a layer the router
+    // does not hold or on the masterslice.
+    let held = |name: &str| t.layers.iter().any(|l| l.name == name && l.kind != LayerKind::Placeholder);
+    let block_vias = db.block_get_vias().iter().filter(|v| held(&db.via_get_top_layer(v)) && held(&db.via_get_bottom_layer(v))).count();
+    let stats = crate::dr::log::TechStats {
+        dbu: db.tech_get_db_units_per_micron(),
+        vias: t.via_defs.len() + block_vias,
+        masters: db.num_masters().unwrap_or(0),
+        via_rule_generates: db.tech_get_via_generate_rules().len(),
+    };
+    crate::dr::log::reading(&t, tech.via_defs.len(), &skipped, stats).into_iter().for_each(&mut *log);
     let (masters, insts, ports) = crate::pa::db::read_design(db, tech, cfg.top_routing_layer)?;
+    {
+        let nets = db.net_names();
+        let snets = nets.iter().filter(|n| db.net_is_special(n)).count();
+        let patterns: usize = t.layers.iter().map(|l| db.track_patterns(&l.name).map_or(0, |(x, y)| x.len() + y.len())).sum();
+        crate::dr::log::design_stats(&crate::dr::log::DesignStats {
+            name: db.block_get_name(),
+            die: (db.block_get_die_area_x_min(), db.block_get_die_area_y_min(), db.block_get_die_area_x_max(), db.block_get_die_area_y_max()),
+            track_patterns: patterns,
+            components: db.num_insts(),
+            terminals: db.num_bterms(),
+            snets,
+            nets: nets.len() - snets,
+        }).into_iter().for_each(&mut *log);
+    }
     if let Some(v) = opts.via_access_layer {
         cfg.via_access_layer = v;
     }
@@ -179,7 +212,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
     let jumpers: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| db.net_has_jumpers(&n.name)).map(|(i, _)| i).collect();
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers })
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()) })
 }
 
 /// The non-default rules, the technology's then the block's (a name already read is skipped):
@@ -291,7 +324,8 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
             raw.entry(net.clone()).or_default().push((l, r));
         }
     }
-    crate::dr::log::guides_read(order.iter().map(|n| raw[n].len()).sum()).into_iter().for_each(&mut *log);
+    let guide_count: usize = order.iter().map(|n| raw[n].len()).sum();
+    crate::dr::log::guides_read(guide_count).into_iter().for_each(&mut *log);
     if !order.is_empty() {
         log(Line::Info(169, "Post process guides.".into()));
     }
@@ -302,6 +336,8 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
         build_gcell_patterns(tech, d.die, &all).ok_or("no gcell grid from the guides")?
     };
     crate::dr::log::gcell_grid(grid.x, grid.y).into_iter().for_each(&mut *log);
+    // initOrigGuide: every guide read enters the region query, counted as it goes.
+    crate::dr::log::orig_guides(guide_count).into_iter().for_each(&mut *log);
     crate::dr::log::layers_complete(tech, 28, "").into_iter().for_each(&mut *log);
     let gcfg = GuideConfig { bottom_routing_layer: d.bottom_layer, top_routing_layer: top, via_access_layer: d.cfg.via_access_layer, allow_pin_feedthrough: tech.allow_pin_feedthrough() };
     let inst_index: HashMap<&str, usize> = d.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
@@ -525,11 +561,19 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
         flow_by_iteration.push(flow.current.name());
         markers_by_iteration.push(routes.markers().count());
         crate::dr::log::iteration(iter, flow.current.name(), markers_by_iteration[iter]).into_iter().for_each(&mut *log);
+        // reportIterationViolations' table, then `end()`'s report on the routes as they stand.
+        if flow.current.name() != "skip" {
+            crate::dr::log::violation_table(&p.tech, routes.markers().map(|m| (m.rule, m.layer))).into_iter().for_each(&mut *log);
+            crate::dr::log::route_stats(&p.tech, d.dbu, routes.shapes.iter().flatten().map(|s| &s.fig)).into_iter().for_each(&mut *log);
+        }
         if markers_by_iteration[iter] == 0 {
             break;
         }
     }
+    // `end(true)` writes the DRC report first; no report file is configured here, so it warns.
+    log(Line::Warn(290, "Warning: no DRC report specified, skipped writing DRC report".into()));
     log(Line::Info(198, "Complete detail routing.".into()));
+    crate::dr::log::route_stats(&p.tech, d.dbu, routes.shapes.iter().flatten().map(|s| &s.fig)).into_iter().for_each(&mut *log);
     Ok((routes, markers_by_iteration, flow_by_iteration))
 }
 
