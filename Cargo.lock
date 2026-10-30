@@ -482,6 +482,7 @@ name = "vyges-opendb"
 version = "0.1.49"
 dependencies = [
  "cxx",
+ "miniz_oxide",
  "serde",
  "serde_json",
  "vyges-events",
