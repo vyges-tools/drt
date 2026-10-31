@@ -96,24 +96,9 @@ const DESCRIBE: &str = r#"{
   "invocation": {
     "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
     "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" }, { "arg": "threads", "flag": "--threads" } ],
-    "emits_json": true
+    "emits_json": true,
+    "findings_exit_codes": [1]
   },
-  "commands": [
-    {
-      "name": "detailed_route",
-      "summary": "route the design on its route guides and write the routes (a .def or .odb out)",
-      "args_template": ["detailed_route", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "via_access_layer", "flag": "--via-access-layer" }, { "arg": "end_iteration", "flag": "--end-iteration" }, { "arg": "threads", "flag": "--threads" } ],
-      "assertion": { "id": "routed-clean", "field": "status", "pass_when": { "eq": "written" } }
-    },
-    {
-      "name": "pin_access",
-      "summary": "compute every pin's access points and write them into the database",
-      "args_template": ["pin_access", "--db", "{db}", "--out", "{out}"],
-      "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" }, { "arg": "threads", "flag": "--threads" } ],
-      "assertion": { "id": "pin-access-written", "field": "status", "pass_when": { "eq": "written" } }
-    }
-  ],
   "inputs": {
     "type": "object",
     "required": ["db", "out"],
@@ -122,7 +107,7 @@ const DESCRIBE: &str = r#"{
       "out": { "type": "string", "description": "where to write the result: detailed_route writes a DEF if the name ends in .def, else a database; pin_access writes a database" },
       "via_access_layer": { "type": "string", "description": "detailed_route: the via-access layer (default the second routing layer)" },
       "end_iteration": { "type": "integer", "description": "detailed_route: stop after this search-and-repair iteration (counted from 0)" },
-      "max_routing_layer": { "type": "string", "description": "pin_access: the block's maximum routing layer, set first" },
+      "threads": { "type": "integer", "description": "bound the worker threads; leave unset (the results are identical at any count)" },
       "report": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
     }
   },
@@ -134,7 +119,30 @@ const DESCRIBE: &str = r#"{
     "field": "status",
     "pass_when": { "eq": "written" }
   },
-  "exit_codes": { "0": "written", "1": "markers (detailed_route)", "2": "vacuous or error", "3": "refused" }
+  "exit_codes": { "0": "written", "1": "markers (detailed_route)", "2": "vacuous or error", "3": "refused" },
+  "tools": [
+    {
+      "name": "drt.pin_access",
+      "summary": "compute every pin's access points and write them into the database",
+      "invocation": {
+        "args_template": ["pin_access", "--db", "{db}", "--out", "{out}"],
+        "optional": [ { "arg": "report", "flag": "-o" }, { "arg": "max_routing_layer", "flag": "--max-routing-layer" }, { "arg": "threads", "flag": "--threads" } ],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["db", "out"],
+        "properties": {
+          "db": { "type": "string", "description": "the placed design database to read" },
+          "out": { "type": "string", "description": "the database to write, access points included" },
+          "max_routing_layer": { "type": "string", "description": "the block's maximum routing layer, set first" },
+          "threads": { "type": "integer", "description": "bound the worker threads; leave unset" },
+          "report": { "type": "string", "description": "write the JSON report to FILE instead of stdout" }
+        }
+      },
+      "assertion": { "id": "pin-access-written", "field": "status", "pass_when": { "eq": "written" } }
+    }
+  ]
 }"#;
 
 /// The `vyges-events` causal trail: every event goes to STDERR, the report to stdout (or `-o`), so
@@ -438,4 +446,43 @@ pub fn main() -> ExitCode {
         None => print!("{report}"),
     }
     ExitCode::from(o.code)
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::describe;
+
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(&describe()).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
+    }
 }

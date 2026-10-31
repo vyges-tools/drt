@@ -51,7 +51,7 @@ fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
 fn every_assertion_is_a_pass_when_predicate() {
     let d = descriptor();
     let mut all = vec![d["assertion"].clone()];
-    all.extend(d["commands"].as_array().expect("commands").iter().map(|c| c["assertion"].clone()));
+    all.extend(d["tools"].as_array().expect("tools").iter().map(|c| c["assertion"].clone()));
     for a in all {
         assert_eq!(a["field"], "status", "{a}");
         assert_eq!(a["pass_when"]["eq"], "written", "{a}");
@@ -60,15 +60,16 @@ fn every_assertion_is_a_pass_when_predicate() {
 }
 
 /// Both commands are described, and the primary invocation is `detailed_route` — the one a caller
-/// that reads only `invocation` runs. Each command's template names the command itself.
+/// that reads only `invocation` runs. `pin_access` is a `tools[]` entry (`drt.pin_access`), the
+/// list `vyges mcp` registers, and its template names the command itself.
 #[test]
 fn both_commands_are_described_and_route_is_primary() {
     let d = descriptor();
     assert_eq!(d["invocation"]["args_template"][0], "detailed_route");
-    let names: Vec<&str> = d["commands"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["detailed_route", "pin_access"]);
-    for c in d["commands"].as_array().unwrap() {
-        assert_eq!(c["args_template"][0], c["name"], "{c}");
+    let names: Vec<&str> = d["tools"].as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["drt.pin_access"]);
+    for c in d["tools"].as_array().unwrap() {
+        assert_eq!(c["invocation"]["args_template"][0], c["name"].as_str().unwrap().trim_start_matches("drt."), "{c}");
     }
     assert!(["discovered", "structured", "workflow-validated"].contains(&d["maturity"].as_str().unwrap()));
 }
