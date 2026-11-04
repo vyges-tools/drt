@@ -384,8 +384,10 @@ impl BooleanOp {
     }
 }
 
-/// `applyBooleanOr`: the OR of vertex data sorted by `(y, x, count)`, as vertex data again.
-fn apply_boolean_or(input: &mut Vec<(i32, (i32, i32))>) {
+/// `applyBooleanOr`: the OR of vertex data sorted by `(y, x, count)`, as vertex data again — the
+/// scan is the same in either orientation (`(major, (minor, count))`), so a VERTICAL set passes its
+/// `(x, (y, count))` data (psm's Manhattan `polygon_45_set_data::clean`).
+pub fn apply_boolean_or(input: &mut Vec<(i32, (i32, i32))>) {
     let mut op = BooleanOp { scan: BTreeMap::new(), next: None };
     let mut output: Vec<(i32, (i32, i32))> = Vec::with_capacity(input.len());
     let (mut prev_pos, mut prev_y, mut count) = (i32::MAX, i32::MAX, 0i32);
