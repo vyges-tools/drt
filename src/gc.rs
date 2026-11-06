@@ -113,6 +113,10 @@ pub enum Rule {
     /// A cut whose metal above or below overhangs it less than any LEF58 enclosure rule for the
     /// metal's width allows (`checkLef58Enclosure_main`).
     Lef58Enclosure,
+    /// A maximal rectangle of one owner's polygon with an edge off the manufacturing grid, where
+    /// the polygon holds the owner's route shapes (`checkMetalShape_offGrid`; every routing layer
+    /// carries the rule, `frOffGridConstraint`).
+    OffGrid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1099,7 +1103,8 @@ impl<'a> Worker<'a> {
     // ---- metal shapes ----
 
     /// Per routing layer (bottom up), per owner checked from, per pin: minimum width, minimum area,
-    /// then rect-only — `checkMetalShape_main`'s order, less the checks not modelled.
+    /// minimum step, rect-only, off-grid, minimum enclosed area — `checkMetalShape_main`'s order,
+    /// less the checks not modelled.
     fn check_metal_shape(&mut self) {
         for layer in 0..self.tech.layers.len() {
             if self.tech.layers[layer].kind != LayerKind::Routing {
@@ -1129,7 +1134,30 @@ impl<'a> Worker<'a> {
         self.min_area(layer, net, pin);
         self.min_step(layer, net, k);
         self.rect_only(layer, net, pin);
+        self.off_grid(layer, net, pin);
         self.min_enclosed_area(layer, net, pin);
+    }
+
+    /// `checkMetalShape_offGrid`: per maximal rectangle of the pin, in its order, one with any edge
+    /// off the manufacturing grid (signed remainder, as `%` in the reference) is a marker on the
+    /// rectangle itself — unless it holds none of the owner's ROUTE shapes (`net->getPolygons(layer,
+    /// false) & maxRect` empty: fixed metal off the grid is not the router's to fix). Victim and
+    /// aggressor are the owner on that rectangle, not fixed.
+    fn off_grid(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        let grid = self.tech.manufacturing_grid;
+        if grid <= 0 {
+            // No grid to be off (the reference would divide by zero).
+            return;
+        }
+        for r in pin.max_rectangles() {
+            if r.xl % grid == 0 && r.xh % grid == 0 && r.yl % grid == 0 && r.yh % grid == 0 {
+                continue;
+            }
+            if !self.nets[net].route_slices[layer].iter().any(|s| overlap(s, &r).is_some()) {
+                continue;
+            }
+            self.add_marker(Rule::OffGrid, layer, r, net, net);
+        }
     }
 
     /// `checkMetalShape_minEnclosedArea`: per hole of the polygon, per MINENCLOSEDAREA rule, a hole
@@ -2545,6 +2573,56 @@ pub(crate) mod tests {
         assert!(boxes(&markers_min_area(&fixed, 100_000, None, false), Rule::MinArea).is_empty());
     }
 
+    /// Rule (`checkMetalShape_offGrid`, every routing layer): a maximal rectangle of one owner's
+    /// polygon with any edge off the manufacturing grid (5 here) is a marker on that rectangle,
+    /// victim and aggressor the owner, not fixed — unless the rectangle holds none of the owner's
+    /// ROUTE shapes by area (`net->getPolygons(layer, false) & maxRect` empty): fixed metal off the
+    /// grid, or a route that only touches it, is not the router's to fix.
+    #[test]
+    fn off_grid_marks_a_maximal_rectangle_off_the_grid_that_holds_a_route() {
+        let run = |shapes: &[(Owner, usize, Rect, bool)]| {
+            let t = tech();
+            let mut w = Worker::new(&t);
+            for (o, l, r, f) in shapes {
+                w.add(o, *l, *r, *f);
+            }
+            w.init();
+            w.run().to_vec()
+        };
+        let pin = Rect::new(0, 0, 1003, 140);
+        // A route off the grid; a fixed pin off the grid with a route on the grid inside it.
+        assert_eq!(boxes(&run(&[(net("a"), 4, pin, false)]), Rule::OffGrid), vec![pin]);
+        let m = run(&[(net("a"), 4, pin, true), (net("a"), 4, Rect::new(0, 0, 500, 140), false)]);
+        assert_eq!(boxes(&m, Rule::OffGrid), vec![pin]);
+        let v = m.iter().find(|m| m.rule == Rule::OffGrid).and_then(|m| m.victim.clone()).expect("the marker has its victim");
+        assert_eq!((v.2, v.3), (pin, false));
+        // Fixed metal alone, and a route that only touches the off-grid rectangle: no marker.
+        assert!(boxes(&run(&[(net("a"), 4, pin, true)]), Rule::OffGrid).is_empty());
+        let touching = run(&[(net("a"), 4, Rect::new(0, 0, 1003, 400), true), (net("a"), 4, Rect::new(1003, 0, 1500, 140), false)]);
+        assert!(boxes(&touching, Rule::OffGrid).is_empty());
+        // On the grid: none.
+        assert!(boxes(&run(&[(net("a"), 4, Rect::new(0, 0, 1000, 140), false)]), Rule::OffGrid).is_empty());
+    }
+
+    /// Rule (`checkMetalShape_main`'s order per pin): rect-only, THEN off-grid, THEN minimum
+    /// enclosed area — the marker list keeps that order. A routed ring off the grid (a 3-unit
+    /// step on a 5-unit grid) on a rect-only layer with a hole rule gives all three.
+    #[test]
+    fn off_grid_markers_come_after_rect_only_and_before_min_hole() {
+        let mut t = tech();
+        t.layers[4].rect_only = true;
+        t.layers[4].min_enclosed_areas = vec![50_000];
+        let mut w = Worker::new(&t);
+        for r in [Rect::new(0, 0, 603, 200), Rect::new(0, 400, 603, 600), Rect::new(0, 200, 200, 400), Rect::new(403, 200, 603, 400)] {
+            w.add(&net("a"), 4, r, false);
+        }
+        w.init();
+        let rules: Vec<Rule> = w.run().iter().map(|m| m.rule).filter(|r| matches!(r, Rule::RectOnly | Rule::OffGrid | Rule::MinEnclosedArea)).collect();
+        let first = |x: Rule| rules.iter().position(|&r| r == x).expect("each of the three rules fires");
+        let last = |x: Rule| rules.iter().rposition(|&r| r == x).expect("each of the three rules fires");
+        assert!(last(Rule::RectOnly) < first(Rule::OffGrid) && last(Rule::OffGrid) < first(Rule::MinEnclosedArea), "{rules:?}");
+    }
+
     /// Rule (`checkMetalShape_minEnclosedArea`): a hole smaller than a MINENCLOSEDAREA rule is a
     /// marker on the hole's extents — here a ring of 200-wide trial wires round a 200 × 200 hole
     /// (40,000 < 50,000). None when the ring is all fixed shapes (no route shape in the polygon),
@@ -2797,11 +2875,12 @@ pub(crate) mod tests {
     }
 
     /// One owner's overlap whose diagonal is EXACTLY the minimum width (84 x 112 → 140) is
-    /// sufficient.
+    /// sufficient. (The route's corner is off this tech's 5-unit grid, so only its off-grid markers
+    /// stand: no other rule.)
     #[test]
     fn a_diagonal_of_exactly_min_width_is_sufficient() {
         let m = markers(&[(net("a"), 4, Rect::new(0, 0, 500, 500), true), (net("a"), 4, Rect::new(416, 388, 1000, 1000), false)]);
-        assert!(m.is_empty(), "{m:?}");
+        assert!(m.iter().all(|m| m.rule == Rule::OffGrid), "{m:?}");
     }
 
     /// A thin overlap is not judged when either rectangle is itself narrower than the minimum
