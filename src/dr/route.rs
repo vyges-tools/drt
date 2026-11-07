@@ -335,19 +335,23 @@ pub fn init_maze_cost_guide_helper(w: &CostWorker<'_, '_>, st: &mut MazeState, g
 /// time. The searches, in order.
 #[allow(clippy::too_many_arguments)]
 pub fn route_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>) -> (Vec<Search>, Vec<DrFig>) {
-    reroute_net(w, st, mcfg, net, ndr, cx, 0, &[])
+    reroute_net(w, st, mcfg, net, ndr, cx, 0, &[], &[])
 }
 
 /// Route a net again (or the first time: `reroutes` 0, nothing written): lift what it wrote
 /// (route cost, cut spacing included), its end-of-line cost from its pins and that metal, and —
 /// the first time only — its via reservation; then as [`route_net`].
+///
+/// `siblings`: the metal of the worker's OTHER nets of the same design net. The end-of-line cost
+/// is the check net's (`modEolCosts_poly(gcNet)`), and the check holds one net per design net:
+/// its pins, and every worker net of it with what each wrote.
 #[allow(clippy::too_many_arguments)]
-pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>, reroutes: u32, old: &[DrFig]) -> (Vec<Search>, Vec<DrFig>) {
+pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCfg<'_>, net: &DrNet, ndr: Option<Ndr<'_>>, cx: &NetCtx<'_>, reroutes: u32, old: &[DrFig], siblings: &[(usize, Rect)]) -> (Vec<Search>, Vec<DrFig>) {
     for f in old {
         w.mod_path_cost(f, ModCost::SubRoute, false, true, ndr);
     }
     let tech = w.cx.tech;
-    let metal: Vec<(usize, Rect)> = net.ext.iter().chain(old).flat_map(|f| f.metal(tech)).collect();
+    let metal: Vec<(usize, Rect)> = net.ext.iter().chain(old).flat_map(|f| f.metal(tech)).chain(siblings.iter().copied()).collect();
     crate::dr::cost::mod_eol_costs_poly_with(w, net.net, cx.ext_box, &metal, ModCost::SubRoute);
     if reroutes == 0 && mcfg.ripup_all {
         init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
@@ -445,10 +449,11 @@ pub fn maze_net_end(w: &mut CostWorker<'_, '_>, st: &mut MazeState, net: &DrNet,
     }
 }
 
-/// After the net's check: its end-of-line route costs from its pins and what it wrote, merged.
-pub fn after_check(w: &mut CostWorker<'_, '_>, net: &DrNet, figs: &[DrFig], ext_box: &Rect) {
+/// After the net's check: its end-of-line route costs from its pins and what it wrote, merged
+/// with the same design net's other worker nets (`siblings`, as [`reroute_net`]).
+pub fn after_check(w: &mut CostWorker<'_, '_>, net: &DrNet, figs: &[DrFig], ext_box: &Rect, siblings: &[(usize, Rect)]) {
     let tech = w.cx.tech;
-    let metal: Vec<(usize, Rect)> = net.ext.iter().chain(figs).flat_map(|f| f.metal(tech)).collect();
+    let metal: Vec<(usize, Rect)> = net.ext.iter().chain(figs).flat_map(|f| f.metal(tech)).chain(siblings.iter().copied()).collect();
     crate::dr::cost::mod_eol_costs_poly_with(w, net.net, ext_box, &metal, ModCost::AddRoute);
 }
 

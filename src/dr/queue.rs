@@ -312,7 +312,8 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let ndr = (q.ndr)(i);
                 let old = std::mem::take(&mut state[i].figs);
                 rq.remove_net(i);
-                let (searches, figs) = reroute_net(w, st, q.mcfg, &nets[i], ndr, &cx, state[i].reroutes, &old);
+                let siblings = sibling_metal(q.mcfg.tech, &state, &|j| (q.name)(j), i);
+                let (searches, figs) = reroute_net(w, st, q.mcfg, &nets[i], ndr, &cx, state[i].reroutes, &old, &siblings);
                 rq.add_net(q.mcfg.tech, i, &figs);
                 maze_net_end(w, st, &nets[i], &cx);
                 crate::dr::route::edge_watch(w, "after-maze-net-end");
@@ -332,7 +333,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 // `modEolCosts_poly` reads the check's net, which already holds the new patches.
                 let mut with_patches = figs.clone();
                 with_patches.extend(pw.iter().map(|(_, p)| DrFig::Patch { layer: p.layer, origin: p.origin, offset: p.offset }));
-                after_check(w, &nets[i], &with_patches, cx.ext_box);
+                after_check(w, &nets[i], &with_patches, cx.ext_box, &siblings);
                 crate::dr::route::edge_watch(w, "after-check-eol");
                 // The patches go to the net at the point of its paths nearest each.
                 let points: Vec<(i32, i32)> = searches.iter().flat_map(|s| s.path.iter()).map(|m| (w.g.xs[m.0 as usize], w.g.ys[m.1 as usize])).collect();
@@ -549,6 +550,24 @@ fn write_gc_patches(q: &QueueCtx<'_>, state: &mut [NetState], rq: &mut RouteRq, 
 fn check(gw: &mut Worker<'_>, target: &Owner) -> Vec<Marker> {
     gw.target = Some(target.clone());
     gw.run().to_vec()
+}
+
+/// The metal of the worker's other nets of net `i`'s design net (same name), in worker order:
+/// each one's boundary shapes, then what it wrote. Upstream, the end-of-line cost of a routed net
+/// is its check net's (one per design net: `modEolCosts_poly(gcNet)`), so a sibling's wire that
+/// meets the pin closes the pin's end; ours merged only the routed net's own shapes.
+fn sibling_metal(tech: &crate::tech::Tech, state: &[NetState], name: &dyn Fn(usize) -> String, i: usize) -> Vec<(usize, Rect)> {
+    let me = name(i);
+    let mut out = Vec::new();
+    for (j, s) in state.iter().enumerate() {
+        if j == i || name(j) != me {
+            continue;
+        }
+        for f in s.ext.iter().chain(&s.figs) {
+            out.extend(f.metal(tech));
+        }
+    }
+    out
 }
 
 /// An owner's route shapes as the check holds them: every worker net of it, its committed
@@ -934,6 +953,23 @@ mod tests {
         assert_eq!(decay(10, 0.95), 9);
         assert_eq!(decay(1, 0.95), 0);
         assert_eq!(decay(255, 0.95), 242);
+    }
+
+    // Rule (`modEolCosts_poly(gcNet)`): a routed net's end-of-line cost is its CHECK net's, one
+    // per design net — its pins, and every worker net of that design net with what each wrote and
+    // its boundary shapes. So a net's end-of-line metal takes in the same name's other worker nets
+    // (boundary shapes, then figures, in worker order), and nothing of its own or of other names.
+    #[test]
+    fn the_end_of_line_metal_takes_the_other_worker_nets_of_the_same_design_net() {
+        let tech = crate::tech::Tech { layers: vec![Default::default(); 3], manufacturing_grid: 5, via_defs: vec![], obs_own_width: false };
+        let patch = |x: i32| DrFig::Patch { layer: 2, origin: (x, 0), offset: Rect::new(0, 0, 10, 10) };
+        let st = |ext: Vec<DrFig>, figs: Vec<DrFig>| NetState { reroutes: 0, ripup_avoids: 0, figs, ext };
+        let state = vec![st(vec![patch(0)], vec![patch(10)]), st(vec![patch(100)], vec![patch(110)]), st(vec![patch(200)], vec![patch(210)]), st(vec![], vec![patch(300)])];
+        let names = ["in_4", "in_3", "in_4", "in_4"];
+        let name = |j: usize| names[j].to_string();
+        let got: Vec<i32> = sibling_metal(&tech, &state, &name, 0).into_iter().map(|(_, r)| r.xl).collect();
+        assert_eq!(got, [200, 210, 300]);
+        assert!(sibling_metal(&tech, &state, &name, 1).is_empty());
     }
 
     // Rule: a marker adds 10, saturating at 255.

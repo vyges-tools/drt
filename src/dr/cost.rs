@@ -1430,6 +1430,35 @@ mod tests {
         assert!(g.nodes.iter().all(|n| n.route_planar == 0 && n.route_via == 0));
     }
 
+    // Rule (`modEolCosts_poly(gcNet)`): the end-of-line edges are those of the check net's merged
+    // polygons — its pins together with the metal of every worker net of it. A pin's short end
+    // costs route beyond it alone; once a wire of the same design net (another worker net's)
+    // runs along that end, the merged edge is long and the end costs nothing.
+    #[test]
+    fn a_wire_of_the_same_design_net_closes_a_pin_end() {
+        let t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
+        let pin = Rect { xl: 400, yl: 400, xh: 500, yh: 1400 };
+        let fixed: Vec<PackedRTree<Fixed>> = (0..5).map(|l| PackedRTree::new(if l == 2 { vec![(pin, Fixed::InstTerm { net: Some(0), inst: 0, term: 0 })] } else { Vec::new() })).collect();
+        let eol = [EolTable { width: 150, space: 150, within: 0 }, EolTable::default()];
+        let below_the_pin = |routes: &[(usize, Rect)]| {
+            let mut g = grid();
+            with_defaults(&t, &mut g, &eol, &fixed, |w| mod_eol_costs_poly_with(w, 0, &Rect { xl: 0, yl: 0, xh: 900, yh: 900 }, routes, ModCost::AddRoute));
+            // The columns around the pin (a box off the grid clamps to its edge columns).
+            let mut n = 0;
+            for x in 2..8 {
+                for y in 0..4 {
+                    for d in [Dir6::E, Dir6::N, Dir6::U] {
+                        n += g.route_cost_adj(x, y, 0, d);
+                    }
+                }
+            }
+            n
+        };
+        assert!(below_the_pin(&[]) > 0, "the pin's 100-wide bottom end alone is an end of line");
+        // The wire runs past both sides of the grid, so its own ends cost nothing near the pin.
+        assert_eq!(below_the_pin(&[(2, Rect { xl: -1000, yl: 400, xh: 2000, yh: 500 })]), 0);
+    }
+
     // Rule: a cost is an 8-bit count — adding saturates at 255, subtracting floors at 0.
     #[test]
     fn costs_saturate_and_floor() {
