@@ -352,15 +352,82 @@ pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCf
     if reroutes == 0 && mcfg.ripup_all {
         init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
     }
+    route_cost_list(w, net.id, reroutes);
     maze_net_init(w, st, net, cx);
+    edge_watch(w, "after-maze-net-init");
     let (searches, figs, ok) = route_net_search(w, st, mcfg, net, cx);
+    edge_watch(w, "after-search");
     if ok {
         // What the net wrote, costed for the nets after it (no end of line or cut spacing here).
         for f in &figs {
             w.mod_path_cost(f, ModCost::AddRoute, false, false, ndr);
         }
     }
+    edge_watch(w, "after-add-route");
     (searches, figs)
+}
+
+/// A DIAGNOSTIC, inert unless `VYGD_EDGEWATCH=z,x,y,d`: that one edge's costs, to stderr as
+/// `ew|<tag>|blocked|fixed|route|marker` (d: 0 east, 1 north, 2 up).
+pub fn edge_watch(w: &CostWorker<'_, '_>, tag: &str) {
+    static WATCH: std::sync::OnceLock<Option<(usize, usize, usize, usize)>> = std::sync::OnceLock::new();
+    let Some((z, x, y, d)) = *WATCH.get_or_init(|| {
+        let v: Vec<usize> = std::env::var("VYGD_EDGEWATCH").ok()?.split(',').filter_map(|s| s.parse().ok()).collect();
+        (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
+    }) else {
+        return;
+    };
+    let g = &w.g;
+    let dir = [Dir6::E, Dir6::N, Dir6::U][d];
+    eprintln!("ew|{tag}|{}|{}|{}|{}", u32::from(g.is_blocked(x, y, z, dir)), g.fixed_cost_adj(x, y, z, dir), g.route_cost_adj(x, y, z, dir), g.marker_cost_adj(x, y, z, dir));
+}
+
+/// A DIAGNOSTIC, inert unless `VYGD_ROUTECL=<worker net id>,<reroutes>[,<nth match>]`: before
+/// that net's route (its old route ripped up, `mazeNetInit` not yet run, where the reference's
+/// trace writes its `route` record), every edge with a block or a cost, to stderr as
+/// `rcl|z|x|y|d|blocked|fixed|route|marker` (d: 0 east, 1 north, 2 up). With an nth match (from
+/// 1; 0 for every match), only that match is listed, and its searches print their wavefront pops
+/// (maze::POP_TRACE).
+fn route_cost_list(w: &CostWorker<'_, '_>, net_id: usize, reroutes: u32) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WANT: std::sync::OnceLock<Option<(String, Option<usize>)>> = std::sync::OnceLock::new();
+    static SEEN: AtomicUsize = AtomicUsize::new(0);
+    crate::dr::maze::POP_TRACE.store(false, Ordering::Relaxed);
+    edge_watch(w, &format!("{net_id}|{reroutes}"));
+    let Some((want, nth)) = WANT.get_or_init(|| {
+        let v = std::env::var("VYGD_ROUTECL").ok()?;
+        let f: Vec<&str> = v.split(',').collect();
+        Some((f[..f.len().min(2)].join(","), f.get(2).and_then(|n| n.parse().ok())))
+    }) else {
+        return;
+    };
+    if *want != format!("{net_id},{reroutes}") {
+        return;
+    }
+    let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    // nth 0: every match, each with its pops.
+    if nth.is_some_and(|n| n != 0 && n != seen) {
+        return;
+    }
+    crate::dr::maze::POP_TRACE.store(nth.is_some(), Ordering::Relaxed);
+    let g = &w.g;
+    eprintln!("rcl-begin|{net_id}|{reroutes}|{seen}");
+    for z in 0..g.zs.len() {
+        for x in 0..g.xs.len() {
+            for y in 0..g.ys.len() {
+                let nd = g.nodes[g.idx(x, y, z)];
+                for (d, (has, dir)) in [(nd.east, Dir6::E), (nd.north, Dir6::N), (nd.up, Dir6::U)].into_iter().enumerate() {
+                    if !has {
+                        continue;
+                    }
+                    let (b, f, r, m) = (u32::from(g.is_blocked(x, y, z, dir)), g.fixed_cost_adj(x, y, z, dir), g.route_cost_adj(x, y, z, dir), g.marker_cost_adj(x, y, z, dir));
+                    if b + f + r + m > 0 {
+                        eprintln!("rcl|{z}|{x}|{y}|{d}|{b}|{f}|{r}|{m}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// A net's end: its pins' costs back (vias kept), its guides off, its access points costed for

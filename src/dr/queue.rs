@@ -315,6 +315,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let (searches, figs) = reroute_net(w, st, q.mcfg, &nets[i], ndr, &cx, state[i].reroutes, &old);
                 rq.add_net(q.mcfg.tech, i, &figs);
                 maze_net_end(w, st, &nets[i], &cx);
+                crate::dr::route::edge_watch(w, "after-maze-net-end");
                 gc_version += 1;
                 let reroutes = state[i].reroutes;
                 state[i].reroutes += 1;
@@ -332,9 +333,11 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let mut with_patches = figs.clone();
                 with_patches.extend(pw.iter().map(|(_, p)| DrFig::Patch { layer: p.layer, origin: p.origin, offset: p.offset }));
                 after_check(w, &nets[i], &with_patches, cx.ext_box);
+                crate::dr::route::edge_watch(w, "after-check-eol");
                 // The patches go to the net at the point of its paths nearest each.
                 let points: Vec<(i32, i32)> = searches.iter().flat_map(|s| s.path.iter()).map(|m| (w.g.xs[m.0 as usize], w.g.ys[m.1 as usize])).collect();
                 let written = write_gc_patches(q, &mut state, &mut rq, &pw, &points);
+                crate::dr::route::edge_watch(w, "after-write-patches");
                 checked.insert(Block::Owner(owner.clone()), (gc_version, m.len()));
                 last_markers = m.len();
                 events.push(Event::Route { net: i, reroutes, searches, figs, markers: m.clone(), patches: pw.iter().map(|(_, p)| p.clone()).collect() });
@@ -372,6 +375,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
         for mk in &markers {
             add_marker_cost(w, q, &state, &rq, mk, &mut planar_hist, &mut via_hist);
         }
+        crate::dr::route::edge_watch(w, "after-marker-cost");
     }
     gw.target = None;
     let (m, pw) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None);
