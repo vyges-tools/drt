@@ -426,6 +426,21 @@ pub struct TaOut {
     pub term_fixed: Vec<Fixed>,
 }
 
+/// A net's terminals by the names its gr pins would carry: its block pins (`PIN/<name>`, block
+/// order), then its instance terminals (`<inst>/<term>`, instance then master order).
+pub fn net_terminals(insts: &[DesignInst], masters: &HashMap<String, Master>, ports: &[DesignPort], net: &str) -> Vec<(String, Option<(i32, i32)>)> {
+    let mut out: Vec<(String, Option<(i32, i32)>)> = ports.iter().filter(|p| p.owner == Owner::Net(net.to_string())).map(|p| (format!("PIN/{}", p.name), None)).collect();
+    for inst in insts {
+        let m = &masters[&inst.unique.master];
+        for (t, n) in inst.nets.iter().enumerate() {
+            if n.as_deref() == Some(net) {
+                out.push((format!("{}/{}", inst.name, m.terms[t].name), None));
+            }
+        }
+    }
+    out
+}
+
 pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
     let (masters, insts, ports, pa, design) = (&d.masters, &d.insts, &d.ports, &d.pa, &d.design);
     let inst_index: HashMap<&str, usize> = insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
@@ -443,11 +458,19 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
     let mut gr_pins = Vec::new();
     let ap_of = |a: &AccessPoint, shift: (i32, i32)| DrAp { point: (a.point.0 + shift.0, a.point.1 + shift.1), layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() };
     for (ni, net) in design.nets.iter().enumerate() {
-        let Some((gs, gps)) = g.by_net.get(&net.name) else { continue };
-        for &(layer, b, e) in gs {
-            guides.push(TaGuide { net: ni, layer, begin: b, end: e, route: None });
-        }
-        for (name, pt) in gps {
+        let named: Vec<(String, Option<(i32, i32)>)> = match g.by_net.get(&net.name) {
+            Some((gs, gps)) => {
+                for &(layer, b, e) in gs {
+                    guides.push(TaGuide { net: ni, layer, begin: b, end: e, route: None });
+                }
+                gps.iter().map(|(n, pt)| (n.clone(), Some(*pt))).collect()
+            }
+            // A net with no guides (routed before routing began) has no gr pin, but its
+            // terminals are in the reference's region query all the same: the worker finds them
+            // at its route ends (initNets_searchRepair_pin2epMap, initNets_segmentTerms).
+            None => net_terminals(insts, masters, ports, &net.name),
+        };
+        for (name, pt) in &named {
             let t = *term_of.entry(name.clone()).or_insert_with(|| {
                 if let Some(pn) = name.strip_prefix("PIN/") {
                     let k = port_index[pn];
@@ -494,7 +517,9 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
                 }
                 ta_terms.len() - 1
             });
-            gr_pins.push((t, *pt));
+            if let Some(pt) = pt {
+                gr_pins.push((t, *pt));
+            }
         }
     }
     let input = TaInput {
@@ -1033,4 +1058,43 @@ pub fn end_fr(db: &mut Db, d: &DesignIn, g: &GuidesIn, p: &Prep, routes: &Design
     crate::dr::db::write_gcell_grid(db, &g.grid)?;
     crate::dr::db::write_routes(db, &p.tech, d.tech.via_defs.len(), routes, &names, &has_ndr)?;
     Ok(crate::dr::design::net_shapes(routes).len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pa::unique::UniqueInst;
+    use crate::tech::{MasterPin, MasterTerm, Transform};
+
+    // Upstream rule (FlexDRWorker::initNets_searchRepair_pin2epMap, initNets_segmentTerms): the
+    // terminals at a route's ends come from the design's region query, which holds EVERY
+    // terminal — a net routed before routing began has no guides and no gr pin, and still finds
+    // its block pin and instance terminals there. Our terminal table takes a guided net's from
+    // its gr pins; an unguided net's are these: block pins first (block order), then instance
+    // terminals (instance order, master order), only the net's own.
+    #[test]
+    fn an_unguided_net_lists_its_block_pins_then_its_instance_terminals() {
+        let pin = || MasterPin { shapes: vec![(2, Rect::new(0, 0, 100, 100))] };
+        let master = Master { terms: vec![MasterTerm { name: "A".into(), sig: "SIGNAL".into(), pins: vec![pin()] }, MasterTerm { name: "B".into(), sig: "SIGNAL".into(), pins: vec![pin()] }], blockages: vec![], blockage_rules: vec![] };
+        let masters: HashMap<String, Master> = [("m".to_string(), master)].into();
+        let inst = |name: &str, a: Option<&str>, b: Option<&str>| DesignInst {
+            name: name.into(),
+            unique: UniqueInst { master: "m".into(), orient: "R0".into(), location: (0, 0), bbox: Rect::new(0, 0, 1000, 1000), routes: vec![a.is_some(), b.is_some()], ndr_no_taper: false },
+            class: MasterClass::StdCell,
+            is_block: false,
+            transform: Transform { orient: "R0".into(), origin: (0, 0) },
+            nets: vec![a.map(String::from), b.map(String::from)],
+            target: vec![],
+            no_taper: vec![false, false],
+        };
+        let insts = vec![inst("u0", Some("other"), Some("clk")), inst("u1", Some("clk"), None)];
+        let port = |name: &str, net: &str| DesignPort { name: name.into(), routed: true, owner: Owner::Net(net.into()), pins: vec![vec![]], target: vec![], no_taper: false };
+        let ports = vec![port("in", "other"), port("clk", "clk")];
+        let names: Vec<String> = net_terminals(&insts, &masters, &ports, "clk").into_iter().map(|(n, pt)| {
+            assert_eq!(pt, None);
+            n
+        }).collect();
+        assert_eq!(names, ["PIN/clk", "u0/B", "u1/A"]);
+        assert!(net_terminals(&insts, &masters, &ports, "none").is_empty());
+    }
 }
