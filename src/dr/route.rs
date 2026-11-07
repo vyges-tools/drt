@@ -34,9 +34,10 @@ pub fn sort_reroute_nets(nets: &[DrNet], abs: &dyn Fn(&DrNet) -> i32, ripped: &d
     order
 }
 
-/// ⚠️ UNWITNESSED: no corpus design reaches NEARDRC with an effect — single_row (the only one past
-/// iteration 7) keeps its two violations whatever is ripped, and its DEF is the same with this rule
-/// disabled. Transcribed from the reference and pinned by unit tests only.
+/// Witnessed at stage D by single_row (iterations 23, 30, …, 58: both markers rip a_i only, its
+/// route cleared before costing, then queued from nets): the stage-D scorer replays this and is
+/// exact on the reference's worker trace. ⚠️ Its DEF is the same with the rule disabled, and the
+/// bloat is UNWITNESSED (single_row's markers lie on a_i's own shapes) — pinned by unit tests only.
 ///
 /// NEARDRC's rip-up (`initRipUpNetsFromMarkers` → `getRipUpNetsFromMarker`): every net with a
 /// worker shape on a marker's layer inside the marker box bloated by twice that layer's width.
