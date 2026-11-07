@@ -200,12 +200,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
         crate::dr::log::pin_access(pins, patterns, pa.rows).into_iter().for_each(&mut *log);
     }
     let ndrs = read_ndrs(db, tech)?;
-    for n in &mut design.nets {
-        let r = db.net_get_non_default_rule(&n.name);
-        if !r.is_empty() {
-            n.ndr = Some(ndrs.iter().find(|x| x.name == r).cloned().ok_or_else(|| format!("net {}: rule {r} not read", n.name))?);
-        }
-    }
+    assign_ndrs(db, &mut design, &ndrs)?;
     // A net routed already (a wire in the database) makes the first iterations incremental.
     let initial = crate::dr::db::initial_routing(db, tech, &design.nets)?;
     // Non-default-rule nets without auto-taper: their routes are never tapered at the pins.
@@ -215,10 +210,22 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()) })
 }
 
+/// Each net's non-default rule, by the name the database gives it (`dbNet::getNonDefaultRule`),
+/// from the rules [`read_ndrs`] read; a net without one keeps the default rule.
+pub fn assign_ndrs(db: &Db, design: &mut TaDesign, ndrs: &[NdrRule]) -> Res<()> {
+    for n in &mut design.nets {
+        let r = db.net_get_non_default_rule(&n.name);
+        if !r.is_empty() {
+            n.ndr = Some(ndrs.iter().find(|x| x.name == r).cloned().ok_or_else(|| format!("net {}: rule {r} not read", n.name))?);
+        }
+    }
+    Ok(())
+}
+
 /// The non-default rules, the technology's then the block's (a name already read is skipped):
 /// per routing layer its width and spacing (0 without a layer rule), its use-vias at their
 /// bottom layer. Refused: a hard-spacing rule, a wire extension, use-via generate rules.
-fn read_ndrs(db: &Db, tech: &Tech) -> Res<Vec<NdrRule>> {
+pub fn read_ndrs(db: &Db, tech: &Tech) -> Res<Vec<NdrRule>> {
     let n_routing = tech.layers.iter().filter(|l| l.kind == LayerKind::Routing).count();
     let z_of = |l: usize| (l / 2).saturating_sub(1);
     let mut out: Vec<NdrRule> = Vec::new();
