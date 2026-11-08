@@ -76,7 +76,8 @@ property detailed routing refuses, since the access points are judged by the sam
 check.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
 with the rect-only and minimum-width rules; so are right-way-on-grid-only layers, which take on-track
-access points only. The
+access points only. A multi-patterned routing layer (LEF `MASK` above 1) is routed both ways at
+once: unidirectional and right-way on grid; the router assigns no colour. The
 router settings are its defaults (via-access layer 2, three sparse points per pin, non-preferred
 tracks allowed); the top routing layer is the block's maximum routing layer.
 
@@ -119,7 +120,7 @@ kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
 report's `reason`), among them LEF58 minimum step and minimum cut, `SPACINGTABLE INFLUENCE` and a
 metal-width via map; corner spacing in a design with a block master; a layer whose via pads break
-its minimum step; a multi-patterned routing layer; a non-default rule with hard spacing, via
+its minimum step; a non-default rule with hard spacing, via
 generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
 the database; and congested input guides. Past iteration 7 the router widens the clip of
 congested workers, and from iteration 23 rips up the nets near each marker (NEARDRC); both follow

@@ -72,10 +72,14 @@ pub struct Layer {
     /// own fixed shapes do not already break that), and it is UNIDIRECTIONAL.
     pub rect_only: bool,
     /// The layer carries the right-way-on-grid-only constraint: io makes it for RIGHTWAYONGRIDONLY
-    /// OR a multi-patterned layer (`numMasks > 1`, refused before routing). Its consumers: pin
+    /// OR a multi-patterned layer (`numMasks > 1`). Its consumers: pin
     /// access (on-grid points only), the maze grid (right-way edges on tracks only; an off-grid via
     /// only at an access point) and, through `Tech::allow_pin_feedthrough`, guides and the maze.
     pub right_way_on_grid_only: bool,
+    /// A routing layer's mask count (`frLayer::getNumMasks`, the LEF `MASK`; 1 without one, 0 on
+    /// a layer that is not read as routing). More than one makes the layer unidirectional and
+    /// right-way-on-grid-only; the router assigns no colour.
+    pub num_masks: u32,
     /// A routing layer's v5.4 MINIMUMCUT rules as io keeps them (`frMinimumcutConstraint`).
     pub min_cuts: Vec<MinCut>,
     /// A routing layer's v5.8 MINSTEP rule as io keeps it (`frMinStepConstraint`).
@@ -330,11 +334,11 @@ impl Layer {
     pub fn is_routable(&self) -> bool {
         self.kind == LayerKind::Routing
     }
-    /// No wire runs across the layer's direction: a rect-only layer is taken as unidirectional
-    /// (a wrong-way rectangle would be legal on one, but the rare case is ignored). Multi-patterned
-    /// layers are too, and are refused before this is read.
+    /// No wire runs across the layer's direction (`frLayer::isUnidirectional`): a multi-patterned
+    /// layer (`numMasks > 1`: the router does not colour, so it routes one way) or a rect-only one
+    /// (a wrong-way rectangle would be legal on one, but the rare case is ignored).
     pub fn is_unidirectional(&self) -> bool {
-        self.rect_only
+        self.num_masks > 1 || self.rect_only
     }
 }
 
@@ -780,7 +784,10 @@ pub mod read {
                     // Only the plain flag makes the constraint; "except non-core pins" alone is
                     // stored and never read.
                     let rect_only = db.layer_is_rect_only(&name);
-                    let right_way_on_grid_only = db.layer_is_right_way_on_grid_only(&name) || db.layer_get_num_masks(&name) > 1;
+                    let num_masks = db.layer_get_num_masks(&name);
+                    // io: "We don't handle coloring so tracks on any multiple patterned layer are
+                    // forced to be on grid" — the constraint for either flag.
+                    let right_way_on_grid_only = db.layer_is_right_way_on_grid_only(&name) || num_masks > 1;
                     let spacing_ranges: Vec<SpacingRange> = db
                         .layer_v54_spacing_rules(&name)
                         .unwrap_or_default()
@@ -823,7 +830,7 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, min_cuts, min_step, spacing_ranges });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, min_step, spacing_ranges });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is

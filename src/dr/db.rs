@@ -14,22 +14,20 @@ pub use crate::dr::wire::InitialRouting;
 
 /// The rule families and layer properties routing does not model, as `layer: family` for each
 /// layer that carries one — a design with any must be refused, not routed with the rule ignored.
-/// A cut layer may carry one plain spacing rule (more than one is refused too). Also refused: a
-/// multi-patterned routing layer (unidirectional, and coloured — colouring is not modelled).
+/// A cut layer may carry one plain spacing rule (more than one is refused too). A multi-patterned
+/// routing layer is modelled as the reference's io takes it: unidirectional and
+/// right-way-on-grid-only, with no colour assigned (colours are a later step's).
 /// Spacing limited to a width RANGE and master obstructions carrying their own DESIGNRULEWIDTH or
 /// SPACING are modelled. A rect-only layer is modelled (unidirectional, and the
 /// check's rect-only rule); its "except non-core pins" flag is never read.
 /// Right-way-on-grid-only is modelled in every consumer (pin access, the maze grid, guides and
-/// the maze's pin feedthrough); a multi-patterned layer, which io also gives it, stays refused.
+/// the maze's pin feedthrough), and so is a multi-patterned layer, which io also gives it.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
     let has_block_master = db.inst_names().iter().any(|i| db.master_get_type(&db.inst_get_master(i)).unwrap_or_default().starts_with("BLOCK"));
     for l in &tech.layers {
         if l.kind == LayerKind::Placeholder {
             continue;
-        }
-        if l.kind == LayerKind::Routing && db.layer_get_num_masks(&l.name) > 1 {
-            out.push(format!("{}: multi-patterned", l.name));
         }
         // Families the reference's io translates that the database census does not list, counted
         // here from the generated accessors — only the rules io KEEPS (it drops the rest with a
