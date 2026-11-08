@@ -82,6 +82,33 @@ pub const ROUTE_SHAPE_COST: u32 = 8;
 pub const MARKER_COST: u32 = 32;
 pub const MAX_CLIPSIZE_INCREASE: i32 = 18;
 pub const END_ITERATION: usize = 80;
+/// The iteration routing resumes at when the database already holds DRC markers
+/// (`REROUTE_VIOLATIONS_START_ITER`, not a command option).
+pub const REROUTE_VIOLATIONS_START_ITER: usize = 3;
+/// The marker category a run reads back from the database (`io::Parser::setMarkers`).
+pub const DRC_MARKER_CATEGORY: &str = "DRC";
+
+/// The first iteration (`FlexDR::main`): 0, or with markers read from the database the resume
+/// iteration, never past the end iteration (so at least one repair iteration still runs).
+pub fn start_iteration(db_markers: usize, end_iteration: usize) -> usize {
+    if db_markers == 0 {
+        0
+    } else {
+        REROUTE_VIOLATIONS_START_ITER.min(end_iteration)
+    }
+}
+
+/// The rule a marker read from the database takes on its layer (`io::Parser::setMarkers`): a
+/// routing layer's recheck, so the router re-runs its own check over the region instead of
+/// trusting the imported geometry; a cut layer has no recheck and takes its short; any other
+/// layer has neither and the marker is dropped.
+pub fn db_marker_rule(kind: crate::tech::LayerKind) -> Option<crate::gc::Rule> {
+    match kind {
+        crate::tech::LayerKind::Routing => Some(crate::gc::Rule::Recheck),
+        crate::tech::LayerKind::Cut => Some(crate::gc::Rule::Short),
+        crate::tech::LayerKind::Placeholder => None,
+    }
+}
 pub const STUBBORN_FLOW_VIOLATION_THRESHOLD: usize = 100;
 
 impl IterArgs {
@@ -690,6 +717,28 @@ mod tests {
         for (xl, _, xh, _) in &e[0] {
             assert!(*xh < 12 || *xl > 12, "box 0 took box 1's gcell: {xl}..{xh}");
         }
+    }
+
+    /// Rule (upstream reroute from database markers, 07e7967736 + 6d4d071e42): with markers read
+    /// from the database the run starts at iteration 3, clamped to the end iteration; without, 0.
+    #[test]
+    fn a_run_with_database_markers_resumes_at_iteration_three_never_past_the_end() {
+        assert_eq!(start_iteration(0, END_ITERATION), 0);
+        assert_eq!(start_iteration(0, 1), 0);
+        assert_eq!(start_iteration(5, END_ITERATION), 3);
+        assert_eq!(start_iteration(1, 3), 3);
+        assert_eq!(start_iteration(1, 2), 2);
+        assert_eq!(start_iteration(1, 0), 0);
+    }
+
+    /// Rule (upstream fb9008b3e6): a database marker on a routing layer is a recheck, on a cut
+    /// layer (no recheck there) a short, on any other layer dropped.
+    #[test]
+    fn a_database_marker_is_a_recheck_on_metal_and_a_short_on_a_cut() {
+        use crate::tech::LayerKind;
+        assert_eq!(db_marker_rule(LayerKind::Routing), Some(Rule::Recheck));
+        assert_eq!(db_marker_rule(LayerKind::Cut), Some(Rule::Short));
+        assert_eq!(db_marker_rule(LayerKind::Placeholder), None);
     }
 
     /// Rule: worker ids go first-fit into the first batch none of whose members' widened boxes

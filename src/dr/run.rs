@@ -14,7 +14,7 @@ use crate::dr::cost::{init_maze_cost, CostCtx, CostWorker, DrFig};
 use crate::dr::db::TaDesign;
 use crate::dr::design::{connectivity_check, DesignRoutes, WriteBack};
 use crate::dr::drw::{access_point_locations, gcell_boundary_pins, grid_maps, init_edges, init_nets_init_dr, init_nets_search_repair, localize_ext, merge_boundary_pins, mt_safe_dist, worker_batches, worker_groups, DrAp, DrNet, DrNetInput, DrPin, DrTerm, GridConfig, WorkerBoxes, BATCH_SIZE};
-use crate::dr::flow::{guide_tile_boxes, in_check_box, sources_in_id_order, strategy, tile_batches, worker_markers, written_back, ClipSize, Flow, FlowState, RipUp, MARKER_COST, ROUTE_SHAPE_COST};
+use crate::dr::flow::{guide_tile_boxes, in_check_box, sources_in_id_order, start_iteration, strategy, tile_batches, worker_markers, written_back, ClipSize, Flow, FlowState, RipUp, MARKER_COST, ROUTE_SHAPE_COST};
 use crate::dr::log::{Line, Sink};
 use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig, GuideNet, GuidePin};
 use crate::dr::maze::{MazeCfg, MazeState};
@@ -122,6 +122,8 @@ pub struct DesignIn {
     pub jumpers: HashSet<usize>,
     /// Database units per micron (the wire-length report's divisor).
     pub dbu: i64,
+    /// The DRC markers the database already holds ([`crate::dr::db::set_markers`]).
+    pub db_markers: Vec<Marker>,
 }
 
 /// The reader, then pin access.
@@ -156,6 +158,11 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     };
     crate::dr::log::reading(&t, tech.via_defs.len(), &skipped, stats).into_iter().for_each(&mut *log);
     let (masters, insts, ports) = crate::pa::db::read_design(db, tech, cfg.top_routing_layer)?;
+    // The reader's last step: markers already in the database.
+    let db_markers = crate::dr::db::set_markers(db, tech)?;
+    if !db_markers.is_empty() {
+        log(Line::Info(628, format!("Read {} marker(s) from the '{}' category in the database.", db_markers.len(), crate::dr::flow::DRC_MARKER_CATEGORY)));
+    }
     {
         let nets = db.net_names();
         let snets = nets.iter().filter(|n| db.net_is_special(n)).count();
@@ -207,7 +214,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
     let jumpers: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| db.net_has_jumpers(&n.name)).map(|(i, _)| i).collect();
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()) })
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()), db_markers })
 }
 
 /// Each net's non-default rule, by the name the database gives it (`dbNet::getNonDefaultRule`),
@@ -590,7 +597,17 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
     let mut increase_clip = false;
     let mut markers_by_iteration = Vec::new();
     let mut flow_by_iteration = Vec::new();
-    for (iter, row) in strategy(ROUTE_SHAPE_COST, MARKER_COST).into_iter().enumerate() {
+    // Markers read from the database stand as the design's (and in its region query) from the
+    // start, and make the run resume past the first, rip-up-everything rows.
+    for m in &d.db_markers {
+        routes.add_marker(m.clone());
+    }
+    let start = start_iteration(d.db_markers.len(), end_iteration);
+    if !d.db_markers.is_empty() {
+        log(Line::Info(627, format!("Found {} DRC marker(s) in the database; resuming detailed routing from iteration {start}.", d.db_markers.len())));
+    }
+    // The strategy rows are indexed by the iteration, so a resumed run takes its own rows.
+    for (iter, row) in strategy(ROUTE_SHAPE_COST, MARKER_COST).into_iter().enumerate().skip(start) {
         if iter > end_iteration {
             break;
         }
@@ -601,14 +618,15 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
         search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip)?;
         flow_by_iteration.push(flow.current.name());
-        markers_by_iteration.push(routes.markers().count());
-        crate::dr::log::iteration(iter, flow.current.name(), markers_by_iteration[iter]).into_iter().for_each(&mut *log);
+        let standing = routes.markers().count();
+        markers_by_iteration.push(standing);
+        crate::dr::log::iteration(iter, flow.current.name(), standing).into_iter().for_each(&mut *log);
         // reportIterationViolations' table, then `end()`'s report on the routes as they stand.
         if flow.current.name() != "skip" {
             crate::dr::log::violation_table(&p.tech, routes.markers().map(|m| (m.rule, m.layer))).into_iter().for_each(&mut *log);
             crate::dr::log::route_stats(&p.tech, d.dbu, routes.shapes.iter().flatten().map(|s| &s.fig)).into_iter().for_each(&mut *log);
         }
-        if markers_by_iteration[iter] == 0 {
+        if standing == 0 {
             break;
         }
     }

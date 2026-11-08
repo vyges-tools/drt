@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use vyges_opendb::Db;
 
 use crate::dr::ta::{Fixed, TaNet};
-use crate::gc::Owner;
+use crate::gc::{Marker, Owner};
 use crate::pa::flow::{DesignInst, DesignPort, MasterClass};
 use crate::polygon90::Rect;
 use crate::tech::{LayerKind, Master, Tech};
@@ -198,6 +198,29 @@ pub struct TaDesign {
     /// too), an unconnected terminal (or the floating power / ground owner), an instance's
     /// obstructions, a routing blockage.
     pub owners: Vec<Vec<Owner>>,
+}
+
+/// `io::Parser::setMarkers`: the markers of the database's `DRC` category and everything under it,
+/// in the database's order, each on its layer with the layer's rule ([`db_marker_rule`]), its box
+/// and its NET sources as owners; one on no layer, on a layer the router does not hold, or on a
+/// layer with no such rule is dropped. They stand as the design's markers before the first
+/// iteration (and make the run resume, [`start_iteration`]).
+///
+/// [`db_marker_rule`]: crate::dr::flow::db_marker_rule
+/// [`start_iteration`]: crate::dr::flow::start_iteration
+pub fn set_markers(db: &Db, tech: &Tech) -> Result<Vec<Marker>, String> {
+    let mut out = Vec::new();
+    for m in db.category_markers(crate::dr::flow::DRC_MARKER_CATEGORY).map_err(|e| e.to_string())? {
+        let Some(name) = m.layer else { continue };
+        let Some(layer) = tech.layers.iter().position(|l| l.name == name) else { continue };
+        let Some(rule) = crate::dr::flow::db_marker_rule(tech.layers[layer].kind) else { continue };
+        let mut owners: Vec<Owner> = m.source_nets.into_iter().map(Owner::Net).collect();
+        owners.sort();
+        owners.dedup();
+        let [xl, yl, xh, yh] = m.rect;
+        out.push(Marker { rule, layer, bbox: Rect { xl, yl, xh, yh }, owners, victim: None, aggressor: None });
+    }
+    Ok(out)
 }
 
 /// Refuses (`Err`) a special wire with no shape type: its ends would extend by half its width,
