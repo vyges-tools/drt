@@ -694,6 +694,10 @@ pub mod read {
     /// the rule is not checked during routing and sign-off DRC must cover it. A rule the
     /// reference drops itself ([`lef58_eol_dropped_by_reference`]) is not one of these.
     pub fn lef58_eol_skipped_clause(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
+        // ⚠️ Unreachable through odb's LEF grammar (the dropped clauses belong to the WITHIN
+        // branch, exclusive with TOCONCAVECORNER and TONOTCHLENGTH), so no test can fail on it
+        // (the mutant removing it survives as EQUIVALENT); kept so the reference's own skip always
+        // wins over ours should a database ever carry both.
         if lef58_eol_dropped_by_reference(db, layer, k) {
             None
         } else if db.spacingeolrule_is_to_concave_corner_valid(layer, k) {
