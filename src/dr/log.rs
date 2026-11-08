@@ -18,6 +18,8 @@ pub enum Line {
     /// A warning of this engine's OWN, with no reference code: it is not one of the reference's
     /// lines and is never scored against its log (a rule skipped where the reference misreads it).
     OwnWarn(String),
+    /// An informational line of this engine's OWN, with no reference code (never scored).
+    OwnInfo(String),
 }
 
 /// Where a stage writes its lines.
@@ -337,6 +339,7 @@ mod tests {
             Line::Warn(i, t) => format!("W{i} {t}"),
             Line::Report(t) => format!("R {t}"),
             Line::OwnWarn(t) => format!("V {t}"),
+            Line::OwnInfo(t) => format!("v {t}"),
         }
     }
 

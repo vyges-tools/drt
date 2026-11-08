@@ -144,6 +144,76 @@ pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
     out
 }
 
+/// A layer PROPERTY the database's LEF reader leaves unparsed, by kind: odb keeps it only as raw
+/// text on the layer (its ODB-0388 "unsupported property" INFO), so no rule reaches routing and
+/// it is NOT checked. Informational: never a refusal, and the reference is silent about it too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnparsedProperty {
+    pub layer: String,
+    /// The property name as the LEF writes it (`LEF58_ENCLOSUREEDGE`, …).
+    pub kind: String,
+    /// The `;`-terminated statements in the raw text odb kept. odb keeps ONE string property per
+    /// name and layer, and a later PROPERTY of the same name is APPENDED to it (with a space,
+    /// `dbStringProperty::create`), so every statement of the kind is counted.
+    pub statements: usize,
+}
+
+impl UnparsedProperty {
+    /// The line logged at tech load.
+    pub fn notice(&self) -> String {
+        format!(
+            "layer {}: {} ({} statement(s)) is not parsed by the database reader and is NOT checked during routing; sign-off DRC must cover it (informational: the reference does not check it either).",
+            self.layer, self.kind, self.statements
+        )
+    }
+}
+
+/// Whether odb's LEF reader parses a layer PROPERTY of this name on a layer of this type into a
+/// rule (lefin `layer()` at the pin, branch by branch: routing, cut, masterslice and implant
+/// layers each have their own list; no other layer type parses any). Every other property gets
+/// ODB-0388 and survives only as raw text.
+fn odb_parses_layer_property(layer_type: &str, name: &str) -> bool {
+    match layer_type {
+        "ROUTING" => matches!(
+            name,
+            "LEF58_SPACING" | "LEF58_MINSTEP" | "LEF57_MINSTEP" | "LEF58_CORNERSPACING" | "LEF58_SPACINGTABLE"
+                | "LEF58_RIGHTWAYONGRIDONLY" | "LEF58_RECTONLY" | "LEF58_BACKSIDE" | "LEF58_TYPE"
+                | "LEF58_EOLEXTENSIONSPACING" | "LEF58_EOLKEEPOUT" | "LEF58_WIDTHTABLE" | "LEF58_MINIMUMCUT"
+                | "LEF58_PITCH" | "LEF58_AREA" | "LEF58_FORBIDDENSPACING" | "LEF58_TWOWIRESFORBIDDENSPACING"
+                | "LEF58_MINWIDTH" | "LEF57_ANTENNAGATEPLUSDIFF" | "LEF58_ANTENNAGATEPLUSDIFF" | "LEF58_VOLTAGESPACING"
+        ),
+        "CUT" => matches!(
+            name,
+            "LEF58_SPACING" | "LEF57_SPACING" | "LEF58_CUTCLASS" | "LEF58_ENCLOSURE" | "LEF58_ENCLOSURETABLE"
+                | "LEF58_SPACINGTABLE" | "LEF58_ARRAYSPACING" | "LEF58_TYPE" | "LEF58_BACKSIDE" | "LEF58_KEEPOUTZONE"
+                | "LEF58_MAXSPACING" | "LEF57_ANTENNAGATEPLUSDIFF" | "LEF58_ANTENNAGATEPLUSDIFF"
+        ),
+        "MASTERSLICE" => name == "LEF58_TYPE",
+        "IMPLANT" => name == "LEF58_AREA",
+        _ => false,
+    }
+}
+
+/// The LEF58 layer properties the database's reader left unparsed (ODB-0388), per layer in the
+/// technology's order and per kind in odb's property order, read-only from the raw text odb keeps
+/// on each layer (one string property per name, repeats appended). Informational ([`UnparsedProperty`]): not
+/// checked, never refused.
+pub fn lef58_not_checked(db: &Db) -> Vec<UnparsedProperty> {
+    let mut out: Vec<UnparsedProperty> = Vec::new();
+    let layers = db.layers_with_direction().unwrap_or_default();
+    for (layer, _) in layers {
+        let kind = db.layer_get_type(&layer).unwrap_or_default();
+        for (name, text) in db.layer_string_properties(&layer) {
+            if !name.starts_with("LEF58_") || odb_parses_layer_property(&kind, &name) {
+                continue;
+            }
+            let statements = text.split(';').filter(|t| !t.trim().is_empty()).count();
+            out.push(UnparsedProperty { layer: layer.clone(), kind: name, statements });
+        }
+    }
+    out
+}
+
 
 /// A regular net's routing read from the database (`None` without a wire). Refused: a FIXED wire
 /// (the router then rips up incrementally in every iteration), a wire type other than ROUTED, a
@@ -600,5 +670,63 @@ mod skipped_rule_tests {
         let (skipped, refused, enforced) = census(&d);
         assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
         assert_eq!(enforced, 0);
+    }
+}
+
+#[cfg(test)]
+mod lef58_not_checked_tests {
+    //! Rule (odb lefin `layer()`): every layer PROPERTY is stored as raw text, and one the reader
+    //! has no parser for (by layer type) gets only ODB-0388 INFO — no rule object, so routing
+    //! never checks it, and the reference is silent. We LIST these (informational), never refuse.
+    use super::{lef58_not_checked, unmodelled_rules, UnparsedProperty};
+    use vyges_opendb::Db;
+
+    fn db(lef: &str) -> Db {
+        let path = std::env::temp_dir().join(format!("vyges-drt-unparsed-{}-{}.lef", std::process::id(), lef.len()));
+        std::fs::write(&path, lef).expect("write lef");
+        let mut db = Db::new();
+        db.read_lef(path.to_str().expect("utf-8 path")).expect("read lef");
+        let _ = std::fs::remove_file(&path);
+        db
+    }
+
+    const LEF: &str = "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\nMANUFACTURINGGRID 0.005 ;\n\
+LAYER M1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\n\
+  PROPERTY LEF58_SPACING \"SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ;\" ;\n\
+  PROPERTY LEF58_EOLENCLOSURE \"EOLENCLOSURE 0.05 ABOVE 0.01 ;\" ;\n\
+  PROPERTY LEF58_PRLTWOSIDESSPACING \"PRLTWOSIDESSPACING 0.05 ;\" ;\nEND M1\n\
+LAYER V1\n  TYPE CUT ;\n  SPACING 0.05 ;\n  WIDTH 0.04 ;\n\
+  PROPERTY LEF58_CUTCLASS \"CUTCLASS CA WIDTH 0.04 ;\" ;\n\
+  PROPERTY LEF58_ENCLOSUREEDGE \"ENCLOSUREEDGE CUTCLASS CA ABOVE 0.01 OPPOSITE NOCONCAVECORNER 0.05 ;\" ;\n\
+  PROPERTY LEF58_ENCLOSUREEDGE \"ENCLOSUREEDGE CUTCLASS CA BELOW 0.02 ;\" ;\n\
+  PROPERTY LEF58_VIACLUSTER \"VIACLUSTER 3 WITHIN 0.1 ; VIACLUSTER 4 WITHIN 0.2 ;\" ;\nEND V1\n\
+LAYER M2\n  TYPE ROUTING ;\n  DIRECTION VERTICAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\nEND M2\nEND LIBRARY\n";
+
+    /// Rule (odb `dbStringProperty::create`): ONE string property per name and layer, a repeated
+    /// PROPERTY appended to it with a space — so V1's two ENCLOSUREEDGE properties read as one
+    /// property of two statements, as do two statements inside one PROPERTY string.
+    #[test]
+    fn unparsed_lef58_properties_are_listed_per_layer_and_kind_and_never_refused() {
+        let d = db(LEF);
+        let u = |layer: &str, kind: &str, statements| UnparsedProperty { layer: layer.into(), kind: kind.into(), statements };
+        assert_eq!(
+            lef58_not_checked(&d),
+            [u("M1", "LEF58_EOLENCLOSURE", 1), u("M1", "LEF58_PRLTWOSIDESSPACING", 1), u("V1", "LEF58_ENCLOSUREEDGE", 2), u("V1", "LEF58_VIACLUSTER", 2)],
+            "the parsed LEF58_SPACING and LEF58_CUTCLASS are not listed"
+        );
+        let kept: Vec<String> = d.layer_string_properties("V1").into_iter().filter(|(k, _)| k == "LEF58_ENCLOSUREEDGE").map(|(_, v)| v).collect();
+        assert_eq!(kept.len(), 1, "one string property per name: {kept:?}");
+        assert!(kept[0].contains("ABOVE 0.01") && kept[0].contains("BELOW 0.02"), "the repeat is appended: {kept:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        assert!(unmodelled_rules(&d, &tech).is_empty(), "informational only: nothing refused");
+        let n = u("V1", "LEF58_VIACLUSTER", 2).notice();
+        assert!(n.contains("layer V1: LEF58_VIACLUSTER (2 statement(s))") && n.contains("NOT checked during routing"), "{n}");
+    }
+
+    /// A technology without unparsed properties lists none.
+    #[test]
+    fn a_technology_without_unparsed_properties_lists_none() {
+        let plain: String = LEF.lines().filter(|l| !l.contains("EOLENCLOSURE") && !l.contains("PRLTWOSIDES") && !l.contains("ENCLOSUREEDGE") && !l.contains("VIACLUSTER")).map(|l| format!("{l}\n")).collect();
+        assert!(lef58_not_checked(&db(&plain)).is_empty());
     }
 }

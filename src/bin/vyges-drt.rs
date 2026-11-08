@@ -34,6 +34,8 @@ one of the design's own vias, a routed net on a non-default rule.
 Skipped with a warning, neither checked nor refused (both commands): a LEF58 end-of-line spacing
 rule with TOCONCAVECORNER or TONOTCHLENGTH. Each is warned about at tech load and listed in the
 report's skipped_rules; the status does not change, so sign-off DRC must cover these rules.
+The report's lef58_not_checked lists, per layer and property kind, the LEF58 layer properties
+the database reader left unparsed (no rule reaches routing): informational, never refused.
 
 OPTIONS:
   --db IN.odb                 read the design from a database
@@ -95,6 +97,7 @@ const DESCRIBE: &str = r#"{
     "Design rules modelled: shorts (metal and cut), non-sufficient metal, the parallel-run spacing table, LEF 5.4 spacing limited to a width range (SPACING ... RANGE), cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing (with or without a parallel edge), minimum width, minimum area (patched where the router can, reported where it cannot), minimum enclosed area (MINENCLOSEDAREA without a WIDTH; a rule with one is skipped, as the reference skips it), minimum step (MINSTEP), minimum cut (MINIMUMCUT), rect-only layers (which are also unidirectional), right-way-on-grid-only layers, multi-patterned routing layers (LEF MASK above 1: unidirectional and right-way on grid, as the reference routes them; no colour is assigned), LEF58 end-of-line keep-out, LEF58 end-of-line spacing with SPACING, ENDOFLINE, WITHIN, ENDTOEND and PARALLELEDGE (a rule with EXCEPTEXACTWIDTH, FILLCONCAVECORNER or EQUALRECTWIDTH is skipped, as the reference skips it), LEF58 corner spacing (CONVEXCORNER, with CORNERONLY or CORNERTOCORNER; the router patches corners that break it), LEF58 cut classes, the LEF58 different-net cut spacing table of a cut layer, LEF58 enclosure (only the rules the reference itself keeps), and a cell obstruction with its own DESIGNRULEWIDTH or SPACING (checked as a blockage of its own, by its own rule). A net carrying antenna jumpers (the database's hasJumpers, set by global routing's antenna repair) is routed at ten times the off-guide cost.",
     "REFUSED rather than approximated, by detailed_route: any other rule family a layer carries (other LEF58 end-of-line clauses, LEF58 minimum step and minimum cut, SPACINGTABLE INFLUENCE, LEF58 max spacing, two-wires forbidden spacing, orthogonal width tables, wrong-direction spacing, the orthogonal spacing table, a metal-width via map and the rest, named in the reason; only the rules the reference itself keeps count); corner spacing with CONCAVECORNER, SAMEMASK or EXCEPTEOL, or in a design that instantiates a BLOCK master; a cut spacing table between layers (LAYER) or with SAMENET or SAMEMETAL; more than one plain cut spacing rule on a cut layer; a layer whose via pads break its minimum step (the check's min-step patch is not modelled); a non-default rule with hard spacing, via generate rules or wire extension; FIXED wiring, a via or patch with no wire, or a routed net on a non-default rule already in the database; and congested input guides. From iteration 7 a congested worker widens the clip of later rows, and from iteration 23 NEARDRC rips up the nets near each marker; both are transcribed but no correlated design exercises them yet.",
     "SKIPPED WITH A WARNING, neither checked nor refused, by detailed_route and pin_access: a LEF58 end-of-line spacing rule with TOCONCAVECORNER or TONOTCHLENGTH. The reference reads either form as a plain end-of-line rule with WITHIN 0 (upstream OpenROAD issue #12174); that reading is not followed. Each skipped rule is warned about at tech load (event DRT-SKIPPED) and listed in the report's skipped_rules (layer, rule, clause, checked false); the status does not change, so sign-off DRC must cover these rules.",
+    "NOT CHECKED, informational, by detailed_route and pin_access: a LEF58 layer property the database's LEF reader leaves unparsed (it keeps only the raw text, with an unsupported-property INFO), e.g. ENCLOSUREEDGE, JOINTCORNERSPACING, VIACLUSTER, PRLTWOSIDESSPACING or EOLENCLOSURE. No rule reaches routing, as in the reference. Each is listed per layer and property kind in the report's lef58_not_checked (event DRT-NOT-CHECKED); never a refusal.",
     "REFUSED rather than approximated, by pin_access: a nearby-track cost round (a pin that no other round can reach); and every rule family or layer property detailed_route refuses (the access points are judged by the same design-rule check), named in the reason.",
     "The router settings are its defaults: via-access layer the second routing layer (detailed_route takes --via-access-layer), no via-in-pin range, three sparse points per pin, non-preferred tracks allowed. detailed_route routes between the block's minimum and maximum routing layers as the database holds them, with the database's non-default rules; pin_access's top routing layer is the block's maximum routing layer, else the topmost."
   ],
@@ -158,6 +161,7 @@ const DESCRIBE: &str = r#"{
 /// | `DRT-nnnn` | detailed_route: the reference's own log lines, each printed on stderr as `[INFO DRT-nnnn] text` as its stage runs — reading, default vias, instance analysis, pin access, guides, track assignment, and per iteration its header (`Start Nth <flow> iteration.`, or `Skipping iteration N`) and `  Number of violations = M.` |
 /// | `DRT-DONE` | the run finished; a census of what it did (detailed_route: iterations, markers, markers after each iteration, nets written, routed before, rerouted; pin_access: unique classes, preferred points, port points). `warn` when the status is not the pass word |
 /// | `DRT-REFUSED` | a step this engine does not model; the reason names it |
+/// | `DRT-NOT-CHECKED` | informational: a LEF58 layer property the database reader left unparsed, so routing does not check it (listed in the report's `lef58_not_checked`; the reference is silent about it too) |
 /// | `DRT-SKIPPED` | a rule SKIPPED with a warning, neither checked nor refused (listed in the report's `skipped_rules`); the `DRT-DONE` event is then a `warn` |
 /// | `DRT-ERROR` | usage, unreadable input, or a failed write |
 mod events {
@@ -184,6 +188,13 @@ mod events {
                 }
                 eprintln!("[WARNING vyges-drt] {t}");
                 emit(&Event::new(TOOL, Severity::Warn, t).with_code("DRT-SKIPPED"));
+            }
+            Line::OwnInfo(t) => {
+                for l in log.take_lines() {
+                    eprintln!("{l}");
+                }
+                eprintln!("[INFO vyges-drt] {t}");
+                emit(&Event::new(TOOL, Severity::Info, t).with_code("DRT-NOT-CHECKED"));
             }
         }
         for l in log.take_lines() {
@@ -290,6 +301,13 @@ fn skipped_json(rules: &[vyges_drt::dr::db::SkippedRule]) -> String {
     format!("[{}]", rules.iter().map(one).collect::<Vec<_>>().join(","))
 }
 
+/// The report's `lef58_not_checked`: per layer and property kind, the LEF58 properties the
+/// database reader left unparsed (informational). Always written with `skipped_rules`.
+fn not_checked_json(props: &[vyges_drt::dr::db::UnparsedProperty]) -> String {
+    let one = |u: &vyges_drt::dr::db::UnparsedProperty| format!("{{\"layer\":{},\"property\":{},\"statements\":{}}}", json_str(&u.layer), json_str(&u.kind), u.statements);
+    format!("[{}]", props.iter().map(one).collect::<Vec<_>>().join(","))
+}
+
 fn route(a: &Args) -> Outcome {
     let Some(p) = &a.db else { return fail("error", 2, "detailed_route reads a database (--db)".into()) };
     let mut db = match Db::open(p) {
@@ -325,7 +343,7 @@ fn route(a: &Args) -> Outcome {
     Outcome {
         status: if s.markers == 0 { "written" } else { "markers" },
         code: u8::from(s.markers > 0),
-        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("markers_by_iteration", format!("[{}]", s.markers_by_iteration.iter().map(usize::to_string).collect::<Vec<_>>().join(","))), ("nets_written", s.nets_written.to_string()), ("routed_before", s.routed_before.to_string()), ("rerouted", s.rerouted.to_string()), ("skipped_rules", skipped_json(&s.skipped_rules))],
+        fields: vec![("out", json_str(out)), ("iterations", s.iterations.to_string()), ("markers", s.markers.to_string()), ("markers_by_iteration", format!("[{}]", s.markers_by_iteration.iter().map(usize::to_string).collect::<Vec<_>>().join(","))), ("nets_written", s.nets_written.to_string()), ("routed_before", s.routed_before.to_string()), ("rerouted", s.rerouted.to_string()), ("skipped_rules", skipped_json(&s.skipped_rules)), ("lef58_not_checked", not_checked_json(&s.lef58_not_checked))],
         skipped: s.skipped_rules.len(),
     }
 }
@@ -381,6 +399,10 @@ fn run(a: &Args) -> Outcome {
     for r in &skipped {
         events::line(vyges_drt::dr::log::Line::OwnWarn(r.warning()));
     }
+    let not_checked = vyges_drt::dr::db::lef58_not_checked(&db);
+    for u in &not_checked {
+        events::line(vyges_drt::dr::log::Line::OwnInfo(u.notice()));
+    }
     let cfg = padb::config(&db, &tech);
     let (masters, insts, ports) = match padb::read_design(&db, &tech, cfg.top_routing_layer) {
         Ok(d) => d,
@@ -417,6 +439,7 @@ fn run(a: &Args) -> Outcome {
             ("preferred_points", pref.to_string()),
             ("port_points", port_points.to_string()),
             ("skipped_rules", skipped_json(&skipped)),
+            ("lef58_not_checked", not_checked_json(&not_checked)),
         ],
         skipped: skipped.len(),
     }
@@ -476,7 +499,7 @@ pub fn main() -> ExitCode {
     }
     report.push_str("}\n");
     // The census counts the skipped rules; each is named in its own DRT-SKIPPED event.
-    let mut census: Vec<String> = o.fields.iter().filter(|(k, _)| *k != "reason" && *k != "skipped_rules").map(|(k, v)| format!("{k}={}", v.trim_matches('"'))).collect();
+    let mut census: Vec<String> = o.fields.iter().filter(|(k, _)| !matches!(*k, "reason" | "skipped_rules" | "lef58_not_checked")).map(|(k, v)| format!("{k}={}", v.trim_matches('"'))).collect();
     if o.fields.iter().any(|(k, _)| *k == "skipped_rules") {
         census.push(format!("skipped_rules={}", o.skipped));
     }

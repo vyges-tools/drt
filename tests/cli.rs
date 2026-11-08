@@ -180,6 +180,7 @@ fn the_report_lists_no_skipped_rule_when_none_is_skipped() {
     let o = bin().args(["pin_access", "--lef", &data("tiny.lef"), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
     let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
     assert_eq!(r["skipped_rules"], serde_json::json!([]));
+    assert_eq!(r["lef58_not_checked"], serde_json::json!([]));
     let _ = std::fs::remove_file(&out);
 }
 
@@ -193,4 +194,22 @@ fn another_end_of_line_clause_is_still_refused() {
     let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
     assert_eq!(r["reason"], "not modelled: M1: lef58_spacing_eol (1, SAMEMASK)");
     assert!(!out.exists());
+}
+
+/// Informational: a LEF58 property the database reader leaves unparsed (no rule reaches routing)
+/// is listed per layer and kind in `lef58_not_checked`; the run is not refused and the access
+/// points do not change.
+#[test]
+fn an_unparsed_lef58_property_is_listed_not_refused() {
+    let lef = tiny_lef_with("ee.lef", "V1", "  PROPERTY LEF58_ENCLOSUREEDGE \"ENCLOSUREEDGE 0.01 ;\" ;\n");
+    let out = tmp("ee.odb");
+    let o = bin().args(["pin_access", "--lef", lef.to_str().unwrap(), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
+    assert_eq!(r["preferred_points"], 3);
+    assert_eq!(r["lef58_not_checked"], serde_json::json!([{"layer": "V1", "property": "LEF58_ENCLOSUREEDGE", "statements": 1}]));
+    assert_eq!(r["skipped_rules"], serde_json::json!([]));
+    assert!(err.contains("[INFO vyges-drt] layer V1: LEF58_ENCLOSUREEDGE (1 statement(s)) is not parsed"), "{err}");
+    let _ = std::fs::remove_file(&out);
 }

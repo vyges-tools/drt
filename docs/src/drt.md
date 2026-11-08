@@ -63,7 +63,8 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 
 ```json
 {"tool":"drt","status":"written","out":"design.odb","unique_classes":82,
- "instances_in_rows":375,"preferred_points":1210,"port_points":54,"skipped_rules":[]}
+ "instances_in_rows":375,"preferred_points":1210,"port_points":54,"skipped_rules":[],
+ "lef58_not_checked":[]}
 ```
 
 `status` is `written`, `vacuous` (nothing to access — not a pass), `refused` or `error`; see the
@@ -95,7 +96,7 @@ vyges-drt detailed_route --db placed_with_guides.odb --out routed.def
 
 The JSON report carries `status`, `out`, `iterations` (search-and-repair iterations run),
 `markers` (design-rule markers standing at the end), `nets_written`, `routed_before`,
-`rerouted` and `skipped_rules`.
+`rerouted`, `skipped_rules` and `lef58_not_checked`.
 
 `status` is `written` (routed with no marker standing, exit 0), `markers` (routed and written, but
 markers remain: exit 1, a finding rather than a pass), `refused` (exit 3) or `error` (exit 2).
@@ -132,3 +133,9 @@ load and lists each rule in the report's `skipped_rules` (layer, rule index, cla
 false), in both commands; the status does not change. Sign-off DRC must cover these rules. The
 reference router reads both forms as a plain end-of-line rule with `WITHIN 0` (upstream OpenROAD
 issue #12174), a reading this router does not copy.
+
+Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
+(it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,
+`PRLTWOSIDESSPACING` or `EOLENCLOSURE`. No rule reaches routing, in this router as in the
+reference; the report's `lef58_not_checked` lists them per layer and property kind, and the run
+is never refused for them.

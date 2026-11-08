@@ -70,6 +70,9 @@ pub struct Summary {
     /// Rules the technology carries that were SKIPPED with a warning, neither checked nor refused
     /// ([`crate::dr::db::skipped_rules`]).
     pub skipped_rules: Vec<crate::dr::db::SkippedRule>,
+    /// LEF58 layer properties the database reader left unparsed, NOT checked (informational,
+    /// [`crate::dr::db::lef58_not_checked`]).
+    pub lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>,
 }
 
 /// Route the design and write the routes into the database.
@@ -99,7 +102,7 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     log(Line::Info(180, "Post processing.".into()));
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
-    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone() })
+    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone(), lef58_not_checked: d.lef58_not_checked.clone() })
 }
 
 /// The design as the router reads it: technology, tracks, instances, ports, nets and their
@@ -129,6 +132,8 @@ pub struct DesignIn {
     pub db_markers: Vec<Marker>,
     /// Rules skipped with a warning at tech load ([`crate::dr::db::skipped_rules`]).
     pub skipped_rules: Vec<crate::dr::db::SkippedRule>,
+    /// LEF58 layer properties left unparsed, listed at tech load ([`crate::dr::db::lef58_not_checked`]).
+    pub lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>,
 }
 
 /// The reader, then pin access.
@@ -141,6 +146,11 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let skipped_rules = crate::dr::db::skipped_rules(db, tech);
     for r in &skipped_rules {
         log(Line::OwnWarn(r.warning()));
+    }
+    // Informational, ours too: what the database reader left unparsed is not checked either.
+    let lef58_not_checked = crate::dr::db::lef58_not_checked(db);
+    for u in &lef58_not_checked {
+        log(Line::OwnInfo(u.notice()));
     }
     let tracks = read::tracks(db, tech).map_err(|e| e.to_string())?;
     let mut cfg = crate::pa::db::config(db, tech);
@@ -224,7 +234,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
     let jumpers: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| db.net_has_jumpers(&n.name)).map(|(i, _)| i).collect();
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()), db_markers, skipped_rules })
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()), db_markers, skipped_rules, lef58_not_checked })
 }
 
 /// Each net's non-default rule, by the name the database gives it (`dbNet::getNonDefaultRule`),
