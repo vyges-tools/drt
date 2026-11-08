@@ -101,6 +101,10 @@ pub enum Rule {
     CornerSpacing,
     /// Two cuts closer than a LEF58 cut spacing table allows (`checkLef58CutSpacingTbl`).
     Lef58CutSpacingTable,
+    /// A cut closer to a concave corner of the metal holding it than a LEF58 cut spacing LAYER …
+    /// CONCAVECORNER rule allows (`checkLef58CutSpacing_spc_layer`); the rule's place in its
+    /// layer's list (the reference keeps a marker once per constraint).
+    Lef58CutSpacing(u16),
     /// A run of edges shorter than the layer's MINSTEP between two longer ones
     /// (`checkMetalShape_minStep`).
     MinStep,
@@ -2152,7 +2156,7 @@ impl<'a> Worker<'a> {
     fn check_cut_spacing(&mut self) {
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_enclosures.is_empty()) {
+            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_enclosures.is_empty() && l.cut_concave.is_empty()) {
                 continue;
             }
             let table = l.cut_table.clone();
@@ -2161,7 +2165,9 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).collect();
-                // `checkCutSpacing_main(rect)`: per cut, the plain rule, then the LEF58 table.
+                // `checkCutSpacing_main(rect)`: per cut, the plain rule, then the LEF58 rules
+                // (the different-net list; no same-net rule is modelled, so none skips a
+                // different net), then the LEF58 table.
                 for k in mine {
                     if let Some(spc) = self.tech.layers[layer].cut_spacing {
                         let q = bloat(&self.shapes[layer][k].rect, spc);
@@ -2169,11 +2175,80 @@ impl<'a> Worker<'a> {
                             self.cut_pair(layer, k, o, spc);
                         }
                     }
+                    for i in 0..self.tech.layers[layer].cut_concave.len() {
+                        self.lef58_cut_spacing_main(layer, k, i);
+                    }
                     if let Some(t) = &table {
                         self.cut_spacing_table(layer, k, t);
                     }
                     self.lef58_enclosure(layer, k);
                 }
+            }
+        }
+    }
+
+    /// `checkLef58CutSpacing_main(rect, con, skipDiffNet)` for rule `i`: every maximal rectangle
+    /// of the second layer's metal (any owner) touching the cut grown by the rule's spacing (its
+    /// `getMaxSpcVal`: no ADJACENTCUTS here), in the tree's order, is paired with the cut.
+    fn lef58_cut_spacing_main(&mut self, layer: usize, k: usize, i: usize) {
+        let con = self.tech.layers[layer].cut_concave[i];
+        let q = bloat(&self.shapes[layer][k].rect, con.spacing);
+        for o in self.query(con.second_layer, &q) {
+            self.lef58_cut_spacing_pair(layer, k, o, i);
+        }
+    }
+
+    /// `checkLef58CutSpacing_main(rect1, rect2, con)`: the pair goes to the LAYER branch (the
+    /// same-object and same-net exits cannot fire: the shapes are on two layers and the rule is
+    /// not SAMENET).
+    fn lef58_cut_spacing_pair(&mut self, layer: usize, k: usize, o: usize, i: usize) {
+        self.lef58_cut_spacing_spc_layer(layer, k, o, i);
+    }
+
+    /// `checkLef58CutSpacing_spc_layer`, its CONCAVECORNER branch: a cut of the rule's class wholly
+    /// inside (edges may meet) the metal rectangle `o` is checked against every polygon edge of
+    /// the second layer (any owner) touching that rectangle, in the tree's order, by the edge's
+    /// starting corner: a CONCAVE corner with its x on the rectangle's left or right line, or its
+    /// y on the bottom or top line, closer to the cut (squared Euclidean, rectangle to point; 0
+    /// inside) than the spacing, not with both cut and corner fixed, gives a marker on the cut
+    /// layer, the box spanning the cut and the corner (`generalized_intersect`). Victim: the cut;
+    /// aggressor: the rectangle's owner, with the corner as a point on the second layer.
+    fn lef58_cut_spacing_spc_layer(&mut self, layer: usize, k: usize, o: usize, i: usize) {
+        let con = self.tech.layers[layer].cut_concave[i];
+        let (sl, cut, metal) = (con.second_layer, self.shapes[layer][k], self.shapes[con.second_layer][o]);
+        let (r1, r2) = (cut.rect, metal.rect);
+        if self.tech.layers[layer].cut_class_of(r1.dx().min(r1.dy()), r1.dx().max(r1.dy())) != con.class {
+            return;
+        }
+        if !contains(&r2, &r1) {
+            return;
+        }
+        let req = i64::from(con.spacing) * i64::from(con.spacing);
+        for e in self.query_segs(sl, &r2) {
+            let Some(c) = self.corner(sl, e) else { continue };
+            if c.convex {
+                continue;
+            }
+            if (c.x != r2.xl && c.x != r2.xh) && (c.y != r2.yl && c.y != r2.yh) {
+                continue;
+            }
+            let p = Rect::new(c.x, c.y, c.x, c.y);
+            let bbox = generalized_intersect(&p, &r1);
+            let (dx, dy) = (i64::from(gap((r1.xl, r1.xh), (c.x, c.x))), i64::from(gap((r1.yl, r1.yh), (c.y, c.y))));
+            if dx * dx + dy * dy >= req {
+                continue;
+            }
+            if cut.fixed && c.fixed {
+                continue;
+            }
+            let rule = Rule::Lef58CutSpacing(i as u16);
+            let mut owners = vec![self.owner(cut.net).clone(), self.owner(metal.net).clone()];
+            owners.sort();
+            owners.dedup();
+            if self.seen.insert((bbox, layer, rule, owners.clone())) {
+                let victim = (self.owner(cut.net).clone(), layer, r1, cut.fixed);
+                let aggressor = (self.owner(metal.net).clone(), sl, p, c.fixed);
+                self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
             }
         }
     }
@@ -2470,9 +2545,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_concave: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_concave: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -3450,5 +3525,103 @@ mod eol_tests {
         ];
         let got = eol(&t, &shapes, false);
         assert!(!got.iter().any(|r| r.xl == 1000 && r.xh == 1150), "{got:?}");
+    }
+}
+
+#[cfg(test)]
+mod cut_concave_tests {
+    //! LEF58 cut spacing to a concave corner (`SPACING 70 LAYER l4 CUTCLASS CA CONCAVECORNER` on
+    //! cut layer 3 of `tests::tech()`), on net `a`'s L on l4: the bar (0, 0)–(1000, 140) and the
+    //! arm (860, 0)–(1000, 1000), concave corner (860, 140); class CA is a 100 × 100 cut.
+    use super::*;
+
+    fn run(shapes: &[(&str, usize, Rect, bool)]) -> Vec<Marker> {
+        run_rules(shapes, 1)
+    }
+
+    fn run_rules(shapes: &[(&str, usize, Rect, bool)], rules: usize) -> Vec<Marker> {
+        let mut t = tests::tech();
+        t.layers[3].cut_spacing = None;
+        t.layers[3].cut_classes = vec![crate::tech::CutClass { name: "CA".into(), width: 100, length: 100 }];
+        t.layers[3].cut_concave = vec![crate::tech::CutConcaveSpacing { spacing: 70, second_layer: 4, class: 1 }; rules];
+        let mut w = Worker::new(&t);
+        for (o, l, r, f) in shapes {
+            w.add(&Owner::Net((*o).into()), *l, *r, *f);
+        }
+        w.init();
+        w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58CutSpacing(_))).cloned().collect()
+    }
+
+    fn l(fixed: bool) -> Vec<(&'static str, usize, Rect, bool)> {
+        vec![("a", 4, Rect::new(0, 0, 1000, 140), fixed), ("a", 4, Rect::new(860, 0, 1000, 1000), fixed)]
+    }
+
+    fn with(mut s: Vec<(&'static str, usize, Rect, bool)>, cut: Rect, fixed: bool) -> Vec<(&'static str, usize, Rect, bool)> {
+        s.push(("a", 3, cut, fixed));
+        s
+    }
+
+    // Rule (`checkLef58CutSpacing_main` → `_spc_layer`, CONCAVECORNER): a cut of the rule's class
+    // inside a maximal rectangle of the second layer's metal, closer (rectangle to point, squared)
+    // than the spacing to a CONCAVE corner of that metal lying on one of the rectangle's boundary
+    // lines, is one marker on the CUT layer whose box spans the cut and the corner
+    // (`generalized_intersect`); victim the cut, aggressor the rectangle's owner with the corner as
+    // a point on the second layer.
+    #[test]
+    fn a_cut_near_a_concave_corner_of_its_metal_is_a_marker() {
+        let cut = Rect::new(740, 20, 840, 120);
+        let m = run(&with(l(false), cut, false));
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!((m[0].rule, m[0].layer, m[0].bbox), (Rule::Lef58CutSpacing(0), 3, Rect::new(840, 120, 860, 140)));
+        assert_eq!(m[0].victim, Some((Owner::Net("a".into()), 3, cut, false)));
+        assert_eq!(m[0].aggressor, Some((Owner::Net("a".into()), 4, Rect::new(860, 140, 860, 140), false)));
+        assert_eq!(crate::dr::log::viol_name(m[0].rule), "Cut Spacing");
+    }
+
+    // Rule: the distance is Euclidean and strict — (50, 0) away marks (2500 < 4900), (70, 0) does
+    // not (4900 is not below 4900), nor (70, 20) (5300) though each axis gap alone is within;
+    // only a cut of the rule's class is checked.
+    #[test]
+    fn the_spacing_is_euclidean_and_strict() {
+        assert_eq!(run(&with(l(false), Rect::new(710, 40, 810, 140), false)).len(), 1, "(50, 0): 2500");
+        assert!(run(&with(l(false), Rect::new(690, 40, 790, 140), false)).is_empty(), "(70, 0): 4900 is not below 4900");
+        assert!(run(&with(l(false), Rect::new(690, 20, 790, 120), false)).is_empty(), "(70, 20): 5300");
+        assert!(run(&with(l(false), Rect::new(750, 30, 850, 100), false)).is_empty(), "not of class CA (100 x 70)");
+        assert!(run(&with(l(false), Rect::new(200, 20, 300, 120), false)).is_empty(), "far");
+    }
+
+    // Rule (`addMarker`): a marker is kept once per (box, layer, CONSTRAINT, sources). On a T —
+    // bar (0, 0)–(1000, 140), stem (400, 140)–(600, 1000) — a cut under the stem lies in the bar
+    // AND in the stem's column through it, and both find the two concave corners: two markers
+    // for one rule, four for two rules alike.
+    #[test]
+    fn a_marker_is_kept_once_per_rule() {
+        let t = vec![("a", 4, Rect::new(0, 0, 1000, 140), false), ("a", 4, Rect::new(400, 140, 600, 1000), false)];
+        let cut = Rect::new(450, 20, 550, 120);
+        let one = run_rules(&with(t.clone(), cut, false), 1);
+        let mut boxes: Vec<Rect> = one.iter().map(|m| m.bbox).collect();
+        boxes.sort();
+        assert_eq!(boxes, [Rect::new(400, 120, 450, 140), Rect::new(550, 120, 600, 140)]);
+        let two = run_rules(&with(t, cut, false), 2);
+        let mut rules: Vec<Rule> = two.iter().map(|m| m.rule).collect();
+        rules.sort();
+        assert_eq!(rules, [Rule::Lef58CutSpacing(0), Rule::Lef58CutSpacing(0), Rule::Lef58CutSpacing(1), Rule::Lef58CutSpacing(1)]);
+    }
+
+    // Rule: a cut and a corner both fixed are not checked; either one routed is.
+    #[test]
+    fn a_fixed_cut_at_a_fixed_corner_is_not_checked() {
+        let cut = Rect::new(740, 20, 840, 120);
+        assert!(run(&with(l(true), cut, true)).is_empty());
+        assert_eq!(run(&with(l(true), cut, false)).len(), 1, "routed cut");
+        assert_eq!(run(&with(l(false), cut, true)).len(), 1, "routed metal");
+    }
+
+    // Rule: the cut must lie wholly inside the maximal rectangle (edges may meet); a cut across the
+    // L's inner corner sits in neither rectangle and is not checked.
+    #[test]
+    fn a_cut_not_inside_one_maximal_rectangle_is_not_checked() {
+        assert_eq!(run(&with(l(false), Rect::new(760, 40, 860, 140), false)).len(), 1, "edges on the rectangle's");
+        assert!(run(&with(l(false), Rect::new(800, 100, 900, 200), false)).is_empty());
     }
 }

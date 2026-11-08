@@ -194,7 +194,7 @@ pub fn iteration(iter: usize, flow: &str, markers: usize) -> Vec<Line> {
 /// `frConstraint::getViolName` for each rule the check reports, after `reportIterationViolations`'
 /// relabels (`Lef58SpacingEndOfLine` → `EOL`, `Lef58CutSpacingTable` → `CutSpcTbl`,
 /// `Lef58EolKeepOut` → `eolKeepOut`). Several constraint kinds share a name (every metal spacing
-/// rule is `Metal Spacing`, both cut spacings `Cut Spacing`).
+/// rule is `Metal Spacing`, the plain and the LEF58 cut spacings `Cut Spacing`).
 pub fn viol_name(rule: Rule) -> &'static str {
     match rule {
         Rule::Short => "Short",
@@ -211,6 +211,7 @@ pub fn viol_name(rule: Rule) -> &'static str {
         Rule::Lef58SpacingEndOfLine => "EOL",
         Rule::CornerSpacing => "Corner Spacing",
         Rule::Lef58CutSpacingTable => "CutSpcTbl",
+        Rule::Lef58CutSpacing(_) => "Cut Spacing",
         Rule::MinStep => "Min Step",
         Rule::MinimumCut => "Minimum Cut",
         Rule::SpacingRange => "SpacingRange",

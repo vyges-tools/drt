@@ -68,6 +68,17 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 }
                 continue;
             }
+            if family == "lef58_cut_spacing" {
+                // Modelled for the cut-to-concave-corner form alone (`SPACING s LAYER l CUTCLASS c
+                // CONCAVECORNER`: the check, the only consumer reached — the via-to-via prep that
+                // also reads it runs only for one named process node, an option this router does
+                // not take); the first rule outside it names the refusal.
+                let classes = &l.cut_classes;
+                if let Some(clause) = (0..n).find_map(|k| crate::tech::read::cut_concave_rule(db, &l.name, k, classes).err()) {
+                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                }
+                continue;
+            }
             if family == "lef58_cut_spacing_table" {
                 // Modelled for the different-net table on the layer itself (check, maze cost,
                 // via-to-via and the default `prep_cutSpcTbl` sets); the reader names any other kind.
@@ -652,14 +663,44 @@ mod skipped_rule_tests {
         assert_eq!(skipped.iter().map(|s| (s.index, s.clause)).collect::<Vec<_>>(), [(1, "TOCONCAVECORNER")]);
     }
 
-    /// The cut-to-concave-corner form (a LEF58 cut spacing LAYER rule) is NOT skipped: the whole
-    /// LEF58 cut spacing family stays refused.
+    /// Rule (reference io `setCutLayerProperties`, LAYER branch, + `io_parser_helper`): `SPACING s
+    /// LAYER m CUTCLASS c CONCAVECORNER` is kept as a different-net LEF58 cut spacing rule with its
+    /// second layer resolved by name after the technology (the metal above is defined later), so it
+    /// is MODELLED — checked, neither refused nor skipped.
     #[test]
-    fn the_cut_spacing_layer_concave_corner_form_stays_refused() {
+    fn the_cut_spacing_layer_concave_corner_form_is_modelled() {
         let d = db("cc", "", &eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"));
         let (skipped, refused, _) = census(&d);
-        assert!(skipped.is_empty(), "{skipped:?}");
-        assert_eq!(refused, ["V1: lef58_cut_spacing (1)"]);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let v1 = tech.layer_num("V1").expect("V1");
+        let m2 = tech.layer_num("M2").expect("M2");
+        assert_eq!(tech.layers[v1].cut_concave, [crate::tech::CutConcaveSpacing { spacing: 70, second_layer: m2, class: 1 }]);
+        // The second layer is the one the rule names, below the cut as well as above it.
+        let d = db("cc-below", "", &eol("SPACING 0.07 LAYER M1 CUTCLASS CA CONCAVECORNER ;"));
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let m1 = tech.layer_num("M1").expect("M1");
+        assert_eq!(tech.layers[v1].cut_concave, [crate::tech::CutConcaveSpacing { spacing: 70, second_layer: m1, class: 1 }]);
+    }
+
+    /// Every other LEF58 cut spacing form stays refused, naming its first clause outside the
+    /// modelled one; a modelled rule beside it does not lift the refusal.
+    #[test]
+    fn other_lef58_cut_spacing_forms_stay_refused_naming_the_clause() {
+        for (rule, clause) in [
+            ("SPACING 0.07 LAYER M2 CUTCLASS CA NONEOLCONVEXCORNER 0.05 ;", "NONEOLCONVEXCORNER"),
+            ("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER WIDTH 0.05 ENCLOSURE 0.01 EDGELENGTH 0.1 ;", "CONCAVECORNER WIDTH"),
+            ("SPACING 0.07 LAYER M2 ;", "LAYER without CUTCLASS"),
+            ("SPACING 0.07 SAMENET LAYER M2 ;", "LAYER without CUTCLASS"),
+            ("SPACING 0.07 CENTERTOCENTER LAYER M2 CUTCLASS CA CONCAVECORNER ;", "CENTERTOCENTER"),
+            ("SPACING 0.07 LAYER M2 CUTCLASS CA ;", "LAYER CUTCLASS without CONCAVECORNER"),
+            ("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS"),
+        ] {
+            let rules = format!("{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol(rule));
+            let d = db("cc-other", "", &rules);
+            let (_, refused, _) = census(&d);
+            assert_eq!(refused, [format!("V1: lef58_cut_spacing (2, {clause})")], "{rule}");
+        }
     }
 
     /// A rule the reference drops itself (FILLCONCAVECORNER, with its own warning) is the

@@ -54,6 +54,11 @@ pub struct Layer {
     /// A cut layer's LEF58 enclosure rules as io keeps them (`frLef58EnclosureConstraint`), in the
     /// technology's order.
     pub cut_enclosures: Vec<CutEnclosure>,
+    /// A cut layer's LEF58 cut spacing rules to a concave corner of the metal on another layer
+    /// (`frLef58CutSpacingConstraint` with a second layer, a cut class and CONCAVECORNER), the
+    /// different-net list in the technology's order (the only form modelled; the census refuses
+    /// every other LEF58 cut spacing rule).
+    pub cut_concave: Vec<CutConcaveSpacing>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line SPACING rules, in the technology's order (the
@@ -239,6 +244,18 @@ impl CutEnclosure {
         }
         (end >= self.first && side >= self.second) || (end >= self.second && side >= self.first)
     }
+}
+
+/// A LEF58 cut spacing rule `SPACING s LAYER l CUTCLASS c CONCAVECORNER` as `io::Parser` keeps it
+/// (`frLef58CutSpacingConstraint`: cut spacing, second layer, cut class, concave corner): a cut of
+/// `class` (this crate's index: the class's place + 1) inside a maximal rectangle of the metal on
+/// `second_layer` needs `spacing`, edge to point, to each concave corner of that metal on the
+/// rectangle's boundary lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CutConcaveSpacing {
+    pub spacing: i32,
+    pub second_layer: usize,
+    pub class: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -554,6 +571,9 @@ pub mod read {
 
     type Res<T> = Result<T, Box<dyn std::error::Error>>;
 
+    /// A cut-to-concave-corner rule as read: spacing, second layer NAME, class index.
+    type ConcaveByName = (i32, String, usize);
+
     /// A cut layer's LEF58 cut classes, as `io::Parser` reads them.
     pub fn cut_classes(db: &Db, layer: &str) -> Vec<CutClass> {
         db.layer_get_tech_layer_cut_class_rules(layer)
@@ -659,6 +679,63 @@ pub mod read {
     /// outside the modelled subset (CONVEXCORNER with its width table, CORNERONLY, CORNERTOCORNER;
     /// not CONCAVECORNER, SAMEMASK or EXCEPTEOL) — or an empty table, which the reference would
     /// index out of bounds.
+    /// LEF58 cut spacing rule `k` of cut layer `layer`, if it is the modelled form — `SPACING s
+    /// LAYER l CUTCLASS c CONCAVECORNER` to a routing layer, nothing else — as its spacing, second
+    /// layer name and class index (the class's LAST place + 1: io looks the name up in a map
+    /// written in class order). `Err` names the first clause outside the form: every other type
+    /// (ADJACENTCUTS, PARALLELOVERLAP, …), and on a LAYER rule each option io drops with a
+    /// warning (STACK, ORTHOGONALSPACING, SHORTEDGEONLY, the CONCAVECORNER WIDTH / PARALLEL /
+    /// EDGELENGTH branches, EXTENSION, ABOVEWIDTH, MASKOVERLAP, WRONGDIRECTION) or keeps but this
+    /// engine does not model (no CUTCLASS or no CONCAVECORNER — the reference's check then does
+    /// nothing or checks the convex branch — NONEOLCONVEXCORNER, CENTERTOCENTER, SAMENET,
+    /// SAMEMETAL, SAMEVIA, PRL).
+    pub fn cut_concave_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<(i32, String, usize), &'static str> {
+        let ty = db.cutspacingrule_get_type(layer, k);
+        if ty != "LAYER" {
+            return Err(match ty.as_str() {
+                "ADJACENTCUTS" => "ADJACENTCUTS",
+                "PARALLELOVERLAP" => "PARALLELOVERLAP",
+                "PARALLELWITHIN" => "PARALLELWITHIN",
+                "SAMEMETALSHAREDEDGE" => "SAMEMETALSHAREDEDGE",
+                "AREA" => "AREA",
+                "MAXXY" => "MAXXY",
+                "SAMEMASK" => "SAMEMASK",
+                _ => "a cut spacing rule of no type",
+            });
+        }
+        let second = db.cutspacingrule_get_second_layer(layer, k);
+        if second.is_empty() || db.layer_get_type(&second).map_or(true, |t| t != "ROUTING") {
+            return Err("LAYER to a layer that is not a routing layer");
+        }
+        let class = db.cutspacingrule_get_cut_class(layer, k);
+        let unmodelled: [(bool, &'static str); 17] = [
+            (db.cutspacingrule_is_stack(layer, k), "STACK"),
+            (db.cutspacingrule_is_orthogonal_spacing_valid(layer, k), "ORTHOGONALSPACING"),
+            (class.is_empty(), "LAYER without CUTCLASS"),
+            (db.cutspacingrule_is_short_edge_only(layer, k), "SHORTEDGEONLY"),
+            (db.cutspacingrule_is_concave_corner_width(layer, k), "CONCAVECORNER WIDTH"),
+            (db.cutspacingrule_is_concave_corner_parallel(layer, k), "CONCAVECORNER PARALLEL"),
+            (db.cutspacingrule_is_concave_corner_edge_length(layer, k), "CONCAVECORNER EDGELENGTH"),
+            (db.cutspacingrule_is_extension_valid(layer, k), "EXTENSION"),
+            (db.cutspacingrule_is_above_width_valid(layer, k), "ABOVEWIDTH"),
+            (db.cutspacingrule_is_mask_overlap(layer, k), "MASKOVERLAP"),
+            (db.cutspacingrule_is_wrong_direction(layer, k), "WRONGDIRECTION"),
+            (db.cutspacingrule_is_non_eol_convex_corner(layer, k), "NONEOLCONVEXCORNER"),
+            (!db.cutspacingrule_is_concave_corner(layer, k), "LAYER CUTCLASS without CONCAVECORNER"),
+            (db.cutspacingrule_is_center_to_center(layer, k), "CENTERTOCENTER"),
+            (db.cutspacingrule_is_same_net(layer, k), "SAMENET"),
+            (db.cutspacingrule_is_same_metal(layer, k) || db.cutspacingrule_is_same_via(layer, k), "SAMEMETAL/SAMEVIA"),
+            (db.cutspacingrule_is_prl_valid(layer, k), "PRL"),
+        ];
+        if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
+            return Err(clause);
+        }
+        let Some(c) = classes.iter().rposition(|c| c.name == class) else {
+            return Err("a CUTCLASS the layer does not define");
+        };
+        Ok((db.cutspacingrule_get_cut_spacing(layer, k), second, c + 1))
+    }
+
     pub fn corner_spacing_rule(db: &Db, layer: &str, k: usize) -> Result<CornerSpacing, &'static str> {
         if db.cornerspacingrule_get_type(layer, k) != "CONVEXCORNER" {
             return Err("CONCAVECORNER");
@@ -764,6 +841,10 @@ pub mod read {
         let placeholder = |name: &str| Layer { name: name.into(), ..Layer::default() };
         // The last masterslice layer read so far that is not a well or diffusion layer.
         let mut masterslice: Option<String> = None;
+        // Cut-to-concave-corner rules by cut layer, their second layer by name until every layer
+        // is read (`io_parser_helper` resolves it after the technology, the metal above being
+        // defined after the cut).
+        let mut concave_by_name: Vec<(usize, Vec<ConcaveByName>)> = Vec::new();
         for (name, dir) in db.layers_with_direction()? {
             let kind = db.layer_get_type(&name)?;
             match kind.as_str() {
@@ -871,7 +952,7 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, min_step, spacing_ranges });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_concave: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, min_step, spacing_ranges });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -904,10 +985,20 @@ pub mod read {
                             })
                         })
                         .collect();
+                    let concave: Vec<ConcaveByName> = (0..db.num_layer_get_tech_layer_cut_spacing_rules(&name)).filter_map(|k| cut_concave_rule(db, &name, k, &cut_classes).ok()).collect();
+                    if !concave.is_empty() {
+                        concave_by_name.push((layers.len(), concave));
+                    }
                     layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_enclosures, ..Layer::default() });
                 }
                 _ => {}
             }
+        }
+        for (cut, rules) in concave_by_name {
+            layers[cut].cut_concave = rules
+                .into_iter()
+                .filter_map(|(spacing, second, class)| Some(CutConcaveSpacing { spacing, second_layer: layers.iter().position(|l| l.name == second && l.kind == LayerKind::Routing)?, class }))
+                .collect();
         }
         let num_of = |n: i64| -> Option<usize> {
             let name = db.layer_name_by_number(n);
