@@ -203,7 +203,7 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
     }
     let members: Vec<usize> = (0..insts.len()).filter(|&i| insts[i].class == MasterClass::StdCell && classes[class_of[i]].routes.iter().any(|&r| r)).collect();
     let boxes: Vec<Rect> = members.iter().map(|&i| insts[i].unique.bbox).collect();
-    let order = inst_set_order(&boxes).ok_or_else(|| FlowError::NoRowPath("two instances share a lower-left".into()))?;
+    let order = inst_set_order(&boxes);
     let class_insts: Vec<Instance<'_>> = classes
         .iter()
         .enumerate()

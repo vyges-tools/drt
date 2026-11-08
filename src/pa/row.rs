@@ -11,7 +11,8 @@
 //!
 //! Rules:
 //! - instances are ordered by their placed box's lower-left, y then x; two at the SAME lower-left
-//!   have no defined order ([`inst_set_order`] refuses them);
+//!   (an instance placed on top of another) by database order — the instance id, which follows
+//!   it;
 //! - a row continues while the next instance has the same lower y and does not start right of the
 //!   previous one's right edge (abutting and overlapping instances continue it);
 //! - an edge between neighbours checks only two vias: the previous pattern's RIGHT boundary point's
@@ -53,13 +54,12 @@ pub enum RowEvent {
     End(i32),
 }
 
-/// Placement order: by the placed box's lower-left, y then x. `None` when two instances share a
-/// lower-left (their order is undefined).
-pub fn inst_set_order(boxes: &[Rect]) -> Option<Vec<usize>> {
+/// Placement order (`frInstLocationComp`): by the placed box's lower-left, y then x, then by
+/// database order (`boxes` is in it) for two at the same lower-left.
+pub fn inst_set_order(boxes: &[Rect]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..boxes.len()).collect();
-    order.sort_by_key(|&i| (boxes[i].yl, boxes[i].xl));
-    let tied = order.windows(2).any(|w| (boxes[w[0]].yl, boxes[w[0]].xl) == (boxes[w[1]].yl, boxes[w[1]].xl));
-    (!tied).then_some(order)
+    order.sort_by_key(|&i| (boxes[i].yl, boxes[i].xl, i));
+    order
 }
 
 /// Rows over instances in placement order (`boxes[order[k]]`): a new row when the lower y changes
@@ -270,19 +270,22 @@ mod tests {
         assert_eq!(gen_inst_row_pattern(&t, &row, &mut None), None);
     }
 
-    /// Placement order is lower y, then lower x; a shared lower-left has no order and is refused.
+    /// Placement order is lower y, then lower x; a shared lower-left (an instance placed on top of
+    /// another) goes by database order (upstream 7eddcd471b: the instance id breaks the tie, not
+    /// where the object was allocated).
     #[test]
-    fn placement_order_refuses_a_shared_lower_left() {
+    fn placement_order_breaks_a_shared_lower_left_by_database_order() {
         let b = [Rect::new(500, 0, 900, 100), Rect::new(0, 100, 400, 200), Rect::new(0, 0, 500, 100)];
-        assert_eq!(inst_set_order(&b), Some(vec![2, 0, 1]));
-        assert_eq!(inst_set_order(&[Rect::new(0, 0, 10, 10), Rect::new(0, 0, 20, 10)]), None);
+        assert_eq!(inst_set_order(&b), vec![2, 0, 1]);
+        assert_eq!(inst_set_order(&[Rect::new(0, 0, 20, 10), Rect::new(0, 0, 10, 10)]), vec![0, 1]);
+        assert_eq!(inst_set_order(&[Rect::new(5, 0, 20, 10), Rect::new(0, 0, 10, 10), Rect::new(5, 0, 9, 10)]), vec![1, 0, 2]);
     }
 
     /// Abutting and overlapping instances continue a row; a gap or a new y starts one.
     #[test]
     fn rows_continue_through_abutment_and_overlap() {
         let b = [Rect::new(0, 0, 100, 10), Rect::new(100, 0, 200, 10), Rect::new(150, 0, 250, 10), Rect::new(251, 0, 300, 10), Rect::new(300, 10, 400, 20)];
-        let order = inst_set_order(&b).unwrap();
+        let order = inst_set_order(&b);
         assert_eq!(compute_inst_rows(&b, &order), vec![vec![0, 1, 2], vec![3], vec![4]]);
     }
 }
