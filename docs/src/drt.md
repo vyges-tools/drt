@@ -63,7 +63,7 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 
 ```json
 {"tool":"drt","status":"written","out":"design.odb","unique_classes":82,
- "instances_in_rows":375,"preferred_points":1210,"port_points":54}
+ "instances_in_rows":375,"preferred_points":1210,"port_points":54,"skipped_rules":[]}
 ```
 
 `status` is `written`, `vacuous` (nothing to access — not a pass), `refused` or `error`; see the
@@ -94,8 +94,8 @@ vyges-drt detailed_route --db placed_with_guides.odb --out routed.def
 ```
 
 The JSON report carries `status`, `out`, `iterations` (search-and-repair iterations run),
-`markers` (design-rule markers standing at the end), `nets_written`, `routed_before` and
-`rerouted`.
+`markers` (design-rule markers standing at the end), `nets_written`, `routed_before`,
+`rerouted` and `skipped_rules`.
 
 `status` is `written` (routed with no marker standing, exit 0), `markers` (routed and written, but
 markers remain: exit 1, a finding rather than a pass), `refused` (exit 3) or `error` (exit 2).
@@ -125,3 +125,10 @@ generate rules or wire extension; FIXED wiring, or a routed net on a non-default
 the database; and congested input guides. Past iteration 7 the router widens the clip of
 congested workers, and from iteration 23 rips up the nets near each marker (NEARDRC); both follow
 the reference, though no correlated design exercises them yet.
+
+Skipped with a warning, neither checked nor refused: a LEF58 end-of-line spacing rule with
+`TOCONCAVECORNER` or `TONOTCHLENGTH`. The router does not model these forms, so it warns at tech
+load and lists each rule in the report's `skipped_rules` (layer, rule index, clause, `checked`
+false), in both commands; the status does not change. Sign-off DRC must cover these rules. The
+reference router reads both forms as a plain end-of-line rule with `WITHIN 0` (upstream OpenROAD
+issue #12174), a reading this router does not copy.

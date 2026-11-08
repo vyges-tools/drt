@@ -57,7 +57,8 @@ pub struct Layer {
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line SPACING rules, in the technology's order (the
-    /// modelled subset — `lef58_eol_rule`; the census refuses the rest).
+    /// modelled subset — `lef58_eol_rule`; the census refuses the rest, and the TOCONCAVECORNER /
+    /// TONOTCHLENGTH rules are skipped with a warning, never held here).
     pub lef58_eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line KEEP-OUT rules, in the technology's order.
     pub eol_keepout: Vec<EolKeepOut>,
@@ -679,16 +680,43 @@ pub mod read {
         Ok(CornerSpacing { same_xy: spacings.iter().all(|&(a, b)| a == b), widths, spacings, corner_to_corner })
     }
 
+    /// Whether the reference's io DROPS LEF58 end-of-line rule `k` of `layer` with a warning
+    /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH). It tests these before any other clause.
+    pub fn lef58_eol_dropped_by_reference(db: &Db, layer: &str, k: usize) -> bool {
+        db.spacingeolrule_is_except_exact_width_valid(layer, k) || db.spacingeolrule_is_fill_concave_corner_valid(layer, k) || db.spacingeolrule_is_equal_rect_width_valid(layer, k)
+    }
+
+    /// The clause that makes THIS engine skip LEF58 end-of-line rule `k` of `layer` with a warning
+    /// of its own: `TOCONCAVECORNER` or `TONOTCHLENGTH`. ⛔ Skipped, not enforced and not emulated.
+    /// The reference's io never tests either branch: it keeps the rule as a plain end-of-line rule
+    /// whose WITHIN is the database default 0 and drops MINADJACENTLENGTH, so it flags line ends
+    /// that face straight edges (upstream OpenROAD issue #12174). We do not copy that reading;
+    /// the rule is not checked during routing and sign-off DRC must cover it. A rule the
+    /// reference drops itself ([`lef58_eol_dropped_by_reference`]) is not one of these.
+    pub fn lef58_eol_skipped_clause(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
+        if lef58_eol_dropped_by_reference(db, layer, k) {
+            None
+        } else if db.spacingeolrule_is_to_concave_corner_valid(layer, k) {
+            Some("TOCONCAVECORNER")
+        } else if db.spacingeolrule_is_to_notch_length_valid(layer, k) {
+            Some("TONOTCHLENGTH")
+        } else {
+            None
+        }
+    }
+
     /// LEF58 end-of-line spacing rule `k` of `layer`, as `io::Parser` translates it
     /// (`frLef58SpacingEndOfLineConstraint`): `Ok(None)` for a rule the reference DROPS with a warning
-    /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH — tested first, as it does), `Err(clause)`
-    /// for a clause outside the modelled subset (SPACING / ENDOFLINE / WITHIN, ENDTOEND without its
-    /// extension or cut spaces, PARALLELEDGE with only its space, within and TWOEDGES).
+    /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH — tested first, as it does) and for a rule
+    /// this engine SKIPS with a warning of its own ([`lef58_eol_skipped_clause`]: TOCONCAVECORNER,
+    /// TONOTCHLENGTH), `Err(clause)` for a clause outside the modelled subset (SPACING / ENDOFLINE /
+    /// WITHIN, ENDTOEND without its extension or cut spaces, PARALLELEDGE with only its space, within
+    /// and TWOEDGES).
     pub fn lef58_eol_rule(db: &Db, layer: &str, k: usize) -> Result<Option<EolRule>, &'static str> {
-        if db.spacingeolrule_is_except_exact_width_valid(layer, k) || db.spacingeolrule_is_fill_concave_corner_valid(layer, k) || db.spacingeolrule_is_equal_rect_width_valid(layer, k) {
+        if lef58_eol_dropped_by_reference(db, layer, k) || lef58_eol_skipped_clause(db, layer, k).is_some() {
             return Ok(None);
         }
-        let unmodelled: [(bool, &'static str); 22] = [
+        let unmodelled: [(bool, &'static str); 20] = [
             (db.spacingeolrule_is_exact_width_valid(layer, k), "EXACTWIDTH"),
             (db.spacingeolrule_is_wrong_dir_spacing_valid(layer, k), "WRONGDIRSPACING"),
             (db.spacingeolrule_is_opposite_width_valid(layer, k), "OPPOSITEWIDTH"),
@@ -706,8 +734,6 @@ pub mod read {
             (db.spacingeolrule_is_parallel_same_mask_valid(layer, k), "PARALLELEDGE PARALLELSAMEMASK"),
             (db.spacingeolrule_is_min_length_valid(layer, k) || db.spacingeolrule_is_max_length_valid(layer, k), "MINLENGTH/MAXLENGTH"),
             (db.spacingeolrule_is_enclose_cut_valid(layer, k), "ENCLOSECUT"),
-            (db.spacingeolrule_is_to_concave_corner_valid(layer, k), "TOCONCAVECORNER"),
-            (db.spacingeolrule_is_to_notch_length_valid(layer, k), "TONOTCHLENGTH"),
             (db.spacingeolrule_is_min_adjacent_length_valid(layer, k), "MINADJACENTLENGTH"),
             (db.spacingeolrule_is_cut_class_valid(layer, k) || db.spacingeolrule_is_withcut_valid(layer, k), "CUTCLASS/WITHCUT"),
             (db.spacingeolrule_is_enclosure_end_valid(layer, k), "ENCLOSUREEND"),

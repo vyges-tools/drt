@@ -141,3 +141,56 @@ fn a_def_with_undefined_cells_names_the_file_the_cause_and_the_fix() {
     assert!(reason.contains("caused by ODB-0092: unknown library cell referenced (BUF) for instance (u1)"), "{reason}");
     assert!(reason.contains("a LEF defining that cell was not read"), "{reason}");
 }
+
+/// The tiny technology with `extra` added inside layer `layer`.
+fn tiny_lef_with(name: &str, layer: &str, extra: &str) -> PathBuf {
+    let lef = std::fs::read_to_string(data("tiny.lef")).unwrap();
+    let end = format!("END {layer}\n");
+    let at = lef.find(&end).unwrap();
+    let path = tmp(name);
+    std::fs::write(&path, format!("{}{extra}{}", &lef[..at], &lef[at..])).unwrap();
+    path
+}
+
+/// Rule (ours): a LEF58 end-of-line rule with TOCONCAVECORNER is SKIPPED with a warning — the
+/// run is not refused, the rule is not checked (the access points are the base technology's),
+/// and the report lists it in `skipped_rules`. The reference checks it as a plain end-of-line
+/// rule with WITHIN 0 (upstream OpenROAD issue #12174); that reading is not copied.
+#[test]
+fn a_to_concave_corner_rule_is_skipped_loudly_and_listed_in_the_report() {
+    let lef = tiny_lef_with("tcc.lef", "M1", "  PROPERTY LEF58_SPACING \"SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER MINADJACENTLENGTH 0.1 0.12 ;\" ;\n");
+    let out = tmp("tcc.odb");
+    let o = bin().args(["pin_access", "--lef", lef.to_str().unwrap(), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
+    assert_eq!(r["status"], "written");
+    assert_eq!(r["preferred_points"], 3, "the skipped rule changes nothing");
+    let s = r["skipped_rules"].as_array().expect("skipped_rules");
+    assert_eq!(s.len(), 1, "{r}");
+    assert_eq!((s[0]["layer"].as_str(), s[0]["clause"].as_str(), s[0]["checked"].as_bool()), (Some("M1"), Some("TOCONCAVECORNER"), Some(false)));
+    assert!(err.contains("[WARNING vyges-drt] layer M1: LEF58_SPACING end-of-line rule 0 uses TOCONCAVECORNER") && err.contains("#12174"), "{err}");
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Without a skipped rule the list is present and empty: absence never stands for "none".
+#[test]
+fn the_report_lists_no_skipped_rule_when_none_is_skipped() {
+    let out = tmp("tiny-skips.odb");
+    let o = bin().args(["pin_access", "--lef", &data("tiny.lef"), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
+    assert_eq!(r["skipped_rules"], serde_json::json!([]));
+    let _ = std::fs::remove_file(&out);
+}
+
+/// Every other refusal stands: a LEF58 end-of-line SAMEMASK rule still refuses the run.
+#[test]
+fn another_end_of_line_clause_is_still_refused() {
+    let lef = tiny_lef_with("eolsm.lef", "M1", "  PROPERTY LEF58_SPACING \"SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 SAMEMASK ;\" ;\n");
+    let out = tmp("eolsm.odb");
+    let o = bin().args(["pin_access", "--lef", lef.to_str().unwrap(), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
+    assert_eq!(o.status.code(), Some(3));
+    let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
+    assert_eq!(r["reason"], "not modelled: M1: lef58_spacing_eol (1, SAMEMASK)");
+    assert!(!out.exists());
+}

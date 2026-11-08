@@ -15,6 +15,9 @@ pub enum Line {
     Warn(u16, String),
     /// `logger_->report`: text with no prefix.
     Report(String),
+    /// A warning of this engine's OWN, with no reference code: it is not one of the reference's
+    /// lines and is never scored against its log (a rule skipped where the reference misreads it).
+    OwnWarn(String),
 }
 
 /// Where a stage writes its lines.
@@ -333,6 +336,7 @@ mod tests {
             Line::Info(i, t) => format!("I{i} {t}"),
             Line::Warn(i, t) => format!("W{i} {t}"),
             Line::Report(t) => format!("R {t}"),
+            Line::OwnWarn(t) => format!("V {t}"),
         }
     }
 

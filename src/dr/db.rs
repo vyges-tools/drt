@@ -101,6 +101,49 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
 }
 
 
+/// The upstream issue for the end-of-line forms [`skipped_rules`] lists.
+pub const SKIPPED_EOL_UPSTREAM_ISSUE: &str = "OpenROAD issue #12174";
+
+/// A rule the technology carries that routing neither checks nor refuses: it is SKIPPED, with a
+/// warning at tech load and an entry in the run's report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedRule {
+    pub layer: String,
+    /// The census family (`lef58_spacing_eol`).
+    pub family: &'static str,
+    /// The rule's index among the layer's rules of that family (from 0).
+    pub index: usize,
+    /// The clause that makes it skipped.
+    pub clause: &'static str,
+}
+
+impl SkippedRule {
+    /// The warning logged at tech load.
+    pub fn warning(&self) -> String {
+        format!(
+            "layer {}: LEF58_SPACING end-of-line rule {} uses {}, which this router does not model; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (the reference reads this form as a plain end-of-line rule with WITHIN 0, which is not followed here; see {}).",
+            self.layer, self.index, self.clause, SKIPPED_EOL_UPSTREAM_ISSUE
+        )
+    }
+}
+
+/// The rules routing skips with a warning instead of refusing, layer by layer in the
+/// technology's order: each LEF58 end-of-line rule with TOCONCAVECORNER or TONOTCHLENGTH
+/// ([`crate::tech::read::lef58_eol_skipped_clause`]). ⛔ Not enforced and not emulated: the
+/// reference checks these as a plain end-of-line rule with WITHIN 0 (upstream OpenROAD issue
+/// #12174), a reading we do not copy. Every other refusal of [`unmodelled_rules`] stands.
+pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
+    let mut out = Vec::new();
+    for l in tech.layers.iter().filter(|l| l.kind == LayerKind::Routing) {
+        for k in 0..db.num_layer_get_tech_layer_spacing_eol_rules(&l.name) {
+            if let Some(clause) = crate::tech::read::lef58_eol_skipped_clause(db, &l.name, k) {
+                out.push(SkippedRule { layer: l.name.clone(), family: "lef58_spacing_eol", index: k, clause });
+            }
+        }
+    }
+    out
+}
+
 
 /// A regular net's routing read from the database (`None` without a wire). Refused: a FIXED wire
 /// (the router then rips up incrementally in every iteration), a wire type other than ROUTED, a
@@ -455,4 +498,107 @@ fn port_stacks(db: &Db, tech: &Tech, tech_vias: usize, names: &[String], wires: 
 /// The gcell grid the routing used, written to the database (one uniform pattern per axis).
 pub fn write_gcell_grid(db: &mut Db, grid: &crate::dr::guides::GCellGrid) -> Result<(), String> {
     db.block_set_gcell_grid(grid.x, grid.y).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod skipped_rule_tests {
+    //! Rule (ours, not the reference's): a LEF58 end-of-line rule with TOCONCAVECORNER or
+    //! TONOTCHLENGTH is SKIPPED with a warning — not enforced, not emulated, not refused. The
+    //! reference's io never tests either branch and checks the rule as a plain end-of-line rule
+    //! with WITHIN 0 (MINADJACENTLENGTH dropped), flagging line ends that face straight edges
+    //! (upstream OpenROAD issue #12174). Copying that would transcribe a misreading, and the rule
+    //! as written has no oracle, so it is left to sign-off DRC. Every other refusal stands.
+    use super::{skipped_rules, unmodelled_rules};
+    use vyges_opendb::Db;
+
+    /// A synthetic two-metal technology; `m1` and `v1` are extra lines inside M1 and V1.
+    fn db(name: &str, m1: &str, v1: &str) -> Db {
+        let lef = format!(
+            "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\nMANUFACTURINGGRID 0.005 ;\n\
+             LAYER M1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\n{m1}END M1\n\
+             LAYER V1\n  TYPE CUT ;\n  SPACING 0.05 ;\n  WIDTH 0.04 ;\n  PROPERTY LEF58_CUTCLASS \"CUTCLASS CA WIDTH 0.04 ;\" ;\n{v1}END V1\n\
+             LAYER M2\n  TYPE ROUTING ;\n  DIRECTION VERTICAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\nEND M2\nEND LIBRARY\n"
+        );
+        let path = std::env::temp_dir().join(format!("vyges-drt-skipped-{}-{name}.lef", std::process::id()));
+        std::fs::write(&path, lef).expect("write lef");
+        let mut db = Db::new();
+        db.read_lef(path.to_str().expect("utf-8 path")).expect("read lef");
+        let _ = std::fs::remove_file(&path);
+        db
+    }
+
+    fn eol(rule: &str) -> String {
+        format!("  PROPERTY LEF58_SPACING \"{rule}\" ;\n")
+    }
+
+    /// (skipped, refused, M1's enforced LEF58 end-of-line rules) for a technology.
+    fn census(db: &Db) -> (Vec<super::SkippedRule>, Vec<String>, usize) {
+        let tech = crate::tech::read::tech(db).expect("tech");
+        let m1 = tech.layers.iter().find(|l| l.name == "M1").expect("M1").lef58_eol.len();
+        (skipped_rules(db, &tech), unmodelled_rules(db, &tech), m1)
+    }
+
+    #[test]
+    fn a_to_concave_corner_rule_is_skipped_with_a_warning_not_refused_and_not_checked() {
+        let d = db("tcc", &eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER MINADJACENTLENGTH 0.1 0.12 ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(enforced, 0, "not enforced: the reference's WITHIN-0 reading is not copied");
+        assert_eq!(skipped.len(), 1);
+        let s = &skipped[0];
+        assert_eq!((s.layer.as_str(), s.family, s.index, s.clause), ("M1", "lef58_spacing_eol", 0, "TOCONCAVECORNER"));
+        let w = s.warning();
+        for part in ["layer M1", "TOCONCAVECORNER", "NOT checked during routing", "sign-off DRC must cover it", "OpenROAD issue #12174"] {
+            assert!(w.contains(part), "{part}: {w}");
+        }
+    }
+
+    #[test]
+    fn a_to_notch_length_rule_is_skipped_too() {
+        let d = db("tnl", &eol("SPACING 0.09 ENDOFLINE 0.07 TONOTCHLENGTH 0.1 ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(enforced, 0);
+        assert_eq!(skipped.iter().map(|s| s.clause).collect::<Vec<_>>(), ["TONOTCHLENGTH"]);
+    }
+
+    /// The control: the same rule written as a plain end-of-line rule is checked, not skipped.
+    #[test]
+    fn a_plain_end_of_line_rule_is_checked_not_skipped() {
+        let d = db("w0", &eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0 ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        assert_eq!(enforced, 1);
+    }
+
+    /// The skip covers only its own rule: another rule on the layer keeps its own verdict (here a
+    /// SAMEMASK end-of-line rule, refused), and only the skipped rule's index is listed.
+    #[test]
+    fn another_refused_rule_on_the_layer_is_still_refused() {
+        let rules = format!("{}{}", eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 SAMEMASK ;"), eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER ;"));
+        let d = db("mixed", &rules, "");
+        let (skipped, refused, _) = census(&d);
+        assert_eq!(refused, ["M1: lef58_spacing_eol (2, SAMEMASK)"]);
+        assert_eq!(skipped.iter().map(|s| (s.index, s.clause)).collect::<Vec<_>>(), [(1, "TOCONCAVECORNER")]);
+    }
+
+    /// The cut-to-concave-corner form (a LEF58 cut spacing LAYER rule) is NOT skipped: the whole
+    /// LEF58 cut spacing family stays refused.
+    #[test]
+    fn the_cut_spacing_layer_concave_corner_form_stays_refused() {
+        let d = db("cc", "", &eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"));
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(refused, ["V1: lef58_cut_spacing (1)"]);
+    }
+
+    /// A rule the reference drops itself (FILLCONCAVECORNER, with its own warning) is the
+    /// reference's skip, not one of ours.
+    #[test]
+    fn a_rule_the_reference_drops_is_not_listed_as_ours() {
+        let d = db("fcc", &eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 FILLCONCAVECORNER 0.05 ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        assert_eq!(enforced, 0);
+    }
 }
