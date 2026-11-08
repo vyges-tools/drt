@@ -441,6 +441,16 @@ pub fn net_terminals(insts: &[DesignInst], masters: &HashMap<String, Master>, po
     out
 }
 
+/// `frPin::hasPinAccess`: the pin carries a pin-access entry — one per unique class of its master,
+/// made for every pin of every terminal whether or not access points are found for it. So a pin
+/// with NO access point still has pin access, and still advances the worker's and track
+/// assignment's chosen-point counter. (Witnessed by upstream's pa_above_top_layer: an output pin
+/// whose only shape is on a cut layer ends with no access point, and the pins after it keep their
+/// chosen points.)
+pub fn pin_has_pin_access(class_aps: &[Vec<Vec<Vec<AccessPoint>>>], same_master: &[usize], t: usize, pi: usize) -> bool {
+    same_master.iter().any(|&c| class_aps[c].get(t).and_then(|x| x.get(pi)).is_some())
+}
+
 pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
     let (masters, insts, ports, pa, design) = (&d.masters, &d.insts, &d.ports, &d.pa, &d.design);
     let inst_index: HashMap<&str, usize> = insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
@@ -499,7 +509,7 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
                     let mut ta_pins = Vec::new();
                     let mut dr_pins = Vec::new();
                     for pi in 0..m.terms[t].pins.len() {
-                        let has = same_master.iter().any(|&c| pa.class_aps[c].get(t).and_then(|x| x.get(pi)).is_some_and(|a| !a.is_empty()));
+                        let has = pin_has_pin_access(&pa.class_aps, &same_master, t, pi);
                         let first = pa.class_aps[c0].get(t).and_then(|x| x.get(pi)).and_then(|a| a.first()).map(|a| ((a.point.0 - rep0.unique.location.0 + loc.0, a.point.1 - rep0.unique.location.1 + loc.1), a.layer));
                         let pref = prefs.get(pi).copied().flatten().map(|(q, l)| ((q.0 + loc.0, q.1 + loc.1), l));
                         ta_pins.push((has, pref, first));
@@ -1065,6 +1075,17 @@ mod tests {
     use super::*;
     use crate::pa::unique::UniqueInst;
     use crate::tech::{MasterPin, MasterTerm, Transform};
+
+    /// Rule (`frPin::hasPinAccess`): a pin of a master with a unique class has pin access even with
+    /// no access point; a pin index past the class's entries, or a master with no class, does not.
+    #[test]
+    fn a_pin_without_access_points_still_has_pin_access() {
+        let class_aps: Vec<Vec<Vec<Vec<AccessPoint>>>> = vec![vec![vec![Vec::new(), Vec::new()]]];
+        assert!(pin_has_pin_access(&class_aps, &[0], 0, 0));
+        assert!(pin_has_pin_access(&class_aps, &[0], 0, 1));
+        assert!(!pin_has_pin_access(&class_aps, &[0], 0, 2));
+        assert!(!pin_has_pin_access(&class_aps, &[], 0, 0));
+    }
 
     // Upstream rule (FlexDRWorker::initNets_searchRepair_pin2epMap, initNets_segmentTerms): the
     // terminals at a route's ends come from the design's region query, which holds EVERY
