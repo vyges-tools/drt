@@ -817,7 +817,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     let tech = &p.tech;
     let term_shape_at = |k: usize, pt: (i32, i32), l: usize| cx.term_shapes(&t.term_fixed[k]).iter().any(|&(tl, r)| tl == l && r.xl <= pt.0 && pt.0 <= r.xh && r.yl <= pt.1 && pt.1 <= r.yh);
     let term_at = |pt: (i32, i32), l: usize, net: usize| -> Vec<usize> { (0..t.dr_terms.len()).filter(|&k| t.dr_terms[k].net == Some(net) && term_shape_at(k, pt, l)).collect() };
-    let dinp = DrNetInput { grid: &cx.g.grid, guides: &cx.guide_trees, gr_pins: &cx.gr_tree, terms: &t.dr_terms, min_area: &cx.min_area, routes: Some((tech, routes)), term_at: Some(&term_at) };
+    let dinp = DrNetInput { grid: &cx.g.grid, guides: &cx.guide_trees, gr_pins: &cx.gr_tree, terms: &t.dr_terms, min_area: &cx.min_area, routes: Some((tech, routes)), term_at: Some(&term_at), top_routing_layer: d.cfg.top_routing_layer };
     let wm = worker_markers(routes.markers_in(&w.drc), iter);
     let built = if wm.skipped(iter) {
         Vec::new()

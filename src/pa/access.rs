@@ -31,8 +31,10 @@
 //!   counting one per cluster of same-layer points within half a width, reach the minimum;
 //! - a point's vias are ordered by the most they stick out of the pin, least first (stable).
 //!
-//! Not transcribed (a caller gets [`Unsupported`]): a nearby-track round (its points carry path
-//! segments). Taken as absent because the technologies here do not have them: the metal-width via
+//! Not transcribed (a caller gets [`Unsupported`]): a nearby-track point (it carries path
+//! segments). A nearby-track round that makes no point runs as any other round: a pin with no
+//! shape the earlier rounds can use (one only on a cut layer, or, for an instance's pin, only
+//! above the top routing layer) reaches it and ends with no access point. Taken as absent because the technologies here do not have them: the metal-width via
 //! map, multi-mask layers (refused before this runs), right-way-on-grid-only layers, stubborn
 //! terminals. A rect-only layer is unidirectional: no wrong-way planar access on it and no
 //! wrong-way segment leaving a via onto it.
@@ -179,10 +181,7 @@ pub fn gen_pin_access(pin: &Pin<'_>, shapes: &[(usize, Rect)], trace: &mut Trace
             if enough {
                 break;
             }
-            if upper == ApType::NearbyGrid {
-                return Err(Unsupported("a nearby-track round"));
-            }
-            enough = gen_pin_access_cost_bounded(pin, &mut sh, &mut aps, &mut apset, lower, upper, trace);
+            enough = gen_pin_access_cost_bounded(pin, &mut sh, &mut aps, &mut apset, lower, upper, trace)?;
         }
     }
     for ap in &mut aps {
@@ -202,9 +201,13 @@ pub fn sort_via_defs(pin: &Pin<'_>, ap: &mut AccessPoint, pin_rects: &[Rect]) ->
 }
 
 /// One round: candidates, their filters, the points kept; whether enough are kept now.
+/// Errors on a nearby-track point (not transcribed).
 #[allow(clippy::too_many_arguments)]
-fn gen_pin_access_cost_bounded(pin: &Pin<'_>, sh: &mut Shapes, aps: &mut Vec<AccessPoint>, apset: &mut BTreeSet<((i32, i32), usize)>, lower: ApType, upper: ApType, trace: &mut Trace) -> bool {
-    let cands = round_candidates(pin.cx, &mut sh.sets, pin.kind, lower, upper, apset);
+fn gen_pin_access_cost_bounded(pin: &Pin<'_>, sh: &mut Shapes, aps: &mut Vec<AccessPoint>, apset: &mut BTreeSet<((i32, i32), usize)>, lower: ApType, upper: ApType, trace: &mut Trace) -> Result<bool, Unsupported> {
+    let cands = round_candidates(pin.cx, &mut sh.sets, pin.kind, pin.cfg.top_routing_layer, lower, upper, apset);
+    if !cands.is_empty() && (lower == ApType::NearbyGrid || upper == ApType::NearbyGrid) {
+        return Err(Unsupported("a nearby-track point"));
+    }
     push(trace, || Event::Round { lower, upper });
     for c in &cands {
         push(trace, || Event::Cand { point: (c.x, c.y), layer: c.layer, lower: c.lower, upper: c.upper });
@@ -229,7 +232,7 @@ fn gen_pin_access_cost_bounded(pin: &Pin<'_>, sh: &mut Shapes, aps: &mut Vec<Acc
     }
     let enough = enough_access_points(pin, aps);
     push(trace, || Event::Enough { enough, kept: aps.len() });
-    enough
+    Ok(enough)
 }
 
 fn in_via_in_pin(cfg: &Config, layer: usize) -> bool {
@@ -572,6 +575,26 @@ mod tests {
         let v2 = ViaDef { name: "v2".into(), ..t.via_defs[0].clone() };
         t.via_defs.push(v2);
         assert_eq!(crate::pa::candidates::via_priority(&t)[&3], vec![1]);
+    }
+
+    /// Rule: a pin no earlier round can use reaches the nearby-track rounds; when they make no
+    /// point either, the pin ends with no access point (not a refusal). Witnessed by upstream's
+    /// pa_above_top_layer (a8d25bb0e6): a cell pin whose only shape is on a cut layer, and one
+    /// whose only shape lies above the top routing layer (here l4 with the top at l2).
+    #[test]
+    fn a_pin_no_round_can_use_ends_with_no_access_point() {
+        let t = tech();
+        let cx = Context::new(&t, &[]);
+        let (c, owner) = (cfg(true), Owner::Net("n".into()));
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let mut trace = Some(Vec::new());
+        let got = gen_pin_access(&pin, &[(3, Rect::new(-85, -85, 85, 85))], &mut trace);
+        assert_eq!(got, Ok(vec![]));
+        let rounds = trace.unwrap().iter().filter(|e| matches!(e, Event::Round { upper: ApType::NearbyGrid, .. })).count();
+        assert_eq!(rounds, 4);
+        let low = Config { top_routing_layer: 2, ..cfg(true) };
+        let pin2 = Pin { cfg: &low, ..pin };
+        assert_eq!(gen_pin_access(&pin2, &[(4, Rect::new(-2000, -2000, 2000, 2000))], &mut None), Ok(vec![]));
     }
 
     /// Retrying tries EVERY via, but still keeps at most two.

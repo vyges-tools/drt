@@ -14,7 +14,10 @@
 //! - a coordinate keeps the FIRST class that produced it, except that centre and enclosed-boundary
 //!   lower an existing class to themselves (the smaller wins);
 //! - a candidate outside its rectangle is dropped (unless a nearby-track round), as is a point
-//!   and layer already made by an earlier rectangle or round — the first one made stays.
+//!   and layer already made by an earlier rectangle or round — the first one made stays;
+//! - an instance's pin (standard cell or block, not a top-level port) makes no candidate on a layer
+//!   above the top routing layer: the layer walk stops there, since the detailed-route grid ends at
+//!   the top routing layer and such a point could never be reached.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,11 +166,14 @@ pub fn merge_pin_shapes(tech: &Tech, shapes: &[(usize, Rect)]) -> Vec<Polygon90S
     sets
 }
 
-/// One cost round over every layer the pin has shapes on; `apset` carries the points already made
-/// (across rounds).
-pub fn round_candidates(cx: &Context<'_>, pin: &mut [Polygon90Set], kind: TermKind, lower: ApType, upper: ApType, apset: &mut BTreeSet<((i32, i32), usize)>) -> Vec<Candidate> {
+/// One cost round over every layer the pin has shapes on, up to the top routing layer for an
+/// instance's pin; `apset` carries the points already made (across rounds).
+pub fn round_candidates(cx: &Context<'_>, pin: &mut [Polygon90Set], kind: TermKind, top_routing_layer: usize, lower: ApType, upper: ApType, apset: &mut BTreeSet<((i32, i32), usize)>) -> Vec<Candidate> {
     let mut out = Vec::new();
     for (layer, set) in pin.iter_mut().enumerate() {
+        if kind != TermKind::Io && layer > top_routing_layer {
+            break;
+        }
         if set.is_empty() || cx.tech.layers[layer].kind != LayerKind::Routing {
             continue;
         }
@@ -434,6 +440,24 @@ mod tests {
         t.layers[4].right_way_on_grid_only = true;
         let (_, ys) = coords_from_rect(&Context::new(&t, &[]), rect, 4, ApType::OnGrid, ApType::OnGrid, true);
         assert!(ys.is_empty());
+    }
+
+    /// Rule (upstream a8d25bb0e6, the pin access layer walk): an instance's pin makes no candidate
+    /// above the top routing layer — the walk over the pin's layers stops past it; a top-level
+    /// port is not limited. Here li1 (2) and met2 (6) shapes, top routing layer met1 (4).
+    #[test]
+    fn an_instance_pin_makes_no_candidate_above_the_top_routing_layer() {
+        let t = tech(vec![]);
+        let cx = Context::new(&t, &[]);
+        let shapes = [(2, Rect::new(0, 0, 400, 1000)), (6, Rect::new(0, 0, 400, 1000))];
+        let layers = |kind| {
+            let mut sets = merge_pin_shapes(&t, &shapes);
+            let got = round_candidates(&cx, &mut sets, kind, 4, ApType::Center, ApType::Center, &mut BTreeSet::new());
+            got.iter().map(|c| c.layer).collect::<BTreeSet<_>>()
+        };
+        assert_eq!(layers(TermKind::StdCell), BTreeSet::from([2]));
+        assert_eq!(layers(TermKind::Macro), BTreeSet::from([2]));
+        assert_eq!(layers(TermKind::Io), BTreeSet::from([2, 6]));
     }
 
     /// Rule (nearby-track rounds): the point recorded as made is the path's first bend when the
