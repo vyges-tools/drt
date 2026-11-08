@@ -137,6 +137,15 @@ pub struct MinCut {
     pub length: Option<(i32, i32)>,
 }
 
+impl MinCut {
+    /// Whether a rule asking for `num_cuts` cuts is imported: only one asking for two or more.
+    /// Every via has at least one cut, so a one-cut rule can only add markers (upstream
+    /// 263dba46d0).
+    pub fn applies(num_cuts: i32) -> bool {
+        num_cuts > 1
+    }
+}
+
 /// An end-of-line spacing rule: a line end narrower than `width` needs `space` to a facing edge
 /// within `within` beyond its sides; with a parallel edge, only when a parallel edge lies within
 /// `par_space` of a side (on both sides with `two_edges`), up to `par_within` behind the end.
@@ -810,9 +819,11 @@ pub mod read {
                         }
                         MinStep { min_step_length: db.layer_get_min_step(&name) as i32, kind, max_length, max_edges }
                     });
-                    // io: a rule without a minimum-cuts value is skipped; BELOW ONLY overrides ABOVE.
+                    // io: a rule without a minimum-cuts value is skipped, and so is one asking for a
+                    // single cut ([`MinCut::applies`]); BELOW ONLY overrides ABOVE.
                     let min_cuts: Vec<MinCut> = (0..db.num_layer_get_min_cut_rules(&name))
                         .filter(|&k| db.v54mincutrule_get_minimum_cuts_valid(&name, k))
+                        .filter(|&k| MinCut::applies(db.v54mincutrule_get_minimum_cuts_numcuts(&name, k) as i32))
                         .map(|k| {
                             let mut from_above = None;
                             if db.v54mincutrule_is_above_only(&name, k) {
@@ -962,6 +973,15 @@ mod tests {
 
     fn term(name: &str, pins: Vec<Vec<(usize, Rect)>>) -> MasterTerm {
         MasterTerm { name: name.into(), sig: "SIGNAL".into(), pins: pins.into_iter().map(|shapes| MasterPin { shapes }).collect() }
+    }
+
+    /// Rule (upstream 263dba46d0, `io::Parser::addRoutingLayer`): a MINIMUMCUT rule asking for a
+    /// single cut is not imported; two or more is.
+    #[test]
+    fn a_single_cut_minimum_cut_rule_is_not_imported() {
+        assert!(!MinCut::applies(0));
+        assert!(!MinCut::applies(1));
+        assert!(MinCut::applies(2));
     }
 
     /// A cut obstruction touching ONE pin's shapes on the layer above becomes that pin's shape.
