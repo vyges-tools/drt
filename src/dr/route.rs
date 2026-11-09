@@ -763,7 +763,7 @@ mod near_drc_tests {
         DrFig::Seg { layer: 2, begin: (x, 0), end: (x, 1000), width: 100, begin_ext: 0, end_ext: 0, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false }
     }
     fn marker(b: Rect, owners: &[&str]) -> Marker {
-        Marker { rule: Rule::Short, layer: 2, bbox: b, owners: owners.iter().map(|n| Owner::Net(n.to_string())).collect(), victim: None, aggressor: None }
+        Marker { rule: Rule::Short, layer: 2, bbox: b, owners: owners.iter().map(|n| Owner::Net(n.to_string())).collect(), victim: None, aggressor: None, second_victim: None }
     }
 
     // Rule (`getRipUpNetsFromMarker`): a net with a shape on the marker's layer inside the marker

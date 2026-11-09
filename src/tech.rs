@@ -111,6 +111,9 @@ pub struct Layer {
     pub spacing_ranges: Vec<SpacingRange>,
     /// A routing layer's LEF58_AREA rules as io keeps them, in io's two lists.
     pub lef58_area: Lef58Area,
+    /// A cut layer's SPACINGTABLE ORTHOGONAL rows, (WITHIN, SPACING) in the technology's order
+    /// (`frOrthSpacingTableConstraint`, io keeps the database's table as it is).
+    pub orth_spacing: Vec<(i32, i32)>,
 }
 
 /// A LEF58_AREA rule io keeps on a routing layer (`frLef58AreaConstraint`): the forms it skips
@@ -1382,7 +1385,7 @@ pub mod read {
                         })
                         .collect();
                     let lef58_area = lef58_area_rules(db, &name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges, lef58_area });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges, lef58_area, orth_spacing: vec![] });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1425,7 +1428,8 @@ pub mod read {
                     if !rules.is_empty() {
                         layer_rules_by_name.push((layers.len(), rules));
                     }
-                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_table_same_net, cut_enclosures, ..Layer::default() });
+                    let orth_spacing = read::orth_spacing_table(db, &name);
+                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_table_same_net, cut_enclosures, orth_spacing, ..Layer::default() });
                 }
                 _ => {}
             }
@@ -1501,6 +1505,15 @@ pub mod read {
     /// keeps its count of 0 and is dropped by [`MinCut::applies`], so no LEF reaches this refusal.
     pub fn lef58_min_cut_refusal(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
         db.mincutrule_is_per_cut_class(layer, k).then_some("PERCUTCLASS")
+    }
+
+    /// A cut layer's SPACINGTABLE ORTHOGONAL as io reads it (`getOrthSpacingTable`): its
+    /// (WITHIN, SPACING) rows in the database's order, none without a table.
+    pub fn orth_spacing_table(db: &Db, layer: &str) -> Vec<(i32, i32)> {
+        if !db.layer_has_orth_spacing_table(layer) {
+            return Vec::new();
+        }
+        db.layer_get_orth_spacing_table(layer).as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect()
     }
 
     /// The clause that makes a LEF58_AREA rule SKIPPED with a warning: io

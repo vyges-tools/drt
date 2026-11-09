@@ -32,7 +32,8 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         // Families the reference's io translates that the database census does not list, counted
         // here from the generated accessors — only the rules io KEEPS (it drops the rest with a
         // warning, and sky130's cut layers carry two LEF58 enclosure rules without a CUTCLASS that
-        // it drops that way) — and refused (none is modelled).
+        // it drops that way) — and refused (none is modelled). SPACINGTABLE ORTHOGONAL is
+        // modelled (the check, its only consumer) and no longer listed here.
         let name = l.name.as_str();
         let kept = |n: usize, keeps: &dyn Fn(usize) -> bool| (0..n).filter(|&k| keeps(k)).count();
         let untracked = [
@@ -40,7 +41,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             ("lef58_two_wires_forbidden_spacing", db.num_layer_get_tech_layer_two_wires_forbidden_spc_rules(name)),
             ("lef58_width_table_orthogonal", kept(db.num_layer_get_tech_layer_width_table_rules(name), &|k| db.widthtablerule_is_orthogonal(name, k))),
             ("lef58_wrong_dir_spacing", kept(db.num_layer_get_tech_layer_wrong_dir_spacing_rules(name), &|k| !db.wrongdirspacingrule_is_length_valid(name, k) && db.wrongdirspacingrule_get_prl_length(name, k) >= 0)),
-            ("orthogonal_spacing_table", usize::from(db.layer_has_orth_spacing_table(name))),
         ];
         for (family, n) in untracked {
             if n > 0 {
@@ -437,7 +437,7 @@ pub fn set_markers(db: &Db, tech: &Tech) -> Result<Vec<Marker>, String> {
         owners.sort();
         owners.dedup();
         let [xl, yl, xh, yh] = m.rect;
-        out.push(Marker { rule, layer, bbox: Rect { xl, yl, xh, yh }, owners, victim: None, aggressor: None });
+        out.push(Marker { rule, layer, bbox: Rect { xl, yl, xh, yh }, owners, victim: None, aggressor: None, second_victim: None });
     }
     Ok(out)
 }
@@ -914,6 +914,20 @@ mod skipped_rule_tests {
         assert_eq!(tech.layers[m1].mt_safe_dist, 2500);
         assert_eq!(crate::dr::drw::mt_safe_dist(&tech, &[]), 2500);
         assert_eq!(tech.layers[tech.layer_num("M2").expect("M2")].min_cuts, []);
+    }
+
+    /// Rule (reference io `setCutLayerProperties`' caller, `hasOrthSpacingTable`): a cut layer's
+    /// SPACINGTABLE ORTHOGONAL is kept whole, its (WITHIN, SPACING) rows in the technology's order
+    /// (`frOrthSpacingTableConstraint`); MODELLED (the check is its only consumer), nothing
+    /// refused or skipped.
+    #[test]
+    fn an_orthogonal_spacing_table_is_kept_row_by_row() {
+        let d = db("orth", "", "  SPACINGTABLE ORTHOGONAL WITHIN 0.06 SPACING 0.04 WITHIN 0.10 SPACING 0.07 ;\n");
+        let (skipped, refused, _) = census(&d);
+        assert!(refused.is_empty() && skipped.is_empty(), "{refused:?} {skipped:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        assert_eq!(tech.layers[tech.layer_num("V1").expect("V1")].orth_spacing, [(60, 40), (100, 70)]);
+        assert!(tech.layers[tech.layer_num("M1").expect("M1")].orth_spacing.is_empty());
     }
 
     /// Rule (reference io `setRoutingLayerProperties`, its LEF58_AREA loop): a rule with

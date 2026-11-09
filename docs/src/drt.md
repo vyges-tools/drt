@@ -133,7 +133,10 @@ net in them, upstream OpenROAD issue #12188; every other LEF58 cut spacing form 
 `LEF58_AREA` on a routing layer (`AREA a` with `RECTWIDTH w` or `EXCEPTRECTANGLE`: checked, and
 patched on the routed net as the reference patches it; a rule with `EXCEPTMINWIDTH`,
 `EXCEPTEDGELENGTH`, `EXCEPTMINSIZE`, `EXCEPTSTEP`, `MASK` or `LAYER` is skipped with a warning, as
-the reference skips it). A cell obstruction with its own `DESIGNRULEWIDTH`
+the reference skips it), and the orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
+WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
+and closer than `s` across that run, is marked; the marker names the pair as its victims with the
+boxes the reference gives them, which the router reads when it picks the nets to rip up). A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the

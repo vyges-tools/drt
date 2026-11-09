@@ -792,11 +792,15 @@ fn update_queue(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], by_nam
     queue.extend(checks);
 }
 
+/// `route_queue_update_from_marker`'s first test: a marker off the route box counts when a
+/// side's shape reaches it — the aggressor, then every victim (a copied marker has none).
+fn marker_reaches_route_box(m: &Marker, rb: &Rect) -> bool {
+    touches(&m.bbox, rb) || m.aggressor.as_ref().is_some_and(|a| touches(&a.2, rb)) || m.victim.as_ref().is_some_and(|v| touches(&v.2, rb)) || m.second_victim.as_ref().is_some_and(|v| touches(&v.2, rb))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn update_from_marker(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], by_name: &HashMap<String, Vec<usize>>, m: &Marker, uv: &mut BTreeSet<(i32, String, i64)>, ua: &mut BTreeSet<(i32, String, i64)>, checks: &mut Vec<Entry>, routes: &mut Vec<Entry>, checking: &Option<Owner>) {
-    let rb = &q.route_box;
-    // A marker off the route box counts when a side's shape reaches it (a copied marker has none).
-    if !touches(&m.bbox, rb) && !m.aggressor.as_ref().is_some_and(|a| touches(&a.2, rb)) && !m.victim.as_ref().is_some_and(|v| touches(&v.2, rb)) {
+    if !marker_reaches_route_box(m, &q.route_box) {
         return;
     }
     let dr_nets = |o: &Owner| -> Vec<usize> {
@@ -1109,6 +1113,23 @@ mod tests {
         let got: Vec<i32> = sibling_metal(&tech, &state, &name, 0).into_iter().map(|(_, r)| r.xl).collect();
         assert_eq!(got, [200, 210, 300]);
         assert!(sibling_metal(&tech, &state, &name, 1).is_empty());
+    }
+
+    /// Rule (`route_queue_update_from_marker`, its first test): a marker whose box misses the
+    /// route box still counts when the aggressor's box or ANY victim's box reaches it
+    /// (`intersects`: touching counts) — the second victim too, which only SPACINGTABLE
+    /// ORTHOGONAL markers carry; a marker none of whose boxes reach it is skipped.
+    #[test]
+    fn a_marker_off_the_route_box_counts_when_any_side_reaches_it() {
+        let rb = Rect::new(0, 0, 1000, 1000);
+        let far = Rect::new(2000, 2000, 2040, 2040);
+        let side = |r: Rect| Some((Owner::Net("a".into()), 3, r, false));
+        let base = Marker { bbox: far, layer: 3, rule: Rule::SpacingTableOrth, owners: vec![], aggressor: side(far), victim: side(far), second_victim: side(far) };
+        assert!(!marker_reaches_route_box(&base, &rb), "every box off the route box");
+        assert!(marker_reaches_route_box(&Marker { bbox: Rect::new(1000, 0, 1040, 40), ..base.clone() }, &rb), "the box touches it");
+        assert!(marker_reaches_route_box(&Marker { aggressor: side(Rect::new(960, 960, 1000, 1000)), ..base.clone() }, &rb), "the aggressor");
+        assert!(marker_reaches_route_box(&Marker { victim: side(Rect::new(500, 500, 540, 540)), ..base.clone() }, &rb), "the first victim");
+        assert!(marker_reaches_route_box(&Marker { second_victim: side(Rect::new(500, 500, 540, 540)), ..base.clone() }, &rb), "the second victim");
     }
 
     // Rule: a marker adds 10, saturating at 255.

@@ -214,6 +214,7 @@ pub fn viol_name(rule: Rule) -> &'static str {
         Rule::MinArea => "Min Area",
         Rule::MinEnclosedArea => "Min Hole",
         Rule::Lef58Area(_) => "Lef58Area",
+        Rule::SpacingTableOrth => "SpacingTableOrth",
         Rule::Lef58EolKeepOut => "eolKeepOut",
         Rule::Lef58SpacingEndOfLine => "EOL",
         Rule::CornerSpacing => "Corner Spacing",

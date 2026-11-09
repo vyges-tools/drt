@@ -492,7 +492,7 @@ pub fn apply_check_ops(d: &mut DesignRoutes, tech: &Tech, net: usize, name: &str
             }
             Op::Marker(l, r) => {
                 let o = Owner::Net(name.to_string());
-                d.add_marker(Marker { rule: Rule::Recheck, layer: *l, bbox: *r, owners: vec![o.clone()], victim: Some((o.clone(), *l, *r, false)), aggressor: Some((o, *l, *r, false)) });
+                d.add_marker(Marker { rule: Rule::Recheck, layer: *l, bbox: *r, owners: vec![o.clone()], victim: Some((o.clone(), *l, *r, false)), aggressor: Some((o, *l, *r, false)), second_victim: None });
             }
         }
     }

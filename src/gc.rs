@@ -98,6 +98,9 @@ pub enum Rule {
     /// (`checkMetalShape_lef58Area`, the marker pass); the rule's place among the layer's
     /// LEF58_AREA rules (the reference keeps a marker once per constraint).
     Lef58Area(u16),
+    /// A third cut in the region a SPACINGTABLE ORTHOGONAL row keeps clear beside a pair of cuts
+    /// (`checkCutSpacingTableOrthogonal`; one constraint per layer).
+    SpacingTableOrth,
     /// Other metal inside a LEF58 end-of-line keep-out box (`checkMetalEOLkeepout_main`).
     Lef58EolKeepOut,
     /// A line end closer than a LEF58 end-of-line spacing rule allows (`checkMetalEndOfLine_eol`
@@ -148,6 +151,9 @@ pub struct Marker {
     /// worker's starting markers are copies).
     pub victim: Option<Side>,
     pub aggressor: Option<Side>,
+    /// A second victim, for a check that names two (`checkCutSpacingTableOrthogonal_helper`:
+    /// the pair; the third cut is the aggressor).
+    pub second_victim: Option<Side>,
 }
 
 /// The markers' final order: each run of consecutive markers alike in layer, rule, x extent and
@@ -267,7 +273,7 @@ pub type Side = (Owner, usize, Rect, bool);
 impl Marker {
     /// A copy as the design and a worker's starting list hold it: its sources, not its sides.
     pub fn copied(&self) -> Marker {
-        Marker { victim: None, aggressor: None, ..self.clone() }
+        Marker { victim: None, aggressor: None, second_victim: None, ..self.clone() }
     }
 }
 
@@ -639,6 +645,20 @@ fn eol_keepout_except_rects(e: &Seg, ko: &EolKeepOut) -> (Rect, Rect) {
         EdgeDir::E => (r(lo.0 - wh, lo.1 - f, lo.0 - wl, lo.1 + b), r(hi.0 + wl, hi.1 - f, hi.0 + wh, hi.1 + b)),
         EdgeDir::W => (r(lo.0 + wl, lo.1 - b, lo.0 + wh, lo.1 + f), r(hi.0 - wh, hi.1 - b, hi.0 - wl, hi.1 + f)),
     }
+}
+
+/// `getRectsPrl`: per axis the extent of `generalized_intersect` — the overlap where the two
+/// rectangles overlap on that axis, negated where they are apart on it (a touch is 0).
+fn rects_prl(a: &Rect, b: &Rect) -> (i32, i32) {
+    let m = generalized_intersect(a, b);
+    let (mut x, mut y) = (m.xh - m.xl, m.yh - m.yl);
+    if gap((a.xl, a.xh), (b.xl, b.xh)) != 0 {
+        x = -x;
+    }
+    if gap((a.yl, a.yh), (b.yl, b.yh)) != 0 {
+        y = -y;
+    }
+    (x, y)
 }
 
 fn generalized_intersect(a: &Rect, b: &Rect) -> Rect {
@@ -1168,7 +1188,7 @@ impl<'a> Worker<'a> {
             if self.seen.insert((b, layer, Rule::MinimumCut, owners.clone())) {
                 let victim = (self.owner(r.net).clone(), layer, r.rect, r.fixed);
                 let aggressor = (self.owner(via.net).clone(), vl, via.rect, via.fixed);
-                self.markers.push(Marker { rule: Rule::MinimumCut, layer, bbox: b, owners, victim: Some(victim), aggressor: Some(aggressor) });
+                self.markers.push(Marker { rule: Rule::MinimumCut, layer, bbox: b, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
             }
         }
     }
@@ -1206,7 +1226,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, layer, rule, owners.clone())) {
             let victim = (self.owner(v.0).clone(), layer, v.1, v.2);
             let aggressor = (self.owner(g.0).clone(), layer, g.1, g.2);
-            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
+            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
         }
     }
 
@@ -1219,7 +1239,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, v.1, rule, owners.clone())) {
             let victim = (self.owner(v.0).clone(), v.1, v.2, v.3);
             let aggressor = (self.owner(g.0).clone(), g.1, g.2, g.3);
-            self.markers.push(Marker { rule, layer: v.1, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
+            self.markers.push(Marker { rule, layer: v.1, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
         }
     }
 
@@ -2389,7 +2409,7 @@ impl<'a> Worker<'a> {
             // `checkCutSpacing_main` reads the default inter-layer table of the layer two above too,
             // while that layer is below the top routing layer.
             let above = (layer + 2 < self.top_routing_layer && layer + 2 < self.tech.layers.len()).then(|| self.tech.layers[layer + 2].cut_table_inter.clone()).flatten();
-            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_table_inter.is_none() && above.is_none() && l.cut_enclosures.is_empty() && l.lef58_cut_spacing.is_empty()) {
+            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_table_inter.is_none() && above.is_none() && l.cut_enclosures.is_empty() && l.lef58_cut_spacing.is_empty() && l.orth_spacing.is_empty()) {
                 continue;
             }
             let (table, same_net, inter) = (l.cut_table.clone(), l.cut_table_same_net.clone(), l.cut_table_inter.clone());
@@ -2401,7 +2421,8 @@ impl<'a> Worker<'a> {
                 // `checkCutSpacing_main(rect)`: per cut, the plain rule, then the LEF58 rules
                 // (the different-net list; no same-net rule is modelled, so none skips a
                 // different net), then the LEF58 tables: SAMENET, then different-net, then the
-                // default inter-layer table of this layer, then that of the layer two above.
+                // default inter-layer table of this layer, then that of the layer two above,
+                // then SPACINGTABLE ORTHOGONAL; then (`checkCutSpacing`) the LEF58 enclosure.
                 for k in mine {
                     if let Some(spc) = self.tech.layers[layer].cut_spacing {
                         let q = bloat(&self.shapes[layer][k].rect, spc);
@@ -2424,8 +2445,73 @@ impl<'a> Worker<'a> {
                     if let Some(t) = &above {
                         self.cut_spacing_table(layer, k, &t.table, CutTableKind::Inter { table_layer: layer + 2, second: t.second_layer, no_stack: t.no_stack });
                     }
+                    self.cut_spacing_table_orthogonal(layer, k);
                     self.lef58_enclosure(layer, k);
                 }
+            }
+        }
+    }
+
+    /// `checkCutSpacingTableOrthogonal(rect)`: per (WITHIN, SPACING) row in order, every maximal
+    /// rectangle (any owner, the cut itself aside) touching the cut grown by WITHIN, in the
+    /// tree's order, is paired with it by [`Self::cut_spacing_table_orthogonal_helper`].
+    fn cut_spacing_table_orthogonal(&mut self, layer: usize, k: usize) {
+        let rows = self.tech.layers[layer].orth_spacing.clone();
+        for (within, spacing) in rows {
+            let q = bloat(&self.shapes[layer][k].rect, within);
+            for o in self.query(layer, &q) {
+                if o != k {
+                    self.cut_spacing_table_orthogonal_helper(layer, k, o, spacing);
+                }
+            }
+        }
+    }
+
+    /// `checkCutSpacingTableOrthogonal_helper(rect1, rect2, spacing)`: a pair that runs parallel
+    /// on exactly ONE axis (`getRectsPrl`: no run on either, or a run on both, exits). The gap
+    /// between them (`generalized_intersect`) and both cuts, each grown ACROSS the run by the
+    /// spacing (along x when they overlap in x), make a region; its maximal rectangles are queried
+    /// in order, every result in the tree's order (one cut may come back from several). A third
+    /// cut, not all three fixed, whose interior meets a query rectangle marks: the box between
+    /// the gap and the third cut, aggressor the third cut, victims the pair, sources all three.
+    /// Upstream rule: each victim's box takes its RIGHT edge for its top (`ury = gtl::xh(...)`),
+    /// an odb box then normalised; copied as written.
+    fn cut_spacing_table_orthogonal_helper(&mut self, layer: usize, k1: usize, k2: usize, spacing: i32) {
+        let (s1, s2) = (self.shapes[layer][k1], self.shapes[layer][k2]);
+        let (r1, r2) = (s1.rect, s2.rect);
+        let (prl_x, prl_y) = rects_prl(&r1, &r2);
+        if prl_x.max(prl_y) <= 0 || prl_x.min(prl_y) > 0 {
+            return;
+        }
+        let prl_rect = generalized_intersect(&r1, &r2);
+        let across_x = prl_x > 0;
+        let grow = |r: &Rect| if across_x { Rect { xl: r.xl - spacing, xh: r.xh + spacing, ..*r } } else { Rect { yl: r.yl - spacing, yh: r.yh + spacing, ..*r } };
+        let mut set = Polygon90Set::new();
+        for r in [grow(&prl_rect), grow(&r1), grow(&r2)] {
+            set.insert_rect(r);
+        }
+        let query_rects = set.max_rectangles();
+        let results: Vec<usize> = query_rects.iter().flat_map(|q| self.query(layer, q)).collect();
+        for o in results {
+            if o == k1 || o == k2 {
+                continue;
+            }
+            let s3 = self.shapes[layer][o];
+            if s1.fixed && s2.fixed && s3.fixed {
+                continue;
+            }
+            if !query_rects.iter().any(|q| strictly_intersects(q, &s3.rect)) {
+                continue;
+            }
+            let bbox = generalized_intersect(&prl_rect, &s3.rect);
+            let mut owners = vec![self.owner(s3.net).clone(), self.owner(s1.net).clone(), self.owner(s2.net).clone()];
+            owners.sort();
+            owners.dedup();
+            if self.seen.insert((bbox, layer, Rule::SpacingTableOrth, owners.clone())) {
+                let side = |s: &Shape| (self.owner(s.net).clone(), layer, Rect::new(s.rect.xl, s.rect.yl, s.rect.xh, s.rect.xh), s.fixed);
+                let (victim, second_victim) = (side(&s1), side(&s2));
+                let aggressor = (self.owner(s3.net).clone(), layer, s3.rect, s3.fixed);
+                self.markers.push(Marker { rule: Rule::SpacingTableOrth, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: Some(second_victim) });
             }
         }
     }
@@ -2644,7 +2730,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, layer, rule, owners.clone())) {
             let victim = (self.owner(cut.net).clone(), layer, cut.rect, cut.fixed);
             let aggressor = (self.owner(metal.net).clone(), sl, Rect::new(c.x, c.y, c.x, c.y), c.fixed);
-            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
+            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
         }
     }
 
@@ -2706,7 +2792,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((vr, el, Rule::Lef58Enclosure, owners.clone())) {
             let victim = (self.owner(v.net).clone(), layer, Rect::new(vr.xl, vr.yl, vr.xh, vr.xh), v.fixed);
             let aggressor = (self.owner(e.net).clone(), el, Rect::new(er.xl, er.yl, er.xh, er.xh), e.fixed);
-            self.markers.push(Marker { rule: Rule::Lef58Enclosure, layer: el, bbox: vr, owners, victim: Some(victim), aggressor: Some(aggressor) });
+            self.markers.push(Marker { rule: Rule::Lef58Enclosure, layer: el, bbox: vr, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
         }
     }
 
@@ -2959,7 +3045,7 @@ pub(crate) mod tests {
     fn marker_at(yl: i32, yh: i32, xh: i32) -> Marker {
         let o = Owner::Net("a".into());
         let r = Rect { xl: 0, yl, xh, yh };
-        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o, 4, r, false)) }
+        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o, 4, r, false)), second_victim: None }
     }
 
     /// Rule: a run of consecutive markers alike in layer, rule, x extent and owners is re-sorted by
@@ -2982,9 +3068,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default() },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default() },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -4035,7 +4121,7 @@ mod patch_tests {
     #[test]
     fn a_patch_stretches_the_markers_it_touches_to_its_origin() {
         let p = PatchWire { layer: 4, origin: (100, 50), offset: Rect::new(0, -10, 40, 10), owner: Owner::Net("a".into()) };
-        let m = |owner: &str, layer: usize, b: Rect| Marker { rule: Rule::CornerSpacing, layer, bbox: b, owners: vec![Owner::Net(owner.into())], victim: None, aggressor: None };
+        let m = |owner: &str, layer: usize, b: Rect| Marker { rule: Rule::CornerSpacing, layer, bbox: b, owners: vec![Owner::Net(owner.into())], victim: None, aggressor: None, second_victim: None };
         let mut ms = vec![m("a", 4, Rect::new(130, 40, 160, 60)), m("b", 4, Rect::new(130, 40, 160, 60)), m("a", 6, Rect::new(130, 40, 160, 60)), m("a", 4, Rect::new(90, 40, 160, 60)), m("a", 4, Rect::new(141, 40, 160, 60))];
         modify_markers(&mut ms, &[p]);
         let boxes: Vec<Rect> = ms.iter().map(|m| m.bbox).collect();
@@ -4694,5 +4780,129 @@ mod adjacent_cuts_tests {
         let e = AdjacentCuts { spacing: 70, center_to_center: false, within: 100, ..rule() };
         // B and C 70.7 apart edge to edge: not below 70; A-B and A-C 50.
         assert_eq!(run(vec![e], &tri(cut(1000, 1090))).len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod orth_spacing_tests {
+    //! SPACINGTABLE ORTHOGONAL on cut layer 3 of `tests::tech()` (no plain cut spacing). Cuts are
+    //! 40 squares centred at the points given; the table WITHIN 60 SPACING 60 unless a test says
+    //! otherwise (the witness `o1`, `o2` cases in the same coordinates).
+    use super::*;
+
+    fn cut(x: i32, y: i32) -> Rect {
+        Rect::new(x - 20, y - 20, x + 20, y + 20)
+    }
+
+    fn run(rows: Vec<(i32, i32)>, cuts: &[(&str, Rect, bool)]) -> Vec<Marker> {
+        let mut t = tests::tech();
+        t.layers[3].cut_spacing = None;
+        t.layers[3].orth_spacing = rows;
+        let mut w = Worker::new(&t);
+        for (o, r, f) in cuts {
+            w.add(&Owner::Net((*o).into()), 3, *r, *f);
+        }
+        w.init();
+        w.run().iter().filter(|m| m.rule == Rule::SpacingTableOrth).cloned().collect()
+    }
+
+    fn col(c: Rect) -> Vec<(&'static str, Rect, bool)> {
+        vec![("a", cut(1000, 1000), false), ("b", cut(1000, 1090), false), ("c", c, false)]
+    }
+
+    /// Rule (`checkCutSpacingTableOrthogonal_helper`): a pair of cuts within WITHIN that runs
+    /// parallel on one axis only; the gap between them and both cuts grown ACROSS the run by
+    /// SPACING; a third cut whose INTERIOR meets that region marks the box between the gap and it
+    /// (witness o1 col: (1020,1025)-(1070,1065)), sources all three, the pair from either cut one
+    /// marker. Touching the region is not meeting it; beyond WITHIN no pair; no net test.
+    #[test]
+    fn a_third_cut_beside_a_pair_marks_the_gap_between() {
+        let m = run(vec![(60, 60)], &col(cut(1090, 1045)));
+        assert_eq!(m.iter().map(|m| (m.layer, m.bbox)).collect::<Vec<_>>(), [(3, Rect::new(1020, 1025, 1070, 1065))]);
+        assert_eq!(m[0].owners.len(), 3);
+        assert_eq!(m[0].aggressor.as_ref().map(|a| a.2), Some(cut(1090, 1045)));
+        assert!(run(vec![(60, 60)], &col(cut(1110, 1045))).is_empty(), "beyond the region");
+        assert!(run(vec![(60, 60)], &col(cut(1100, 1045))).is_empty(), "only touching the region");
+        let gap70 = [("a", cut(1000, 1000), false), ("b", cut(1000, 1110), false), ("c", cut(1090, 1055), false)];
+        assert!(run(vec![(60, 60)], &gap70).is_empty(), "the pair 70 apart is beyond WITHIN 60");
+        let row = [("a", cut(1000, 1000), false), ("b", cut(1090, 1000), false), ("c", cut(1045, 1090), false)];
+        assert_eq!(run(vec![(60, 60)], &row).iter().map(|m| m.bbox).collect::<Vec<_>>(), [Rect::new(1025, 1020, 1065, 1070)], "the same across");
+        let one_net: Vec<_> = col(cut(1090, 1045)).into_iter().map(|(_, r, f)| ("a", r, f)).collect();
+        assert_eq!(run(vec![(60, 60)], &one_net).len(), 1, "no net test");
+    }
+
+    /// Rule (`checkCutSpacingTableOrthogonal`): every row in order, each with its own WITHIN and
+    /// SPACING; a box found by two rows is one marker (witness o2: row 2 alone reaches the third
+    /// cut, and finds the 70-apart pair row 1 does not). A pair running parallel on both axes
+    /// (overlapping) or on neither (diagonal) is no pair; three fixed cuts are not judged.
+    #[test]
+    fn each_row_judges_with_its_own_within_and_spacing() {
+        let o2 = vec![(60, 40), (100, 70)];
+        assert_eq!(run(o2.clone(), &col(cut(1100, 1045))).len(), 1);
+        assert!(run(vec![(60, 40)], &col(cut(1100, 1045))).is_empty());
+        let gap70 = [("a", cut(1000, 1000), false), ("b", cut(1000, 1110), false), ("c", cut(1090, 1055), false)];
+        assert_eq!(run(o2.clone(), &gap70).len(), 1);
+        assert_eq!(run(vec![(60, 60), (60, 60)], &col(cut(1090, 1045))).len(), 1, "one box, one marker");
+        // Each two of these are apart on both axes: no pair, so no region to judge.
+        let diag = [("a", cut(1000, 1000), false), ("b", cut(1050, 1050), false), ("c", cut(1100, 1100), false)];
+        assert!(run(vec![(100, 100)], &diag).is_empty(), "no run on either axis");
+        let fixed: Vec<_> = col(cut(1090, 1045)).into_iter().map(|(o, r, _)| (o, r, true)).collect();
+        assert!(run(vec![(60, 60)], &fixed).is_empty(), "all three fixed");
+        let mut two_fixed = fixed.clone();
+        two_fixed[2].2 = false;
+        assert_eq!(run(vec![(60, 60)], &two_fixed).len(), 1, "one of the three not fixed");
+    }
+
+    /// Rule (`checkCutSpacingTableOrthogonal_helper`, the marker's victims): the pair, each box
+    /// taking its RIGHT edge for its top — the reference writes `ury = gtl::xh(...)` — then
+    /// normalised (witness trace vyc-orth1: B (980,1070)-(1020,1110) recorded as
+    /// (980,1020)-(1020,1070)). Copied as written: the queue reads victim boxes when a marker
+    /// lies off the route box.
+    #[test]
+    fn the_victim_boxes_take_the_right_edge_for_the_top() {
+        let m = run(vec![(60, 60)], &col(cut(1090, 1045)));
+        assert_eq!(m[0].victim.as_ref().map(|v| v.2), Some(Rect::new(980, 980, 1020, 1020)));
+        assert_eq!(m[0].second_victim.as_ref().map(|v| v.2), Some(Rect::new(980, 1020, 1020, 1070)));
+        let row = [("a", cut(1000, 1000), false), ("b", cut(1090, 1000), false), ("c", cut(1045, 1090), false)];
+        assert_eq!(run(vec![(60, 60)], &row)[0].second_victim.as_ref().map(|v| v.2), Some(Rect::new(1070, 980, 1110, 1110)));
+    }
+
+    /// Rule (`getRectsPrl`, the helper's first exit): a pair whose longest run is ZERO — two
+    /// cuts meeting at one x edge only, here a and b, b up and to the right — is no pair; the
+    /// exit is `max(prl_x, prl_y) <= 0`, so a zero run exits as a negative one does. Third cut c
+    /// above a would meet a's grown box were the pair judged; the only pair c could be the third
+    /// of is (a, b), so no marker has c for its aggressor.
+    #[test]
+    fn a_pair_meeting_at_an_edge_only_is_no_pair() {
+        let (a, b, c) = (cut(1000, 1000), cut(1040, 1090), cut(1000, 1090));
+        let m = run(vec![(60, 60)], &[("a", a, false), ("b", b, false), ("c", c, false)]);
+        assert!(!m.iter().any(|m| m.aggressor.as_ref().map(|g| g.2) == Some(c)), "{m:?}");
+    }
+
+    /// Rule (`checkCutSpacingTableOrthogonal_helper`): the grown gap and both grown cuts are ONE
+    /// polygon set, queried by EVERY one of its maximal rectangles and the results joined. With
+    /// the pair offset (b 10 to the right of a) the set has three maximal rectangles; c reaches
+    /// only the one past b's grown right side, d only the one past a's grown left side, and both
+    /// are marked as the pair's third cut.
+    #[test]
+    fn every_maximal_rectangle_of_the_grown_pair_is_queried() {
+        let (a, b) = (cut(1000, 1000), cut(1010, 1090));
+        let (c, d) = (Rect::new(1085, 1080, 1125, 1120), Rect::new(885, 985, 925, 1025));
+        let m = run(vec![(60, 60)], &[("a", a, false), ("b", b, false), ("c", c, false), ("d", d, false)]);
+        for third in [c, d] {
+            let of_pair = |m: &&Marker| m.aggressor.as_ref().map(|g| g.2) == Some(third) && m.victim.as_ref().is_some_and(|v| v.2 == a || v.2 == b);
+            assert!(m.iter().any(|m| of_pair(&m)), "third cut {third:?} not marked from the pair: {m:?}");
+        }
+    }
+
+    /// Rule (`getRectsPrl`, the helper's second exit, "short"): a pair running parallel on BOTH
+    /// axes — overlapping cuts a and b — is no pair. Third cut c to their right would meet the
+    /// pair's grown gap were it judged; the only pair c could be the third of is (a, b), so no
+    /// marker has c for its aggressor.
+    #[test]
+    fn an_overlapping_pair_is_no_pair() {
+        let (a, b, c) = (cut(1000, 1000), cut(1010, 1010), cut(1070, 1005));
+        let m = run(vec![(60, 60)], &[("a", a, false), ("b", b, false), ("c", c, false)]);
+        assert!(!m.iter().any(|m| m.aggressor.as_ref().map(|g| g.2) == Some(c)), "{m:?}");
     }
 }

@@ -752,7 +752,7 @@ mod tests {
     fn marker(rule: Rule, x: i32) -> Marker {
         let o = Owner::Net("a".into());
         let r = Rect { xl: x, yl: 0, xh: x + 10, yh: 10 };
-        Marker { rule, layer: 4, bbox: r, owners: vec![o.clone()], victim: None, aggressor: None }
+        Marker { rule, layer: 4, bbox: r, owners: vec![o.clone()], victim: None, aggressor: None, second_victim: None }
     }
 
     /// Rule: 65 rows; the first three rip everything up; row 3 is the first markers-driven one
@@ -783,7 +783,7 @@ mod tests {
     fn starting_markers_are_copies_without_sides() {
         let o = Owner::Net("a".into());
         let r = Rect { xl: 0, yl: 0, xh: 10, yh: 10 };
-        let sided = Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o.clone(), 4, r, false)) };
+        let sided = Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o.clone(), 4, r, false)), second_victim: None };
         let wm = worker_markers(vec![sided], 2);
         assert_eq!(wm.markers[0].owners, vec![o]);
         assert!(wm.markers[0].victim.is_none() && wm.markers[0].aggressor.is_none());
@@ -821,7 +821,7 @@ mod tests {
     fn guide_tiles_merge_and_batch() {
         let o = Owner::Net("a".into());
         let g = vec![Rect { xl: 0, yl: 0, xh: 100, yh: 10 }, Rect { xl: 90, yl: 0, xh: 200, yh: 10 }, Rect { xl: 0, yl: 0, xh: 10, yh: 300 }];
-        let m = Marker { rule: Rule::Short, layer: 4, bbox: Rect { xl: 5, yl: 5, xh: 95, yh: 6 }, owners: vec![o], victim: None, aggressor: None };
+        let m = Marker { rule: Rule::Short, layer: 4, bbox: Rect { xl: 5, yl: 5, xh: 95, yh: 6 }, owners: vec![o], victim: None, aggressor: None, second_victim: None };
         let boxes = guide_tile_boxes(&[m], &|_| Some(g.clone()), &|_| Vec::new());
         assert_eq!(boxes, vec![Rect { xl: 0, yl: 0, xh: 200, yh: 10 }, Rect { xl: 0, yl: 0, xh: 10, yh: 300 }]);
         assert_eq!(tile_batches(&[Rect { xl: 0, yl: 0, xh: 10, yh: 10 }, Rect { xl: 30, yl: 0, xh: 40, yh: 10 }, Rect { xl: 100, yl: 0, xh: 110, yh: 10 }], 10), vec![vec![0, 2], vec![1]]);
