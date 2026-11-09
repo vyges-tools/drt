@@ -26,7 +26,7 @@
 
 use crate::pa::stack::default_via;
 use crate::polygon90::Rect;
-use crate::tech::{MinCut, Dir, LayerKind, SpacingTable, Tech, ViaDef};
+use crate::tech::{MinCut, MinSpacing, Dir, LayerKind, Tech, ViaDef};
 
 /// Forbidden length ranges, `(low, high)`.
 pub type Ranges = Vec<(i32, i32)>;
@@ -170,9 +170,9 @@ fn merge_shrunk(ranges: &[(i32, i32)]) -> Ranges {
     merge(ranges).into_iter().map(|(lo, hi)| (lo + 1, hi - 1)).collect()
 }
 
-/// A layer's minimum spacing for a width and a parallel run (`None`: the layer has none).
-fn min_spacing(tech: &Tech, layer: usize, width: i32, prl: i32) -> Option<i32> {
-    tech.layers[layer].spacing.as_ref().map(|t: &SpacingTable| t.find(width, prl))
+/// A layer's minimum spacing for two widths and a parallel run (`None`: the layer has none).
+fn min_spacing(tech: &Tech, layer: usize, width1: i32, width2: i32, prl: i32) -> Option<i32> {
+    tech.layers[layer].spacing.as_ref().map(|t: &MinSpacing| t.find(width1, width2, prl))
 }
 
 /// The via's shape box on `layer` (its lower shapes when that is its lower layer, else upper).
@@ -244,7 +244,7 @@ impl Ctx<'_> {
         let non_overlap = if along_x { (b1.dx() + b2.dx()) / 2 } else { (b1.dy() + b2.dy()) / 2 };
         let mut req: Option<i32> = None;
         if fat1 && fat2 {
-            req = min_spacing(tech, l, w1.max(w2), prl1.min(prl2));
+            req = min_spacing(tech, l, w1, w2, prl1.min(prl2));
             if let Some(n) = ndr {
                 req = Some(req.map_or(n.spacing(z_of(l)), |r| r.max(n.spacing(z_of(l)))));
             }
@@ -260,7 +260,7 @@ impl Ctx<'_> {
             let (w, prl) = (b.dx().min(b.dy()), if along_x { b.dy() } else { b.dx() });
             let mut req: Option<i32> = None;
             if tech.layers[other].spacing.is_some() {
-                req = min_spacing(tech, other, w, prl);
+                req = min_spacing(tech, other, w, w, prl);
                 if let Some(n) = ndr {
                     req = Some(req.map_or(n.spacing(z_of(other)), |r| r.max(n.spacing(z_of(other)))));
                 }
@@ -534,7 +534,7 @@ impl Ctx<'_> {
         if !(fat || ndr.is_some()) {
             return None;
         }
-        let mut req = min_spacing(tech, l, w1.max(width), prl);
+        let mut req = min_spacing(tech, l, w1, width, prl);
         if let Some(n) = ndr {
             req = Some(req.map_or(n.spacing(z_of(l)), |r| r.max(n.spacing(z_of(l)))));
         }
@@ -564,7 +564,7 @@ impl Ctx<'_> {
         let layer = &self.tech.layers[l];
         let w = layer.width;
         let prl = if z_shape { w } else { layer.pitch };
-        min_spacing(self.tech, l, w, prl).map(|s| (w, s + w))
+        min_spacing(self.tech, l, w, w, prl).map(|s| (w, s + w))
     }
 
     fn line_forbidden_len(&self) -> Vec<[Ranges; 4]> {
@@ -685,7 +685,7 @@ pub fn rule_tables(tech: &Tech, defaults: &[Option<usize>], ndrs: &[NdrRule], cf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tech::{EolKeepOut, EolRule, Layer};
+    use crate::tech::{EolKeepOut, EolRule, Layer, SpacingTable};
 
     fn r(xl: i32, yl: i32, xh: i32, yh: i32) -> Rect {
         Rect { xl, yl, xh, yh }
@@ -696,7 +696,7 @@ mod tests {
     fn tech(vias: Vec<ViaDef>) -> Tech {
         let mut t = Tech::default();
         let table = SpacingTable { widths: vec![0, 100], prls: vec![0, 150], values: vec![vec![50, 50], vec![50, 70]] };
-        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone()), ..Default::default() };
+        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone().into()), ..Default::default() };
         t.layers = vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing: Some(80), ..Default::default() }, routing(Dir::Vertical)];
         t.via_defs = vias;
         t
@@ -708,6 +708,19 @@ mod tests {
 
     fn cfg(bottom: usize, top: usize) -> RuleConfig {
         RuleConfig { bottom_routing_layer: bottom, top_routing_layer: top, enable_via_gen: true }
+    }
+
+    // The reference's RP prep hands BOTH widths to the layer's rule (line, via-to-via,
+    // via-to-line and the same-via second layer): on a TWOWIDTHS table a narrow and a wide shape
+    // need the off-diagonal value, not the wide-wide one.
+    #[test]
+    fn a_two_widths_layer_preps_on_both_widths() {
+        use crate::tech::TwoWidthsTable;
+        let mut t = tech(Vec::new());
+        t.layers[2].spacing = Some(MinSpacing::TwoWidths(TwoWidthsTable { widths: vec![0, 200], prls: vec![-1, -1], values: vec![vec![140, 200], vec![200, 300]] }));
+        assert_eq!(min_spacing(&t, 2, 100, 300, 500), Some(200));
+        assert_eq!(min_spacing(&t, 2, 300, 300, 500), Some(300));
+        assert_eq!(min_spacing(&t, 2, 100, 100, 500), Some(140));
     }
 
     // Touching closed intervals join; an empty one (low above high) is dropped.
@@ -865,7 +878,7 @@ mod tests {
     #[test]
     fn line_ranges_use_width_then_pitch() {
         let mut t = tech(vec![]);
-        t.layers[2].spacing = Some(SpacingTable { widths: vec![0], prls: vec![0, 150], values: vec![vec![50, 70]] });
+        t.layers[2].spacing = Some(SpacingTable { widths: vec![0], prls: vec![0, 150], values: vec![vec![50, 70]] }.into());
         let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
         assert_eq!(c.line_min_spc(2, true), Some((100, 150)));
         assert_eq!(c.line_min_spc(2, false), Some((100, 170)));

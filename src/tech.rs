@@ -43,8 +43,8 @@ pub struct Layer {
     pub pitch: i32,
     /// The width of a wire run across the layer's direction.
     pub wrong_way_width: i32,
-    /// A routing layer's minimum spacing.
-    pub spacing: Option<SpacingTable>,
+    /// A routing layer's minimum spacing (`frLayer::getMinSpacing`).
+    pub spacing: Option<MinSpacing>,
     /// A cut layer's minimum spacing, edge to edge.
     pub cut_spacing: Option<i32>,
     /// A cut layer's LEF58 cut classes, in the technology's order.
@@ -362,6 +362,82 @@ impl SpacingTable {
     /// The last row's last value.
     pub fn find_max(&self) -> i32 {
         *self.values.last().and_then(|r| r.last()).expect("a value")
+    }
+}
+
+/// A classic TWOWIDTHS spacing table (`frSpacingTableTwConstraint`): rows and columns both by
+/// width, each row with an optional parallel run length (-1 when the row gives none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwoWidthsTable {
+    pub widths: Vec<i32>,
+    pub prls: Vec<i32>,
+    pub values: Vec<Vec<i32>>,
+}
+
+impl TwoWidthsTable {
+    /// odb `_dbTechLayer::getTwIdx`: the row BEFORE the first row whose width is not below
+    /// `width` (row 0 when that is the first, the last row when there is none), then back while
+    /// the row's run length exceeds `prl`; row 0 when none takes it. A row without one (-1) takes
+    /// any run.
+    fn tw_idx(&self, width: i32, prl: i32) -> usize {
+        let pos = self.widths.partition_point(|&w| w < width);
+        let mut idx = pos.saturating_sub(1);
+        loop {
+            if prl >= self.prls[idx] {
+                return idx;
+            }
+            if idx == 0 {
+                return 0;
+            }
+            idx -= 1;
+        }
+    }
+    /// `frSpacingTableTwConstraint::find` = odb `dbTechLayer::findTwSpacing`: the row by the
+    /// first width, the column by the second, both at the run clamped at 0.
+    pub fn find(&self, width1: i32, width2: i32, prl: i32) -> i32 {
+        let prl = prl.max(0);
+        self.values[self.tw_idx(width1, prl)][self.tw_idx(width2, prl)]
+    }
+}
+
+/// A routing layer's minimum spacing rule (`frLayer::getMinSpacing`): the parallel-run table (a
+/// plain SPACING is its one-cell form) or the TWOWIDTHS table, whichever the tech load set last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MinSpacing {
+    /// `frSpacingTablePrlConstraint`.
+    Prl(SpacingTable),
+    /// `frSpacingTableTwConstraint`.
+    TwoWidths(TwoWidthsTable),
+}
+
+impl From<SpacingTable> for MinSpacing {
+    fn from(t: SpacingTable) -> Self {
+        MinSpacing::Prl(t)
+    }
+}
+
+impl MinSpacing {
+    /// The spacing two shapes of these widths need over a run: the parallel-run table on the
+    /// WIDER width alone, the TWOWIDTHS table on both (every reference consumer passes them so).
+    pub fn find(&self, width1: i32, width2: i32, prl: i32) -> i32 {
+        match self {
+            MinSpacing::Prl(t) => t.find(width1.max(width2), prl),
+            MinSpacing::TwoWidths(t) => t.find(width1, width2, prl),
+        }
+    }
+    /// `findMin`: the first row's first value.
+    pub fn find_min(&self) -> i32 {
+        match self {
+            MinSpacing::Prl(t) => t.find_min(),
+            MinSpacing::TwoWidths(t) => t.values[0][0],
+        }
+    }
+    /// `findMax`: the last row's last value.
+    pub fn find_max(&self) -> i32 {
+        match self {
+            MinSpacing::Prl(t) => t.find_max(),
+            MinSpacing::TwoWidths(t) => *t.values.last().and_then(|r| r.last()).expect("a TWOWIDTHS table has a value"),
+        }
     }
 }
 
@@ -892,7 +968,7 @@ pub mod read {
                     let pitch = db.layer_get_pitch(&name);
                     let wrong_way_width = db.layer_get_wrong_way_width(&name) as i32;
                     let v55 = db.layer_v55_spacing_table(&name)?;
-                    let spacing = match (v55.widths_and_lengths, v55.table) {
+                    let prl_spacing = match (v55.widths_and_lengths, v55.table) {
                         (Some((w, l)), Some(t)) => Some(SpacingTable {
                             widths: w.iter().map(|&v| v as i32).collect(),
                             prls: l.iter().map(|&v| v as i32).collect(),
@@ -902,6 +978,12 @@ pub mod read {
                             s if s > 0 => Some(SpacingTable { widths: vec![0], prls: vec![0], values: vec![vec![s]] }),
                             _ => None,
                         },
+                    };
+                    // io `setRoutingLayerProperties` sets the TWOWIDTHS table after the parallel-run
+                    // one, so on a layer carrying both it is the one kept.
+                    let spacing = match db.layer_two_widths_spacing_table(&name)? {
+                        Some(t) => Some(MinSpacing::TwoWidths(TwoWidthsTable { widths: t.widths, prls: t.prls, values: t.spacing })),
+                        None => prl_spacing.map(MinSpacing::Prl),
                     };
                     let eol = db
                         .layer_v54_eol_rules(&name)?
@@ -1187,5 +1269,65 @@ mod tests {
         let m = Master::import(&t, Vec::new(), &[(4, a), (4, b), (4, bar)]);
         let want = vec![(4, bar), (4, a), (4, b), (4, Rect::new(0, 400, 500, 600))];
         assert_eq!(m.blockages, want);
+    }
+}
+
+#[cfg(test)]
+mod two_widths_tests {
+    //! The TWOWIDTHS spacing table (`frSpacingTableTwConstraint`, its lookup odb's
+    //! `findTwSpacing`).
+    use super::*;
+
+    fn t() -> TwoWidthsTable {
+        TwoWidthsTable {
+            widths: vec![0, 100, 300],
+            prls: vec![-1, 200, 400],
+            values: vec![vec![40, 60, 100], vec![60, 80, 120], vec![100, 125, 160]],
+        }
+    }
+
+    // Rule (odb `getTwIdx`): a width picks the row BEFORE the first row width not below it — a
+    // width equal to a row's is the row before, one past the last is the last; then rows are
+    // walked back while their PRL exceeds the run, row 0 when none takes it; a row without PRL
+    // (-1) takes any run.
+    #[test]
+    fn a_width_picks_the_row_before_then_walks_back_by_prl() {
+        let t = t();
+        assert_eq!(t.tw_idx(0, 0), 0);
+        assert_eq!(t.tw_idx(100, 1000), 0, "equal to row 1's width: row 0");
+        assert_eq!(t.tw_idx(101, 1000), 1);
+        assert_eq!(t.tw_idx(301, 1000), 2);
+        assert_eq!(t.tw_idx(301, 399), 1, "row 2 needs a run of 400");
+        assert_eq!(t.tw_idx(301, 400), 2, "a run equal to the row's PRL takes it");
+        assert_eq!(t.tw_idx(301, 199), 0, "row 1 needs 200; row 0 has none");
+        let no_prl_row0 = TwoWidthsTable { prls: vec![50, 200, 400], ..t.clone() };
+        assert_eq!(no_prl_row0.tw_idx(101, 10), 0, "no row takes the run: row 0");
+    }
+
+    // Rule (`findTwSpacing`): the ROW by the first width and the COLUMN by the second, each at the
+    // run clamped at 0 — the table need not be symmetric and the order of the widths is kept.
+    #[test]
+    fn the_row_is_the_first_width_and_the_column_the_second() {
+        let t = t();
+        assert_eq!(t.find(500, 150, 1000), 125);
+        assert_eq!(t.find(150, 500, 1000), 120);
+        assert_eq!(t.find(500, 500, -7), 40, "a negative run is 0: rows 1 and 2 are out");
+        // The clamp shows where a row after the first has no PRL: a run of -7 is 0, which a
+        // PRL of -1 takes (row 1); unclamped it would not (row 0).
+        let t = TwoWidthsTable { prls: vec![-1, -1, 400], ..t };
+        assert_eq!(t.find(150, 150, -7), 80);
+    }
+
+    // Rule (every consumer: GC `checkMetalSpacing_prl_getReqSpcVal`, `frLayer::getMinSpacingValue`,
+    // the RP prep): the parallel-run table is looked up on the WIDER width, the TWOWIDTHS table
+    // on both; `findMin` is the first row's first value, `findMax` the last row's last.
+    #[test]
+    fn min_spacing_dispatches_on_the_rule_kind() {
+        let tw = MinSpacing::TwoWidths(t());
+        assert_eq!((tw.find(500, 150, 1000), tw.find(150, 500, 1000)), (125, 120));
+        assert_eq!((tw.find_min(), tw.find_max()), (40, 160));
+        let prl: MinSpacing = SpacingTable { widths: vec![0, 100], prls: vec![0], values: vec![vec![40], vec![90]] }.into();
+        assert_eq!((prl.find(150, 50, 0), prl.find(50, 150, 0)), (90, 90));
+        assert_eq!((prl.find_min(), prl.find_max()), (40, 90));
     }
 }

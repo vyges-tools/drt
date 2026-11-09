@@ -24,7 +24,7 @@ ports above the top routing layer, the gcell grid).
    and track offsets) are grouped, and each class is analysed once, on a representative.
 2. **Access points** — per pin, cost rounds of candidates (on-track, half-track, centre,
    enclosed-boundary), each planar direction and each via checked against the design rules
-   (shorts, non-sufficient metal, the parallel-run spacing table, cut spacing), until enough
+   (shorts, non-sufficient metal, the layer's spacing table, cut spacing), until enough
    sparse points are kept.
 3. **Access patterns** — per class, a shortest path choosing one point per pin so that
    neighbouring pins' vias stand clear of each other.

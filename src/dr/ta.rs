@@ -351,7 +351,7 @@ impl<'s, 'a> Worker<'s, 'a> {
 
     /// The minimum spacing for two widths and a run (0 without a rule).
     fn min_spacing_value(&self, layer: usize, w1: i32, w2: i32, prl: i32) -> i32 {
-        self.tech().layers[layer].spacing.as_ref().map_or(0, |t| t.find(w1.max(w2), prl))
+        self.tech().layers[layer].spacing.as_ref().map_or(0, |t| t.find(w1, w2, prl))
     }
 
     fn get_track_idx(&self, lo: i32, hi: i32, layer: usize) -> (i32, i32) {
@@ -1550,7 +1550,7 @@ mod tests {
     /// spacing 100, or 150 over runs above 200); one via whose lower metal is 300 wide.
     fn tech() -> Tech {
         let table = SpacingTable { widths: vec![0], prls: vec![0, 200], values: vec![vec![100, 150]] };
-        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone()), ..Default::default() };
+        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone().into()), ..Default::default() };
         Tech {
             layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing: Some(100), ..Default::default() }, routing(Dir::Vertical)],
             via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-150, -50, 150, 50)], cut_figs: vec![r(-50, -50, 50, 50)], layer2_figs: vec![r(-50, -150, 50, 150)] }],
@@ -1594,6 +1594,21 @@ mod tests {
         w.via_costs = (0..n).map(|_| TrackIndex::new(true)).collect();
         w.init_tracks();
         w
+    }
+
+    // The reference's frLayer::getMinSpacingValue hands BOTH widths to the layer's rule; a
+    // TWOWIDTHS table takes the row from the first and the column from the second, so a narrow
+    // and a wide wire need the off-diagonal value, not the wide-wide one.
+    #[test]
+    fn a_two_widths_layer_spaces_on_both_widths() {
+        use crate::tech::{MinSpacing, TwoWidthsTable};
+        let mut f = fixture();
+        f.tech.layers[2].spacing = Some(MinSpacing::TwoWidths(TwoWidthsTable { widths: vec![0, 200], prls: vec![-1, -1], values: vec![vec![140, 200], vec![200, 300]] }));
+        let st = state(&f, Vec::new());
+        let w = worker(&st, 1);
+        assert_eq!(w.min_spacing_value(2, 100, 300, 500), 200);
+        assert_eq!(w.min_spacing_value(2, 300, 300, 500), 300);
+        assert_eq!(w.min_spacing_value(2, 100, 100, 500), 140);
     }
 
     // Both ends are inclusive: a track exactly at `lo` or `hi` is inside.

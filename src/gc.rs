@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, ParallelEdge, Tech};
+use crate::tech::{CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, MinSpacing, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -74,6 +74,9 @@ pub enum Rule {
     NonSufficientMetal,
     /// Closer than the routing layer's spacing table allows.
     MetalSpacing,
+    /// Closer than the routing layer's TWOWIDTHS spacing table allows: the same check as
+    /// [`Rule::MetalSpacing`], named after the layer's rule as the reference names the marker.
+    SpacingTableTw,
     /// Closer than the cut layer's spacing.
     CutSpacing,
     /// A line end closer than its end-of-line spacing to a facing edge.
@@ -1910,7 +1913,7 @@ impl<'a> Worker<'a> {
             }
         }
         let (w1, w2) = (ws[0], ws[1]);
-        let mut req = l.spacing.as_ref().map_or(0, |t| t.find(w1.max(w2), prl));
+        let mut req = l.spacing.as_ref().map_or(0, |t| t.find(w1, w2, prl));
         let mut is_range = false;
         if r1.net != r2.net {
             for c in &l.spacing_ranges {
@@ -1963,7 +1966,13 @@ impl<'a> Worker<'a> {
         } else if !self.spc_marker_outside_net(layer, r1.net, &marker) {
             return;
         }
-        let rule = if is_range { Rule::SpacingRange } else { Rule::MetalSpacing };
+        // The marker's constraint (`checkMetalSpacing_prl`): the range rule that raised the
+        // requirement, else the layer's minimum spacing rule, whichever kind it is.
+        let rule = match &self.tech.layers[layer].spacing {
+            _ if is_range => Rule::SpacingRange,
+            Some(MinSpacing::TwoWidths(_)) => Rule::SpacingTableTw,
+            _ => Rule::MetalSpacing,
+        };
         self.add_marker_of(rule, layer, marker, (r1.net, r1.rect, r1.fixed), (r2.net, r2.rect, r2.fixed));
     }
 
@@ -2624,9 +2633,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)])), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], min_step: None, spacing_ranges: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -2882,6 +2891,26 @@ pub(crate) mod tests {
         assert_eq!(near.iter().map(|m| m.rule).collect::<Vec<_>>(), vec![Rule::MetalSpacing]);
         let far = markers(&[(net("a"), 4, Rect::new(0, 0, 1000, 140), true), (net("b"), 4, Rect::new(0, 280, 1000, 420), false)]);
         assert!(far.is_empty());
+    }
+
+    /// Rule (`checkMetalSpacing_prl_getReqSpcVal`, `checkMetalSpacing_prl`): on a layer whose
+    /// minimum spacing is a TWOWIDTHS table the pair is looked up on BOTH widths (a 300-wide and a
+    /// 140-wide shape need 200 here, the wider width alone would ask 300) and the marker is named
+    /// after that rule (`SpacingTableTw`), not `Metal Spacing`.
+    #[test]
+    fn a_two_widths_layer_needs_both_widths_and_names_its_marker() {
+        let mut t = tech();
+        t.layers[4].spacing = Some(MinSpacing::TwoWidths(crate::tech::TwoWidthsTable { widths: vec![0, 200], prls: vec![-1, -1], values: vec![vec![140, 200], vec![200, 300]] }));
+        let run = |gap: i32| {
+            let mut w = Worker::new(&t);
+            w.add(&net("a"), 4, Rect::new(0, 0, 10000, 300), true);
+            w.add(&net("b"), 4, Rect::new(0, 300 + gap, 10000, 440 + gap), false);
+            w.init();
+            w.run().iter().map(|m| m.rule).filter(|r| matches!(r, Rule::SpacingTableTw | Rule::MetalSpacing)).collect::<Vec<_>>()
+        };
+        assert_eq!(run(199), vec![Rule::SpacingTableTw]);
+        assert!(run(200).is_empty(), "the wide-wide 300 does not apply to a wide-narrow pair");
+        assert_eq!(crate::dr::log::viol_name(Rule::SpacingTableTw), "SpacingTableTw");
     }
 
     /// The width that picks the row is the WIDER shape's, and a width of exactly 3000 is still the

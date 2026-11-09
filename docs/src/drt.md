@@ -35,8 +35,8 @@ The rounds stop once enough sparse points are kept (three per cell pin; one for 
 point's vias are ordered by how far they stick out of the pin.
 
 **Design rules** checked in these trials, against the pin's own cell (or port): shorts between
-different nets (metal and cut), non-sufficient metal, the parallel-run spacing table, cut spacing,
-and end-of-line spacing (a line end narrower than the rule's width needs its space to a facing
+different nets (metal and cut), non-sufficient metal, the layer's spacing table (parallel-run or
+two-widths), cut spacing, and end-of-line spacing (a line end narrower than the rule's width needs its space to a facing
 edge; long sides of a wire are skipped in via trials, not in planar ones).
 
 **Access patterns.** Per class, the pins are sorted by the mean x of their points (relative to the
@@ -110,7 +110,8 @@ ran, because rerouting everything writes the same DEF; the counts can.
 ### Limits
 
 Design rules modelled: shorts, non-sufficient metal, parallel-run spacing (with spacing limited to
-a width range), cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing, minimum
+a width range), the two-widths spacing table (`SPACINGTABLE TWOWIDTHS`, looked up on both widths;
+kept over a parallel-run table on the same layer), cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing, minimum
 width, minimum area (patched, or reported where a patch cannot fix it), minimum enclosed area
 (`MINENCLOSEDAREA` without a width), minimum step, minimum cut, rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing

@@ -102,6 +102,10 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 // modelled — refused (it was counted modelled before; no corpus tech carries it).
                 "v55_influence" => false,
                 "lef58_eol_keepout" => true,
+                // SPACINGTABLE TWOWIDTHS: the layer's minimum spacing rule, read by every consumer
+                // the parallel-run table has (the check, the maze and track costs, the via-to-via
+                // and line prep), each on both widths.
+                "two_widths_spacing" => true,
                 _ => false,
             };
             if !modelled {
@@ -682,6 +686,23 @@ mod skipped_rule_tests {
         let tech = crate::tech::read::tech(&d).expect("tech");
         let m1 = tech.layer_num("M1").expect("M1");
         assert_eq!(tech.layers[v1].cut_layer_spacing, [crate::tech::CutLayerSpacing { spacing: 70, second_layer: m1, class: 1, corner: crate::tech::CutCorner::Concave }]);
+    }
+
+    /// Rule (reference io `setRoutingLayerProperties`): a SPACINGTABLE TWOWIDTHS is the layer's
+    /// minimum spacing rule (set after the parallel-run table, so it is the one kept on a layer
+    /// with both), each row's PRL -1 when the row gives none; MODELLED, neither refused nor skipped.
+    #[test]
+    fn the_two_widths_spacing_table_is_modelled() {
+        let tw = "  SPACINGTABLE\n    TWOWIDTHS\n      WIDTH 0.00 0.04 0.06\n      WIDTH 0.10 PRL 0.20 0.06 0.08 ;\n";
+        let d = db("tw", tw, "");
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let m1 = tech.layer_num("M1").expect("M1");
+        let want = crate::tech::TwoWidthsTable { widths: vec![0, 100], prls: vec![-1, 200], values: vec![vec![40, 60], vec![60, 80]] };
+        assert_eq!(tech.layers[m1].spacing, Some(crate::tech::MinSpacing::TwoWidths(want)));
+        let m2 = tech.layer_num("M2").expect("M2");
+        assert!(matches!(tech.layers[m2].spacing, Some(crate::tech::MinSpacing::Prl(_))));
     }
 
     /// Rule (reference io `setCutLayerProperties`, LAYER branch): `SPACING s LAYER m CUTCLASS c
