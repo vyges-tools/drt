@@ -109,6 +109,83 @@ pub struct Layer {
     /// A routing layer's v5.4 SPACING … RANGE rules, in the technology's order
     /// (`frSpacingRangeConstraint`; io keeps them out of the spacing table).
     pub spacing_ranges: Vec<SpacingRange>,
+    /// A routing layer's LEF58_AREA rules as io keeps them, in io's two lists.
+    pub lef58_area: Lef58Area,
+}
+
+/// A LEF58_AREA rule io keeps on a routing layer (`frLef58AreaConstraint`): the forms it skips
+/// with a warning (EXCEPTMINWIDTH, EXCEPTEDGELENGTH, EXCEPTMINSIZE, EXCEPTSTEP, MASK, LAYER) are
+/// never held, see [`read::lef58_area_skipped_clause`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AreaRule {
+    /// The rule's place among the layer's LEF58_AREA rules in the technology's order: the
+    /// marker's constraint (the reference keeps a marker once per constraint).
+    pub index: u16,
+    /// AREA, in square database units.
+    pub area: i64,
+    /// RECTWIDTH (0 without one).
+    pub rect_width: i32,
+    /// EXCEPTRECTANGLE: a polygon that is one rectangle is judged by the next rule instead.
+    pub except_rectangle: bool,
+}
+
+/// io's two LEF58_AREA lists for a layer (`frLayer`): the rules with a RECTWIDTH, and the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lef58Area {
+    /// Ascending by (RECTWIDTH, AREA) (`addLef58AreaConstraintRectWidth`).
+    pub rect_width: Vec<AreaRule>,
+    /// Descending by AREA (`addLef58AreaConstraint`).
+    pub area: Vec<AreaRule>,
+}
+
+impl Lef58Area {
+    pub fn is_empty(&self) -> bool {
+        self.rect_width.is_empty() && self.area.is_empty()
+    }
+
+    /// io's insertion, a rule with a RECTWIDTH into the first list, any other into the second.
+    /// Upstream rule (`frLayer::addLef58AreaConstraintRectWidth` / `addLef58AreaConstraint`):
+    /// each inserts at `std::ranges::lower_bound` of its key, so a rule whose key equals earlier
+    /// ones goes BEFORE them (ties end up in reverse technology order), not after.
+    pub fn add(&mut self, r: AreaRule) {
+        if r.rect_width > 0 {
+            let key = (r.rect_width, r.area);
+            let at = self.rect_width.partition_point(|a| (a.rect_width, a.area) < key);
+            self.rect_width.insert(at, r);
+        } else {
+            let at = self.area.partition_point(|a| a.area > r.area);
+            self.area.insert(at, r);
+        }
+    }
+
+    /// `checkMetalShape_lef58Area`, which rule a polygon breaks, if any: `is_rect` (its outer
+    /// boundary has four vertices), its maximal rectangles, its area. Upstream rule: a
+    /// rectangle first tries the RECTWIDTH rules in order; the first whose RECTWIDTH is at least
+    /// the polygon's narrower side (the polygon being ONE maximal rectangle) decides it alone,
+    /// broken below that rule's AREA, and no other rule is tried. Otherwise the other rules, by
+    /// descending AREA: none is broken once the area reaches a rule's; the first rule not
+    /// EXCEPTRECTANGLE, or EXCEPTRECTANGLE with the polygon NOT one maximal rectangle, is broken.
+    pub fn violated(&self, is_rect: bool, max_rects: &[crate::polygon90::Rect], area: i64) -> Option<AreaRule> {
+        if is_rect {
+            for r in &self.rect_width {
+                // `checkMetalShape_lef58Area_rectWidth`
+                let applies = max_rects.len() == 1 && (max_rects[0].xh - max_rects[0].xl).min(max_rects[0].yh - max_rects[0].yl) <= r.rect_width;
+                if applies {
+                    return (area < r.area).then_some(*r);
+                }
+            }
+        }
+        for r in &self.area {
+            if area >= r.area {
+                break;
+            }
+            // `checkMetalShape_lef58Area_exceptRectangle`
+            if !r.except_rectangle || max_rects.len() != 1 {
+                return Some(*r);
+            }
+        }
+        None
+    }
 }
 
 /// `frSpacingRangeConstraint`: SPACING for a rectangle whose width is within [min, max].
@@ -1304,7 +1381,8 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
+                    let lef58_area = lef58_area_rules(db, &name);
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges, lef58_area });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1423,6 +1501,43 @@ pub mod read {
     /// keeps its count of 0 and is dropped by [`MinCut::applies`], so no LEF reaches this refusal.
     pub fn lef58_min_cut_refusal(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
         db.mincutrule_is_per_cut_class(layer, k).then_some("PERCUTCLASS")
+    }
+
+    /// The clause that makes a LEF58_AREA rule SKIPPED with a warning: io
+    /// `setRoutingLayerProperties`, its LEF58_AREA loop, warns and skips (DRT-311..316, in this
+    /// order) a rule with EXCEPTMINWIDTH, EXCEPTEDGELENGTH (one value or two), EXCEPTMINSIZE,
+    /// EXCEPTSTEP, MASK or LAYER (a trim layer; OVERLAP comes only with it). The reference routes
+    /// without the rule; so does this router, but it says so.
+    pub fn lef58_area_skipped_clause(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
+        if db.arearule_get_except_min_width(layer, k) != 0 {
+            Some("EXCEPTMINWIDTH")
+        } else if db.arearule_get_except_edge_length(layer, k) != 0 || (db.arearule_get_except_edge_lengths_first(layer, k), db.arearule_get_except_edge_lengths_second(layer, k)) != (0, 0) {
+            Some("EXCEPTEDGELENGTH")
+        } else if (db.arearule_get_except_min_size_first(layer, k), db.arearule_get_except_min_size_second(layer, k)) != (0, 0) {
+            Some("EXCEPTMINSIZE")
+        } else if (db.arearule_get_except_step_first(layer, k), db.arearule_get_except_step_second(layer, k)) != (0, 0) {
+            Some("EXCEPTSTEP")
+        } else if db.arearule_get_mask(layer, k) != 0 {
+            Some("MASK")
+        } else if !db.arearule_get_trim_layer(layer, k).is_empty() {
+            Some("LAYER")
+        } else {
+            None
+        }
+    }
+
+    /// io's LEF58_AREA loop for a routing layer: each rule not skipped
+    /// ([`lef58_area_skipped_clause`]), in the technology's order, into its list
+    /// ([`Lef58Area::add`]).
+    pub fn lef58_area_rules(db: &Db, layer: &str) -> Lef58Area {
+        let mut out = Lef58Area::default();
+        for k in 0..db.num_layer_get_tech_layer_area_rules(layer) {
+            if lef58_area_skipped_clause(db, layer, k).is_some() {
+                continue;
+            }
+            out.add(AreaRule { index: k as u16, area: db.arearule_get_area(layer, k), rect_width: db.arearule_get_rect_width(layer, k), except_rectangle: db.arearule_is_except_rectangle(layer, k) });
+        }
+        out
     }
 
     /// io `convertLef58MinCutConstraints` (postProcess): per routing layer, bottom to top, each
@@ -1613,6 +1728,89 @@ mod tests {
         let m = Master::import(&t, Vec::new(), &[(4, a), (4, b), (4, bar)]);
         let want = vec![(4, bar), (4, a), (4, b), (4, Rect::new(0, 400, 500, 600))];
         assert_eq!(m.blockages, want);
+    }
+}
+
+#[cfg(test)]
+mod lef58_area_tests {
+    //! LEF58_AREA on a routing layer: io's two lists (`frLayer`) and the rule a polygon breaks
+    //! (`checkMetalShape_lef58Area`).
+    use super::*;
+
+    fn rule(index: u16, area: i64, rect_width: i32, except_rectangle: bool) -> AreaRule {
+        AreaRule { index, area, rect_width, except_rectangle }
+    }
+
+    fn lists(rules: &[AreaRule]) -> Lef58Area {
+        let mut l = Lef58Area::default();
+        for &r in rules {
+            l.add(r);
+        }
+        l
+    }
+
+    /// Rule (reference `frLayer::addLef58AreaConstraintRectWidth` / `addLef58AreaConstraint`): a
+    /// RECTWIDTH rule goes to the first list, ascending by (RECTWIDTH, AREA); any other to the
+    /// second, descending by AREA; each inserted at `lower_bound`, so a rule tying earlier ones
+    /// goes BEFORE them (witness: two AREA 0.02 rules, the later one is tried first).
+    #[test]
+    fn io_inserts_each_rule_at_the_lower_bound_of_its_list() {
+        let l = lists(&[rule(0, 20_000, 0, false), rule(1, 10_000, 50, false), rule(2, 20_000, 0, true), rule(3, 5_000, 50, false), rule(4, 40_000, 0, false), rule(5, 8_000, 40, false), rule(6, 10_000, 50, true), rule(7, 10_000, 0, false)]);
+        let idx = |v: &[AreaRule]| v.iter().map(|r| r.index).collect::<Vec<_>>();
+        assert_eq!(idx(&l.rect_width), [5, 3, 6, 1], "(40, 8000) (50, 5000) then the tie (50, 10000): the later first");
+        assert_eq!(idx(&l.area), [4, 2, 0, 7], "40000, then the tie at 20000: the later first, then 10000");
+    }
+
+    const R300: Rect = Rect { xl: 980, yl: 980, xh: 1280, yh: 1020 };
+
+    /// Rule (reference `checkMetalShape_lef58Area`): a rectangle (four vertices) first tries the
+    /// RECTWIDTH rules in order; the first whose RECTWIDTH reaches the rectangle's narrower side
+    /// (the polygon ONE maximal rectangle, `checkMetalShape_lef58Area_rectWidth`) decides alone —
+    /// broken below its AREA, and no other rule is tried even when it would break. A RECTWIDTH
+    /// rule never judges a polygon that is not a rectangle (witness `w`, `wa`).
+    #[test]
+    fn a_rect_width_rule_decides_a_narrow_rectangle_alone() {
+        let w = lists(&[rule(0, 20_000, 50, false)]);
+        assert_eq!(w.violated(true, &[R300], 12_000), Some(rule(0, 20_000, 50, false)));
+        assert_eq!(w.violated(true, &[R300], 24_000), None);
+        assert_eq!(w.violated(true, &[Rect::new(980, 980, 1180, 1060)], 16_000), None, "80 wide: the rule does not apply, no other rule");
+        assert_eq!(w.violated(false, &[R300, Rect::new(1240, 980, 1280, 1180)], 18_400), None, "not a rectangle");
+        assert_eq!(w.violated(true, &[R300, R300], 12_000), None, "four vertices but two maximal rectangles (a ring): not one");
+        let at = lists(&[rule(0, 20_000, 40, false)]);
+        assert!(at.violated(true, &[R300], 12_000).is_some(), "a side EQUAL to RECTWIDTH applies");
+        let wa = lists(&[rule(0, 10_000, 50, false), rule(1, 30_000, 0, false)]);
+        assert_eq!(wa.violated(true, &[R300], 12_000), None, "decided by the RECTWIDTH rule: the 0.03 rule is not tried");
+        assert_eq!(wa.violated(true, &[Rect::new(980, 980, 1180, 1060)], 16_000).map(|r| r.index), Some(1));
+        assert_eq!(wa.violated(false, &[R300, Rect::new(1240, 980, 1280, 1180)], 18_400).map(|r| r.index), Some(1));
+        let first = lists(&[rule(0, 20_000, 50, false), rule(1, 10_000, 60, false)]);
+        assert_eq!(first.violated(true, &[R300], 15_000).map(|r| r.index), Some(0), "the first RECTWIDTH rule that applies, in list order");
+        let narrowest = lists(&[rule(0, 30_000, 60, false), rule(1, 20_000, 50, false)]);
+        assert_eq!(narrowest.violated(true, &[R300], 25_000), None, "the 50 rule sorts first and passes: the 60 rule, which 25000 breaks, is not tried");
+    }
+
+    /// Rule (reference `checkMetalShape_lef58Area`): the other rules by descending AREA — none
+    /// breaks once the polygon reaches a rule's AREA (strictly below breaks); EXCEPTRECTANGLE
+    /// passes a polygon that is ONE maximal rectangle on to the next rule
+    /// (`checkMetalShape_lef58Area_exceptRectangle`); the first rule not passing it on is broken
+    /// (witness `a`, `x`, `xa`, `t`).
+    #[test]
+    fn the_area_rules_go_by_descending_area_and_except_rectangle_passes_a_rectangle_on() {
+        let ell = [R300, Rect::new(1240, 980, 1280, 1180)];
+        let a = lists(&[rule(0, 20_000, 0, false)]);
+        assert!(a.violated(true, &[R300], 19_999).is_some() && a.violated(true, &[R300], 20_000).is_none());
+        let x = lists(&[rule(0, 20_000, 0, true)]);
+        assert_eq!(x.violated(true, &[R300], 12_000), None);
+        assert_eq!(x.violated(false, &ell, 18_400).map(|r| r.index), Some(0));
+        let xa = lists(&[rule(0, 30_000, 0, true), rule(1, 15_000, 0, false)]);
+        assert_eq!(xa.violated(true, &[R300], 12_000).map(|r| r.index), Some(1));
+        assert_eq!(xa.violated(true, &[R300], 24_000), None, "at or above the next rule: stop");
+        assert_eq!(xa.violated(false, &ell, 18_400).map(|r| r.index), Some(0));
+        let t = lists(&[rule(0, 20_000, 0, false), rule(1, 20_000, 0, true)]);
+        assert_eq!(t.violated(true, &[R300], 12_000).map(|r| r.index), Some(0), "the later (EXCEPTRECTANGLE) rule is tried first and passes it on");
+        assert_eq!(t.violated(false, &ell, 18_400).map(|r| r.index), Some(1));
+        let stop = lists(&[rule(0, 30_000, 0, true), rule(1, 20_000, 0, false)]);
+        assert_eq!(stop.violated(true, &[R300], 25_000), None, "a passed-on rectangle is still judged by the next AREA");
+        assert_eq!(Lef58Area::default().violated(true, &[R300], 0), None);
     }
 }
 

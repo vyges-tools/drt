@@ -94,6 +94,10 @@ pub enum Rule {
     /// A hole in one owner's polygon smaller than a MINENCLOSEDAREA rule
     /// (`checkMetalShape_minEnclosedArea`).
     MinEnclosedArea,
+    /// One owner's polygon smaller than the LEF58_AREA rule that judges it
+    /// (`checkMetalShape_lef58Area`, the marker pass); the rule's place among the layer's
+    /// LEF58_AREA rules (the reference keeps a marker once per constraint).
+    Lef58Area(u16),
     /// Other metal inside a LEF58 end-of-line keep-out box (`checkMetalEOLkeepout_main`).
     Lef58EolKeepOut,
     /// A line end closer than a LEF58 end-of-line spacing rule allows (`checkMetalEndOfLine_eol`
@@ -176,6 +180,67 @@ pub struct PatchWire {
 impl PatchWire {
     pub fn bbox(&self) -> Rect {
         Rect::new(self.offset.xl + self.origin.0, self.offset.yl + self.origin.1, self.offset.xh + self.origin.0, self.offset.yh + self.origin.1)
+    }
+}
+
+/// A patch the patch pass makes for a pin below its minimum area or a LEF58_AREA rule, before the
+/// router picks its worker net (`checkMetalShape_addPatch`): its layer, origin, box relative to
+/// the origin, and the owner (the target) whose pin it grows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AreaPatch {
+    pub layer: usize,
+    pub origin: (i32, i32),
+    pub offset: Rect,
+    pub owner: Owner,
+}
+
+/// `checkMetalShape_addPatch`, where the patch goes on a pin's polygon edges (`segs`, ring order).
+/// Upstream rules: the edge is chosen among those running ACROSS the layer's preferred direction
+/// (`e->isVertical() != prefDirIsVert`), in edge order, by `bestSuitable`: an edge with both
+/// corners convex beats one without; otherwise only a strictly longer edge replaces the one
+/// held, so the FIRST of equals stays. The patch is as wide as that edge (half its length each
+/// way from the edge's midpoint, both halves truncated) and reaches out of the polygon, on the
+/// edge's outer side (inside on an edge's left), by `ceil((float) gap / length / grid) * grid`
+/// — computed in single precision. The origin is the edge's midpoint across the layer and its
+/// own coordinate along it. `None` when no edge runs across (the reference would crash).
+fn area_patch_geometry(segs: &[Seg], vertical_layer: bool, gap: i32, grid: i32) -> Option<((i32, i32), Rect)> {
+    let convex = |e: &Seg| orientation(&segs[e.prev], e) == 1 && orientation(e, &segs[e.next]) == 1;
+    let mut chosen: Option<usize> = None;
+    for (k, e) in segs.iter().enumerate() {
+        if (e.from.0 == e.to.0) == vertical_layer {
+            continue;
+        }
+        chosen = match chosen {
+            None => Some(k),
+            Some(c) => {
+                let (ce, cc) = (convex(e), convex(&segs[c]));
+                let wins = if ce != cc { ce } else { e.len() > segs[c].len() };
+                Some(if wins { k } else { c })
+            }
+        };
+    }
+    let e = &segs[chosen?];
+    let len = e.len();
+    let length = ((gap as f32 / len as f32 / grid as f32).ceil() as f64 * f64::from(grid)) as i32;
+    let half = len / 2;
+    if vertical_layer {
+        let origin = ((e.from.0 + e.to.0) / 2, e.from.1);
+        let (yl, yh) = match e.dir() {
+            // outer N (the edge runs W)
+            EdgeDir::W => (0, length),
+            // outer S (the edge runs E)
+            _ => (-length, 0),
+        };
+        Some((origin, Rect::new(-half, yl, half, yh)))
+    } else {
+        let origin = (e.from.0, (e.from.1 + e.to.1) / 2);
+        let (xl, xh) = match e.dir() {
+            // outer E (the edge runs N)
+            EdgeDir::N => (0, length),
+            // outer W (the edge runs S)
+            _ => (-length, 0),
+        };
+        Some((origin, Rect::new(xl, -half, xh, half)))
     }
 }
 
@@ -1199,6 +1264,7 @@ impl<'a> Worker<'a> {
         self.rect_only(layer, net, pin);
         self.off_grid(layer, net, pin);
         self.min_enclosed_area(layer, net, pin);
+        self.lef58_area(layer, net, pin);
     }
 
     /// `checkMetalShape_offGrid`: per maximal rectangle of the pin, in its order, one with any edge
@@ -1251,35 +1317,134 @@ impl<'a> Worker<'a> {
     }
 
     /// `checkMetalShape_minArea`, the marker pass: a polygon below the layer's minimum area gives a
-    /// marker on its bounding box — unless the layer has no area rule, the check is ignored (pin
-    /// access), the box is not WHOLLY inside the worker's check box, or any of its edges is fixed
-    /// (on the owner's fixed shapes). The patch pass (`allow_patching`) is the router's write-out.
+    /// marker on its bounding box (see [`Worker::min_area_breach`]).
     fn min_area(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        if let Some((bbox, _)) = self.min_area_breach(layer, net, pin) {
+            self.add_marker(Rule::MinArea, layer, bbox, net, net);
+        }
+    }
+
+    /// `checkMetalShape_minArea`'s test, shared by the marker pass and the patch pass: the
+    /// polygon's bounding box and the layer's minimum area, when the polygon is below it — unless
+    /// the layer has no area rule, the check is ignored (pin access), the box is not WHOLLY
+    /// inside the worker's check box, or any of its edges is fixed (on the owner's fixed shapes).
+    fn min_area_breach(&self, layer: usize, net: usize, pin: &mut Polygon90Set) -> Option<(Rect, i64)> {
         let required = self.tech.layers[layer].min_area;
         if self.ignore_min_area || required == 0 {
-            return;
+            return None;
         }
         let slices = pin.rectangles();
         if slices.iter().map(area).sum::<i64>() >= required {
-            return;
+            return None;
         }
+        let bbox = self.pin_bbox_in_drc_box(&slices)?;
+        if self.pin_segs(layer, net, &slices).iter().any(|e| e.fixed) {
+            return None;
+        }
+        Some((bbox, required))
+    }
+
+    /// A pin's bounding box, when the worker's check box holds it wholly (`drcBox_.contains`).
+    fn pin_bbox_in_drc_box(&self, slices: &[Rect]) -> Option<Rect> {
         let bbox = slices.iter().skip(1).fold(slices[0], |b, r| Rect { xl: b.xl.min(r.xl), yl: b.yl.min(r.yl), xh: b.xh.max(r.xh), yh: b.yh.max(r.yh) });
         if let Some(d) = self.drc_box {
             if !(d.xl <= bbox.xl && d.yl <= bbox.yl && bbox.xh <= d.xh && bbox.yh <= d.yh) {
-                return;
+                return None;
             }
         }
+        Some(bbox)
+    }
+
+    /// A pin's polygon edges (`pin->getPolygonEdges()`, outer ring then holes, ring order), each
+    /// marked fixed when it lies on the owner's fixed shapes' boundary or a fixed rectangle's.
+    fn pin_segs(&self, layer: usize, net: usize, slices: &[Rect]) -> Vec<Seg> {
         let net_ref = &self.nets[net];
         let mut fixed_edges: BTreeSet<EdgePoints> = boundary(&net_ref.fixed_slices[layer]).into_iter().collect();
         for r in &net_ref.fixed_rects[layer] {
             fixed_edges.extend([((r.xl, r.yl), (r.xh, r.yl)), ((r.xh, r.yl), (r.xh, r.yh)), ((r.xh, r.yh), (r.xl, r.yh)), ((r.xl, r.yh), (r.xl, r.yl))]);
         }
         let mut segs = Vec::new();
-        polygon_segs(&mut segs, &slices, &fixed_edges, net);
-        if segs.iter().any(|e| e.fixed) {
-            return;
+        polygon_segs(&mut segs, slices, &fixed_edges, net);
+        segs
+    }
+
+    /// `checkMetalShape_lef58Area`, the marker pass: a polygon breaking a LEF58_AREA rule gives a
+    /// marker on its bounding box, with that rule (see [`Worker::lef58_area_breach`]).
+    fn lef58_area(&mut self, layer: usize, net: usize, pin: &mut Polygon90Set) {
+        if let Some((bbox, rule)) = self.lef58_area_breach(layer, net, pin) {
+            self.add_marker(Rule::Lef58Area(rule.index), layer, bbox, net, net);
         }
-        self.add_marker(Rule::MinArea, layer, bbox, net, net);
+    }
+
+    /// `checkMetalShape_lef58Area`'s test, shared by the marker pass and the patch pass: the
+    /// polygon's bounding box and the rule it breaks ([`crate::tech::Lef58Area::violated`]) —
+    /// unless the check is ignored (pin access: the reference reads `ignoreMinArea_` here too),
+    /// the layer has no LEF58_AREA rule, the box is not WHOLLY inside the worker's check box, or
+    /// any of the polygon's edges is fixed. A rectangle is a polygon whose outer boundary has
+    /// four vertices (`poly->size() == 4`; with a hole it is one too, and no RECTWIDTH rule then
+    /// applies, as it is not one maximal rectangle).
+    fn lef58_area_breach(&self, layer: usize, net: usize, pin: &mut Polygon90Set) -> Option<(Rect, crate::tech::AreaRule)> {
+        let rules = &self.tech.layers[layer].lef58_area;
+        if self.ignore_min_area || rules.is_empty() {
+            return None;
+        }
+        let slices = pin.rectangles();
+        let bbox = self.pin_bbox_in_drc_box(&slices)?;
+        if self.pin_segs(layer, net, &slices).iter().any(|e| e.fixed) {
+            return None;
+        }
+        let is_rect = crate::polygon_formation::polygons_with_holes(&slices).first().is_some_and(|p| p.outer.len() == 4);
+        let curr: i64 = slices.iter().map(area).sum();
+        let max_rects = pin.max_rectangles();
+        rules.violated(is_rect, &max_rects, curr).map(|r| (bbox, r))
+    }
+
+    /// The patch pass's minimum-area half (`checkMetalShape(true)`, its `checkMetalShape_minArea`
+    /// and `checkMetalShape_lef58Area` with patching): per routing layer (bottom up), per pin of
+    /// the TARGET owner, a patch for the layer's minimum area when the pin is below it, then one
+    /// for the LEF58_AREA rule it breaks — both from the pin as it stands, so a pin below both
+    /// gets two patches. None without a target (`allow_patching && !targetNet_`). Each patch is
+    /// placed by [`area_patch_geometry`]; the router then picks its worker net and keeps it when
+    /// valid (`checkMetalShape_addPatch`'s second half).
+    pub fn area_patches(&mut self) -> Vec<AreaPatch> {
+        let mut out = Vec::new();
+        let Some(target) = self.target.clone() else { return out };
+        for layer in 0..self.tech.layers.len() {
+            if self.tech.layers[layer].kind != LayerKind::Routing {
+                continue;
+            }
+            let vertical = self.tech.layers[layer].dir == crate::tech::Dir::Vertical;
+            for net in 0..self.nets.len() {
+                if !self.checks_from(net) || self.nets[net].pins.len() <= layer {
+                    continue;
+                }
+                for k in 0..self.nets[net].pins[layer].len() {
+                    let mut pin = self.nets[net].pins[layer][k].clone();
+                    let mut required = Vec::new();
+                    if let Some((_, req)) = self.min_area_breach(layer, net, &mut pin) {
+                        required.push(req);
+                    }
+                    if let Some((_, rule)) = self.lef58_area_breach(layer, net, &mut pin) {
+                        required.push(rule.area);
+                    }
+                    if required.is_empty() {
+                        continue;
+                    }
+                    let slices = pin.rectangles();
+                    let curr: i64 = slices.iter().map(area).sum();
+                    let segs = self.pin_segs(layer, net, &slices);
+                    for req in required {
+                        // `checkMetalShape_addPatch(gcPin*, int min_area)`: the area narrowed to
+                        // int, the gap to `frCoord`.
+                        let gap = (i64::from(req as i32) - curr) as i32;
+                        if let Some((origin, offset)) = area_patch_geometry(&segs, vertical, gap, self.tech.manufacturing_grid) {
+                            out.push(AreaPatch { layer, origin, offset, owner: target.clone() });
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A slice narrower than the minimum width, unless the owner's fixed shapes cover it whole.
@@ -2817,9 +2982,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default() },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default() },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -2918,6 +3083,141 @@ pub(crate) mod tests {
         // Part of the polygon is the owner's fixed shape (a fixed edge): none.
         let fixed = [(net("a"), 4, Rect::new(0, 0, 150, 200), true), (net("a"), 4, Rect::new(150, 0, 300, 200), false)];
         assert!(boxes(&markers_min_area(&fixed, 100_000, None, false), Rule::MinArea).is_empty());
+    }
+
+    /// `markers`, on `tech()` with layer 4's LEF58_AREA rules (in io's lists), a check box, the
+    /// ignore flag and layer 4's plain minimum area.
+    fn markers_lef58_area(shapes: &[(Owner, usize, Rect, bool)], rules: &[crate::tech::AreaRule], drc: Option<Rect>, ignore: bool, min_area: i64) -> Vec<Marker> {
+        let mut t = tech();
+        for &r in rules {
+            t.layers[4].lef58_area.add(r);
+        }
+        t.layers[4].min_area = min_area;
+        let mut w = Worker::new(&t);
+        w.drc_box = drc;
+        w.ignore_min_area = ignore;
+        for (o, l, r, f) in shapes {
+            w.add(o, *l, *r, *f);
+        }
+        w.init();
+        w.run().to_vec()
+    }
+
+    /// Rule (`checkMetalShape_lef58Area`, the marker pass, after `checkMetalShape_minEnclosedArea`):
+    /// a polygon breaking a LEF58_AREA rule is a marker on its bounding box, named after the rule
+    /// broken (a marker per constraint). None when the box is not WHOLLY inside the check box, when
+    /// one of its edges is on the owner's fixed shapes, or when the check is ignored (pin access:
+    /// the reference reads `ignoreMinArea_` here too). Independent of the plain minimum area: a
+    /// polygon below both gets both markers (witness: `a`, `t`, `fx`).
+    #[test]
+    fn lef58_area_marks_a_polygon_below_the_rule_that_judges_it() {
+        use crate::tech::AreaRule;
+        let a = [AreaRule { index: 0, area: 100_000, rect_width: 0, except_rectangle: false }];
+        let stub = [(net("a"), 4, Rect::new(0, 0, 300, 200), false)];
+        let m = markers_lef58_area(&stub, &a, Some(Rect::new(-1000, -1000, 1000, 1000)), false, 0);
+        assert_eq!(m.iter().map(|m| (m.rule, m.bbox)).collect::<Vec<_>>(), [(Rule::Lef58Area(0), Rect::new(0, 0, 300, 200))]);
+        assert!(markers_lef58_area(&stub, &a, Some(Rect::new(-1000, -1000, 150, 1000)), false, 0).is_empty(), "the check box must hold it");
+        assert!(markers_lef58_area(&stub, &a, None, true, 0).is_empty(), "ignored");
+        let fixed = [(net("a"), 4, Rect::new(0, 0, 150, 200), true), (net("a"), 4, Rect::new(150, 0, 300, 200), false)];
+        assert!(markers_lef58_area(&fixed, &a, None, false, 0).is_empty(), "a fixed edge");
+        let both = markers_lef58_area(&stub, &a, None, false, 80_000);
+        assert_eq!(both.iter().map(|m| m.rule).collect::<Vec<_>>(), [Rule::MinArea, Rule::Lef58Area(0)]);
+        // A tie: the later rule (EXCEPTRECTANGLE) is tried first; a rectangle passes to rule 0, an
+        // L is marked by rule 1 — two constraints, two marker identities.
+        let t = [AreaRule { index: 0, area: 100_000, rect_width: 0, except_rectangle: false }, AreaRule { index: 1, area: 100_000, rect_width: 0, except_rectangle: true }];
+        assert_eq!(markers_lef58_area(&stub, &t, None, false, 0)[0].rule, Rule::Lef58Area(0));
+        let ell = [(net("a"), 4, Rect::new(0, 0, 300, 100), false), (net("a"), 4, Rect::new(200, 0, 300, 300), false)];
+        assert_eq!(area_rules(&markers_lef58_area(&ell, &t, None, false, 0)), [Rule::Lef58Area(1)]);
+        // A RECTWIDTH rule judges a narrow rectangle alone; a ring (four outer vertices, a hole)
+        // is not one maximal rectangle, so it falls to the other rules.
+        let w = [AreaRule { index: 0, area: 100_000, rect_width: 200, except_rectangle: false }, AreaRule { index: 1, area: 300_000, rect_width: 0, except_rectangle: false }];
+        assert_eq!(markers_lef58_area(&stub, &w, None, false, 0)[0].rule, Rule::Lef58Area(0));
+        let ring = [(net("a"), 4, Rect::new(0, 0, 500, 100), false), (net("a"), 4, Rect::new(0, 400, 500, 500), false), (net("a"), 4, Rect::new(0, 0, 100, 500), false), (net("a"), 4, Rect::new(400, 0, 500, 500), false)];
+        assert_eq!(area_rules(&markers_lef58_area(&ring, &w, None, false, 0)), [Rule::Lef58Area(1)]);
+    }
+
+    /// The LEF58_AREA rules among `m` (the thin test shapes also break the minimum width).
+    fn area_rules(m: &[Marker]) -> Vec<Rule> {
+        m.iter().map(|m| m.rule).filter(|r| matches!(r, Rule::Lef58Area(_))).collect()
+    }
+
+    /// Rule (`checkMetalShape(true)`: `checkMetalShape_minArea` then `checkMetalShape_lef58Area`
+    /// with patching): only the TARGET's pins are patched (none without a target); both tests
+    /// read the pin as it stands, so a pin below the plain minimum area AND a LEF58_AREA rule
+    /// gets two patches, the minimum area's first; a pin with a fixed edge gets none.
+    #[test]
+    fn the_patch_pass_patches_the_target_for_each_area_rule_it_breaks() {
+        use crate::tech::AreaRule;
+        let mut t = tech();
+        t.layers[4].lef58_area.add(AreaRule { index: 0, area: 100_000, rect_width: 0, except_rectangle: false });
+        t.layers[4].min_area = 80_000;
+        let run = |shapes: &[(Owner, usize, Rect, bool)], target: Option<Owner>| {
+            let mut w = Worker::new(&t);
+            for (o, l, r, f) in shapes {
+                w.add(o, *l, *r, *f);
+            }
+            w.init();
+            w.target = target;
+            w.area_patches()
+        };
+        let stub = [(net("a"), 4, Rect::new(0, 0, 300, 200), false), (net("b"), 4, Rect::new(0, 1000, 300, 1200), false)];
+        let p = run(&stub, Some(net("a")));
+        // Layer 4 is horizontal: the first vertical edge, the right one, grows east by
+        // ceil((80000 - 60000) / 200 / 5) * 5 = 100, then by (100000 - 60000) / 200 = 200.
+        assert_eq!(p.iter().map(|p| (p.layer, p.origin, p.offset)).collect::<Vec<_>>(), [(4, (300, 100), Rect::new(0, -100, 100, 100)), (4, (300, 100), Rect::new(0, -100, 200, 100))]);
+        assert!(p.iter().all(|p| p.owner == net("a")), "net b is not the target");
+        assert!(run(&stub, None).is_empty(), "no target: no patching");
+        let fixed = [(net("a"), 4, Rect::new(0, 0, 150, 200), true), (net("a"), 4, Rect::new(150, 0, 300, 200), false)];
+        assert!(run(&fixed, Some(net("a"))).is_empty());
+    }
+
+    /// The polygon edges of `slices` (one polygon, nothing fixed), ring order.
+    fn ring(slices: &[Rect]) -> Vec<Seg> {
+        let mut segs = Vec::new();
+        polygon_segs(&mut segs, slices, &BTreeSet::new(), 0);
+        segs
+    }
+
+    /// Rule (`checkMetalShape_addPatch`; the reference's trace on gcd_nangate45 with a LEF58_AREA
+    /// rule): the patch grows from an edge running ACROSS the layer's direction, the first of the
+    /// best in ring order (a rectangle's ring starts at its lower-left corner, running east), as
+    /// wide as the edge (half each way from its midpoint) and out of the polygon by
+    /// `ceil(gap / edge / grid) * grid`. On a vertical layer a rectangle grows down from its
+    /// bottom edge — (27480, 28560)-(27620, 28840), gap 40800: origin (27550, 28560), box
+    /// (-70, -300, 70, 0); on a horizontal layer east from its right edge — (27410, 134750)-
+    /// (27770, 134890), gap 29600: origin (27770, 134820), box (0, -70, 220, 70).
+    #[test]
+    fn an_area_patch_grows_from_the_first_best_edge_across_the_layer() {
+        let v = ring(&[Rect::new(27480, 28560, 27620, 28840)]);
+        assert_eq!(area_patch_geometry(&v, true, 40_800, 10), Some(((27550, 28560), Rect::new(-70, -300, 70, 0))));
+        let h = ring(&[Rect::new(27410, 134750, 27770, 134890)]);
+        assert_eq!(area_patch_geometry(&h, false, 29_600, 10), Some(((27770, 134820), Rect::new(0, -70, 220, 70))));
+        // 18400 / 140 / 10 = 13.14…: 14 grids.
+        let h2 = ring(&[Rect::new(87830, 138670, 88270, 138810)]);
+        assert_eq!(area_patch_geometry(&h2, false, 18_400, 10), Some(((88270, 138740), Rect::new(0, -70, 140, 70))));
+        // An exact multiple stays: 42000 / 140 / 10 = 30.
+        assert_eq!(area_patch_geometry(&v, true, 42_000, 10).map(|g| g.1), Some(Rect::new(-70, -300, 70, 0)));
+        // An odd edge: each half truncated (141 / 2 = 70), the origin at the truncated midpoint.
+        let odd = ring(&[Rect::new(0, 0, 141, 280)]);
+        assert_eq!(area_patch_geometry(&odd, true, 1_000, 10), Some(((70, 0), Rect::new(-70, -10, 70, 0))));
+    }
+
+    /// Rule (`bestSuitable`): an edge with BOTH corners convex beats any edge without, however
+    /// long; among the same kind only a strictly longer edge replaces the one held. A "+" (bars
+    /// 1000 x 100 and 100 x 300) on a vertical layer: the long horizontal edges (450) each end at
+    /// a concave corner, so the vertical bar's bottom (100, convex) is chosen, and its top (100,
+    /// convex, later in the ring) does not replace it.
+    #[test]
+    fn an_area_patch_prefers_a_convex_edge_to_a_longer_one() {
+        let plus = ring(&[Rect::new(0, 100, 1000, 200), Rect::new(450, 0, 550, 100), Rect::new(450, 200, 550, 300)]);
+        assert_eq!(area_patch_geometry(&plus, true, 1_000, 10), Some(((500, 0), Rect::new(-50, -10, 50, 0))));
+        // On a horizontal layer the vertical edges: the bar's two ends (100, convex) tie, and the
+        // one earlier in the ring wins. Where a ring starts is the polygon formation's accident
+        // (polygon_formation.rs); this one starts on the bar's left end, so the left end grows west.
+        let left = plus.iter().position(|e| e.from == (0, 200) && e.to == (0, 100)).expect("left end");
+        let right = plus.iter().position(|e| e.from == (1000, 100) && e.to == (1000, 200)).expect("right end");
+        assert!(left < right, "ring order: {plus:?}");
+        assert_eq!(area_patch_geometry(&plus, false, 1_000, 10), Some(((0, 150), Rect::new(-10, -50, 0, 50))));
     }
 
     /// Rule (`checkMetalShape_offGrid`, every routing layer): a maximal rectangle of one owner's

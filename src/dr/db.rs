@@ -127,6 +127,10 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 // the parallel-run table has (the check, the maze and track costs, the via-to-via
                 // and line prep), each on both widths.
                 "two_widths_spacing" => true,
+                // LEF58_AREA: the check (`checkMetalShape_lef58Area`, marking) and the router's patch
+                // pass (`checkMetalShape_addPatch`), its only consumers; the forms io skips are
+                // skipped with a warning (`skipped_rules`), and io keeps nothing else.
+                "lef58_area" => true,
                 _ => false,
             };
             if !modelled {
@@ -178,6 +182,10 @@ impl SkippedRule {
                 "layer {}: LEF58_SPACING cut spacing rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
             ),
+            ("lef58_area", clause) => format!(
+                "layer {}: LEF58_AREA rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
+                self.layer, self.index
+            ),
             ("lef58_min_cut", clause) => format!(
                 "layer {}: LEF58_MINIMUMCUT rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
@@ -204,7 +212,9 @@ impl SkippedRule {
 /// technology's order: each LEF58 end-of-line rule with TOCONCAVECORNER or TONOTCHLENGTH
 /// ([`crate::tech::read::lef58_eol_skipped_clause`]), then each LEF58 minimum-cut rule the
 /// reference skips or drops unread ([`crate::tech::read::lef58_min_cut_skipped_clause`]: AREA,
-/// SAMEMETALOVERLAP, FULLYENCLOSED, or written per cut class), then on each cut layer each LEF58
+/// SAMEMETALOVERLAP, FULLYENCLOSED, or written per cut class), then each LEF58_AREA rule io
+/// skips ([`crate::tech::read::lef58_area_skipped_clause`]: EXCEPTMINWIDTH, EXCEPTEDGELENGTH,
+/// EXCEPTMINSIZE, EXCEPTSTEP, MASK, LAYER), then on each cut layer each LEF58
 /// cut spacing ADJACENTCUTS rule io skips ([`crate::tech::read::adjacent_cuts_rule`]:
 /// EXACTALIGNED, EXCEPTSAMEPGNET, TO ALL, SIDEPARALLELOVERLAP, SAMEMASK) and each LAYER rule with
 /// no CUTCLASS (kept by io, never checked by the reference's GC) — routed as the
@@ -222,6 +232,11 @@ pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
         for k in 0..db.num_layer_get_tech_layer_min_cut_rules(&l.name) {
             if let Some(clause) = crate::tech::read::lef58_min_cut_skipped_clause(db, &l.name, k) {
                 out.push(SkippedRule { layer: l.name.clone(), family: "lef58_min_cut", index: k, clause });
+            }
+        }
+        for k in 0..db.num_layer_get_tech_layer_area_rules(&l.name) {
+            if let Some(clause) = crate::tech::read::lef58_area_skipped_clause(db, &l.name, k) {
+                out.push(SkippedRule { layer: l.name.clone(), family: "lef58_area", index: k, clause });
             }
         }
     }
@@ -899,6 +914,47 @@ mod skipped_rule_tests {
         assert_eq!(tech.layers[m1].mt_safe_dist, 2500);
         assert_eq!(crate::dr::drw::mt_safe_dist(&tech, &[]), 2500);
         assert_eq!(tech.layers[tech.layer_num("M2").expect("M2")].min_cuts, []);
+    }
+
+    /// Rule (reference io `setRoutingLayerProperties`, its LEF58_AREA loop): a rule with
+    /// EXCEPTMINWIDTH, EXCEPTEDGELENGTH (one value or two), EXCEPTMINSIZE, EXCEPTSTEP, MASK or
+    /// LAYER (a trim layer) is skipped with a warning (DRT-311..316), tested in that order; every
+    /// other rule is kept, a RECTWIDTH one in the first list (ascending by RECTWIDTH, AREA), any
+    /// other in the second (descending by AREA), a tie going before the rules it ties with.
+    /// MODELLED (the check and the router's patch pass), nothing refused.
+    #[test]
+    fn lef58_area_rules_are_kept_in_io_lists_and_the_skipped_forms_warned() {
+        let rules = [
+            "AREA 0.02 ;",
+            "AREA 0.03 EXCEPTMINWIDTH 0.05 ;",
+            "AREA 0.01 RECTWIDTH 0.05 ;",
+            "AREA 0.02 EXCEPTEDGELENGTH 0.1 ;",
+            "AREA 0.02 EXCEPTEDGELENGTH 0.1 0.2 ;",
+            "AREA 0.02 EXCEPTMINSIZE 0.05 0.1 ;",
+            "AREA 0.02 EXCEPTSTEP 0.05 0.1 ;",
+            "AREA 0.02 MASK 1 ;",
+            "AREA 0.02 LAYER M1 OVERLAP 1 ;",
+            "AREA 0.02 EXCEPTRECTANGLE ;",
+            "AREA 0.005 RECTWIDTH 0.05 ;",
+            "AREA 0.04 ;",
+            "AREA 0.02 MASK 1 EXCEPTMINWIDTH 0.05 ;",
+            "AREA 0.02 RECTWIDTH 0.04 EXCEPTRECTANGLE ;",
+        ];
+        let m1 = format!("  PROPERTY LEF58_AREA \"{}\" ;\n", rules.join(" "));
+        let d = db("area", &m1, "");
+        assert_eq!(d.num_layer_get_tech_layer_area_rules("M1"), rules.len(), "every rule parsed");
+        let (skipped, refused, _) = census(&d);
+        assert!(refused.is_empty(), "{refused:?}");
+        let sk = |index, clause| super::SkippedRule { layer: "M1".into(), family: "lef58_area", index, clause };
+        assert_eq!(skipped, [sk(1, "EXCEPTMINWIDTH"), sk(3, "EXCEPTEDGELENGTH"), sk(4, "EXCEPTEDGELENGTH"), sk(5, "EXCEPTMINSIZE"), sk(6, "EXCEPTSTEP"), sk(7, "MASK"), sk(8, "LAYER"), sk(12, "EXCEPTMINWIDTH")]);
+        assert!(skipped[0].warning().contains("LEF58_AREA rule 1 uses EXCEPTMINWIDTH") && skipped[0].warning().contains("SKIPPED"));
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let l = &tech.layers[tech.layer_num("M1").expect("M1")].lef58_area;
+        use crate::tech::AreaRule;
+        let r = |index, area, rect_width, except_rectangle| AreaRule { index, area, rect_width, except_rectangle };
+        assert_eq!(l.rect_width, [r(13, 20_000, 40, true), r(10, 5_000, 50, false), r(2, 10_000, 50, false)]);
+        assert_eq!(l.area, [r(11, 40_000, 0, false), r(9, 20_000, 0, true), r(0, 20_000, 0, false)]);
+        assert!(tech.layers[tech.layer_num("M2").expect("M2")].lef58_area.is_empty());
     }
 
     /// Rule (reference io `setCutLayerProperties`, LAYER branch): `SPACING s LAYER m CUTCLASS c

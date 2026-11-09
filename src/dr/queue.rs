@@ -385,24 +385,85 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
     events
 }
 
-/// `FlexGCWorker::main` with the surgical fix (the worker's own checks): when the technology has
-/// corner spacing, `patchMetalShape` — `checkMetalCornerSpacing`, then
-/// `patchMetalShape_cornerSpacing` — and the patched nets updated with their patches
-/// (`updateGCWorker`); then the full check and `modifyMarkers`. `target`: the worker net checked
-/// (`setTargetNet(drNet)`), none after the queue. The check's markers and patches.
-/// (The min-area and min-step patching of the same branch are not modelled: neither fires on any
-/// design of the corpora.)
+/// `FlexGCWorker::main` with the surgical fix (the worker's own checks): `checkMetalShape(true)`
+/// — with a target, its minimum-area and LEF58_AREA patches ([`Worker::area_patches`], each
+/// given its worker net and kept when valid by [`area_patch_owner`]); then, when the technology
+/// has corner spacing, `patchMetalShape` — `checkMetalCornerSpacing`, then
+/// `patchMetalShape_cornerSpacing` — on the check as it stood before any patch; and the patched
+/// nets updated with their patches (`updateGCWorker`); then the full check and `modifyMarkers`.
+/// `target`: the worker net checked (`setTargetNet(drNet)`), none after the queue. The check's
+/// markers and patches. (The min-step patching of the same branch is not modelled: it does not
+/// fire on any design of the corpora.)
 fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>) -> (Vec<Marker>, Vec<(usize, PatchWire)>) {
     let mut pw = Vec::new();
+    let rb = q.route_box;
+    for p in gw.area_patches() {
+        let Some(ni) = area_patch_owner(q, nets, state, &p) else { continue };
+        let pwire = PatchWire { layer: p.layer, origin: p.origin, offset: p.offset, owner: p.owner };
+        if is_patch_valid(&pwire, &rb) {
+            pw.push((ni, pwire));
+        }
+    }
     if q.mcfg.tech.layers.iter().any(|l| !l.corner_spacing.is_empty()) {
         let markers = gw.corner_markers();
-        pw = patch_corner_spacing(q, state, rq, &markers, target);
-        if !pw.is_empty() {
-            update_patched(gw, q, nets, state, &pw);
-        }
+        pw.extend(patch_corner_spacing(q, state, rq, &markers, target));
+    }
+    if !pw.is_empty() {
+        update_patched(gw, q, nets, state, &pw);
     }
     let patches: Vec<PatchWire> = pw.iter().map(|(_, p)| p.clone()).collect();
     (gw.run_patched(&patches).to_vec(), pw)
+}
+
+/// `gc_patch::isPatchValid`: a patch is kept when its box touches the route box (edges count) or
+/// the route box holds its origin (boundary included).
+fn is_patch_valid(p: &PatchWire, rb: &Rect) -> bool {
+    let o = p.origin;
+    touches(&p.bbox(), rb) || (rb.xl <= o.0 && o.0 <= rb.xh && rb.yl <= o.1 && o.1 <= rb.yh)
+}
+
+/// `checkMetalShape_addPatch`, its second half: the patch's worker net. The design net's only
+/// worker net; with several, `checkMetalShape_patchOwner_helper` — the first (worker order) whose
+/// pin box, else one of its boundary shapes, else one of its route shapes (each in order) strictly
+/// overlaps the patch's box. Upstream rule: that box is `patch->getOffsetBox()`, the box RELATIVE
+/// to the patch's origin, not where the patch is, so a match needs a shape near the origin of
+/// the design; without one the patch is dropped (`!patch->hasNet()`).
+fn area_patch_owner(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], p: &crate::gc::AreaPatch) -> Option<usize> {
+    let Owner::Net(name) = &p.owner else { return None };
+    let mine: Vec<usize> = (0..nets.len()).filter(|&i| (q.name)(i) == *name).collect();
+    if mine.len() == 1 {
+        return Some(mine[0]);
+    }
+    let tech = q.mcfg.tech;
+    patch_owner_helper(p.offset, mine.into_iter().map(|i| (i, nets[i].pin_box, state[i].ext.iter().chain(&state[i].figs).map(|f| fig_bbox(tech, f)).collect())))
+}
+
+/// `checkMetalShape_patchOwner_helper` on the patch's box as the reference passes it (`box`, the
+/// offset box): the first candidate worker net, in order, whose pin box, then one of its shapes'
+/// boxes (boundary shapes, then route shapes, in order) STRICTLY overlaps it (`Rect::overlaps`:
+/// interiors meet; touching is not enough).
+fn patch_owner_helper(b: Rect, cands: impl Iterator<Item = (usize, Rect, Vec<Rect>)>) -> Option<usize> {
+    let overlaps = |r: &Rect| r.xh > b.xl && r.xl < b.xh && r.yh > b.yl && r.yl < b.yh;
+    for (i, pin_box, figs) in cands {
+        if overlaps(&pin_box) || figs.iter().any(overlaps) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// A route shape's box (`drConnFig::getBBox`): a wire's, a via's over its three layers, a patch's.
+fn fig_bbox(tech: &crate::tech::Tech, f: &DrFig) -> Rect {
+    match *f {
+        DrFig::Seg { begin, end, width, begin_ext, end_ext, .. } => DrFig::seg_box(begin, end, width, begin_ext, end_ext),
+        DrFig::Via { via, origin, .. } => {
+            let vd = &tech.via_defs[via];
+            let all: Vec<&Rect> = vd.layer1_figs.iter().chain(&vd.cut_figs).chain(&vd.layer2_figs).collect();
+            let b = all.iter().skip(1).fold(*all[0], |a, f| Rect::new(a.xl.min(f.xl), a.yl.min(f.yl), a.xh.max(f.xh), a.yh.max(f.yh)));
+            Rect::new(b.xl + origin.0, b.yl + origin.1, b.xh + origin.0, b.yh + origin.1)
+        }
+        DrFig::Patch { origin, offset, .. } => Rect::new(offset.xl + origin.0, offset.yl + origin.1, offset.xh + origin.0, offset.yh + origin.1),
+    }
 }
 
 /// `patchMetalShape_cornerSpacing`: per corner-spacing marker, the first route shape of a source
@@ -461,7 +522,7 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
         let Some((ni, origin, fb)) = chosen else { continue };
         let mb = stretch_corner_patch(mb0, fb, tech.layers[l].is_horizontal(), tech.manufacturing_grid);
         let p = PatchWire { layer: l, origin, offset: Rect::new(mb.xl - origin.0, mb.yl - origin.1, mb.xh - origin.0, mb.yh - origin.1), owner: Owner::Net((q.name)(ni)) };
-        if touches(&p.bbox(), &rb) || in_rb(origin) {
+        if is_patch_valid(&p, &rb) {
             out.push((ni, p));
         }
     }
@@ -925,6 +986,39 @@ pub fn order_map(order: &[usize]) -> BTreeMap<usize, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`checkMetalShape_patchOwner_helper`, as `checkMetalShape_addPatch` calls it for a
+    /// design net with several worker nets): the box compared is the patch's OFFSET box (relative
+    /// to its origin — the reference's trace shows (-70, -300, 70, 0) for a patch at (87210,
+    /// 68320)), so a worker net is found only when a shape of it reaches the design's origin;
+    /// otherwise the patch has no net and is dropped. First match in order; pin box before
+    /// shapes; touching is not overlapping.
+    #[test]
+    fn a_patch_owner_is_looked_up_by_the_patch_box_relative_to_its_origin() {
+        let b = Rect::new(-70, -300, 70, 0);
+        let far = |i| (i, Rect::new(87000, 68000, 88000, 69000), vec![Rect::new(87140, 68320, 87280, 68600)]);
+        assert_eq!(patch_owner_helper(b, [far(0), far(1)].into_iter()), None, "where the patch IS does not count");
+        let near_shape = (1, Rect::new(5000, 5000, 6000, 6000), vec![Rect::new(9000, 9000, 9100, 9100), Rect::new(0, -10, 100, 10)]);
+        assert_eq!(patch_owner_helper(b, [far(0), near_shape.clone()].into_iter()), Some(1));
+        let near_pin = (2, Rect::new(-10, -10, 10, 10), vec![]);
+        assert_eq!(patch_owner_helper(b, [near_pin, near_shape].into_iter()), Some(2), "the first in order");
+        let touching = (3, Rect::new(70, -300, 200, 0), vec![Rect::new(-200, 0, 200, 50)]);
+        assert_eq!(patch_owner_helper(b, [touching].into_iter()), None, "touching edges do not overlap");
+    }
+
+    /// Rule (`gc_patch::isPatchValid`, both patch passes): a patch is kept when its box touches
+    /// the route box — sharing only an edge is enough — or the route box holds its origin; a patch
+    /// wholly outside, origin outside, is dropped.
+    #[test]
+    fn a_patch_is_valid_when_it_touches_the_route_box_or_holds_its_origin_there() {
+        let rb = Rect::new(0, 0, 1000, 1000);
+        let p = |origin: (i32, i32), offset: Rect| PatchWire { layer: 2, origin, offset, owner: Owner::Net("a".into()) };
+        assert!(is_patch_valid(&p((500, 500), Rect::new(0, -10, 100, 10)), &rb), "inside");
+        assert!(is_patch_valid(&p((1000, 500), Rect::new(0, -10, 100, 10)), &rb), "origin on the boundary, box outward");
+        assert!(is_patch_valid(&p((1100, 500), Rect::new(-100, -10, 0, 10)), &rb), "box edge on the boundary");
+        assert!(!is_patch_valid(&p((1100, 500), Rect::new(0, -10, 100, 10)), &rb), "wholly outside");
+        assert!(!is_patch_valid(&p((1001, 500), Rect::new(0, -10, 100, 10)), &rb), "one unit outside");
+    }
 
     // Rule (`patchMetalShape_cornerSpacing`): on a horizontal layer the patch spans the shape's y
     // and one grid past the marker in x — to the left when the shape starts at the marker's right
