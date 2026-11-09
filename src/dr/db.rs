@@ -131,6 +131,10 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
 /// The upstream issue for the end-of-line forms [`skipped_rules`] lists.
 pub const SKIPPED_EOL_UPSTREAM_ISSUE: &str = "OpenROAD issue #12174";
 
+/// The upstream issue for the per-cut-class LEF58 minimum-cut rules [`skipped_rules`] lists: the
+/// database reader never marks them per cut class, so the reference drops them unread.
+pub const SKIPPED_MIN_CUT_UPSTREAM_ISSUE: &str = "OpenROAD issue #12176";
+
 /// A rule the technology carries that routing neither checks nor refuses: it is SKIPPED, with a
 /// warning at tech load and an entry in the run's report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,8 +153,8 @@ impl SkippedRule {
     pub fn warning(&self) -> String {
         match (self.family, self.clause) {
             ("lef58_min_cut", "CUTCLASS") => format!(
-                "layer {}: LEF58_MINIMUMCUT rule {} is written per cut class (CUTCLASS), which the database reader keeps with a cut count of 0; the reference then drops it, and so does this router: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
-                self.layer, self.index
+                "layer {}: LEF58_MINIMUMCUT rule {} is written per cut class (CUTCLASS), which the database reader keeps with a cut count of 0; the reference then drops it, and so does this router: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (see {}).",
+                self.layer, self.index, SKIPPED_MIN_CUT_UPSTREAM_ISSUE
             ),
             ("lef58_min_cut", clause) => format!(
                 "layer {}: LEF58_MINIMUMCUT rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
@@ -165,7 +169,11 @@ impl SkippedRule {
 
     /// The upstream issue that explains the skip, when one is filed.
     pub fn upstream(&self) -> Option<&'static str> {
-        (self.family == "lef58_spacing_eol").then_some(SKIPPED_EOL_UPSTREAM_ISSUE)
+        match (self.family, self.clause) {
+            ("lef58_spacing_eol", _) => Some(SKIPPED_EOL_UPSTREAM_ISSUE),
+            ("lef58_min_cut", "CUTCLASS") => Some(SKIPPED_MIN_CUT_UPSTREAM_ISSUE),
+            _ => None,
+        }
     }
 }
 
@@ -768,7 +776,8 @@ mod skipped_rule_tests {
         // is dropped as one that can never be broken, not skipped).
         let sk = |index, clause| super::SkippedRule { layer: "M1".into(), family: "lef58_min_cut", index, clause };
         assert_eq!(skipped, [sk(1, "CUTCLASS"), sk(4, "AREA"), sk(5, "SAMEMETALOVERLAP"), sk(6, "FULLYENCLOSED")]);
-        assert!(skipped[0].warning().contains("per cut class") && skipped[1].warning().contains("uses AREA") && skipped.iter().all(|s| s.upstream().is_none()));
+        assert!(skipped[0].warning().contains("per cut class") && skipped[0].warning().contains("#12176") && skipped[1].warning().contains("uses AREA"));
+        assert_eq!(skipped.iter().map(|s| s.upstream()).collect::<Vec<_>>(), [Some(super::SKIPPED_MIN_CUT_UPSTREAM_ISSUE), None, None, None]);
         let tech = crate::tech::read::tech(&d).expect("tech");
         let m1 = tech.layer_num("M1").expect("M1");
         let rule = |num_cuts, width, within, from_above, length| MinCut { num_cuts, width, within, from_above, length };

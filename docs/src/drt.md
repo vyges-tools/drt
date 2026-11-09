@@ -140,7 +140,8 @@ reference router reads both forms as a plain end-of-line rule with `WITHIN 0` (u
 issue #12174), a reading this router does not copy. Skipped the same way: a `LEF58_MINIMUMCUT`
 rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
 reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS c n`: the
-database reader keeps it with a cut count of 0, so the reference drops it unread).
+database reader keeps it with a cut count of 0, so the reference drops it unread; upstream
+OpenROAD issue #12176).
 
 Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
 (it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,
