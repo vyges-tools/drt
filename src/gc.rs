@@ -2508,6 +2508,8 @@ impl<'a> Worker<'a> {
             owners.sort();
             owners.dedup();
             if self.seen.insert((bbox, layer, Rule::SpacingTableOrth, owners.clone())) {
+                // The reference's top is the cut's RIGHT edge (`ury = gtl::xh`), OpenROAD issue
+                // #12198; copied as written, normalised by `Rect::new`.
                 let side = |s: &Shape| (self.owner(s.net).clone(), layer, Rect::new(s.rect.xl, s.rect.yl, s.rect.xh, s.rect.xh), s.fixed);
                 let (victim, second_victim) = (side(&s1), side(&s2));
                 let aggressor = (self.owner(s3.net).clone(), layer, s3.rect, s3.fixed);
@@ -4856,8 +4858,8 @@ mod orth_spacing_tests {
     /// Rule (`checkCutSpacingTableOrthogonal_helper`, the marker's victims): the pair, each box
     /// taking its RIGHT edge for its top — the reference writes `ury = gtl::xh(...)` — then
     /// normalised (witness trace vyc-orth1: B (980,1070)-(1020,1110) recorded as
-    /// (980,1020)-(1020,1070)). Copied as written: the queue reads victim boxes when a marker
-    /// lies off the route box.
+    /// (980,1020)-(1020,1070)). Copied as written (OpenROAD issue #12198): the queue reads
+    /// victim boxes when a marker lies off the route box.
     #[test]
     fn the_victim_boxes_take_the_right_edge_for_the_top() {
         let m = run(vec![(60, 60)], &col(cut(1090, 1045)));
