@@ -96,7 +96,7 @@ vyges-drt detailed_route --db placed_with_guides.odb --out routed.def
 
 The JSON report carries `status`, `out`, `iterations` (search-and-repair iterations run),
 `markers` (design-rule markers standing at the end), `nets_written`, `routed_before`,
-`rerouted`, `skipped_rules` and `lef58_not_checked`.
+`rerouted`, `skipped_rules`, `lef58_not_checked` and `area_patches_dropped_no_owner` (below).
 
 `status` is `written` (routed with no marker standing, exit 0), `markers` (routed and written, but
 markers remain: exit 1, a finding rather than a pass), `refused` (exit 3) or `error` (exit 2).
@@ -129,7 +129,11 @@ m]`), and LEF58 cut spacing with adjacent cuts (`SPACING s [CENTERTOCENTER] ADJA
 [TWOCUTS t] WITHIN w [CUTCLASS c] [NOPRL]`; with `EXACTALIGNED`, `EXCEPTSAMEPGNET`, `TO ALL`,
 `SIDEPARALLELOVERLAP` or `SAMEMASK` the rule is skipped with a warning, as the reference skips
 it; a `SAMENET` rule beside one of these is refused, since the reference then judges only cuts of one
-net in them, upstream OpenROAD issue #12188; every other LEF58 cut spacing form is refused). A cell obstruction with its own `DESIGNRULEWIDTH`
+net in them, upstream OpenROAD issue #12188; every other LEF58 cut spacing form is refused), and
+`LEF58_AREA` on a routing layer (`AREA a` with `RECTWIDTH w` or `EXCEPTRECTANGLE`: checked, and
+patched on the routed net as the reference patches it; a rule with `EXCEPTMINWIDTH`,
+`EXCEPTEDGELENGTH`, `EXCEPTMINSIZE`, `EXCEPTSTEP`, `MASK` or `LAYER` is skipped with a warning, as
+the reference skips it). A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
@@ -155,6 +159,14 @@ OpenROAD issue #12176). Skipped the same way: a LEF58 cut spacing `LAYER` rule w
 nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`). The reference keeps it, but its check
 acts only on a cut class with one of those corners, so it never checks it and routes as if it were
 absent, without a warning (upstream OpenROAD issue #12187).
+
+Area patches dropped, counted: when a net has several pieces in one worker, the reference looks
+up the piece a minimum-area or `LEF58_AREA` patch belongs to by comparing the patch box relative
+to its origin, not where the patch is, so it usually finds none and drops the patch silently
+(upstream OpenROAD issue #12191). This router routes the same way, so its routes still match the
+reference, and counts the drops: the report's `area_patches_dropped_no_owner`, with one
+`DRT-PATCH-DROPPED` warning per run when it is not zero. A minimum-area marker such a patch would
+have fixed may remain, so sign-off DRC must cover minimum area.
 
 Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
 (it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,

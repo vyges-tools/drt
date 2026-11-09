@@ -20,6 +20,10 @@ pub enum Line {
     OwnWarn(String),
     /// An informational line of this engine's OWN, with no reference code (never scored).
     OwnInfo(String),
+    /// A warning of this engine's OWN under its own event code (never scored): a run-level count
+    /// the reference does not report (`DRT-PATCH-DROPPED`: area patches dropped for want of a
+    /// worker net, OpenROAD issue #12191).
+    OwnWarnCode(&'static str, String),
 }
 
 /// Where a stage writes its lines.
@@ -344,6 +348,7 @@ mod tests {
             Line::Report(t) => format!("R {t}"),
             Line::OwnWarn(t) => format!("V {t}"),
             Line::OwnInfo(t) => format!("v {t}"),
+            Line::OwnWarnCode(c, t) => format!("V {c} {t}"),
         }
     }
 

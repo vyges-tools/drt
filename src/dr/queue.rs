@@ -55,6 +55,9 @@ pub enum Event {
     Check { owner: Owner, markers: Vec<Marker> },
     /// After the queue, the check over every owner: the worker's markers.
     Final { markers: Vec<Marker>, patches: Vec<PatchWire> },
+    /// Area patches of one check dropped for want of a worker net (`!patch->hasNet()`; the owner
+    /// lookup compares the origin-relative box, OpenROAD issue #12191). Never zero.
+    AreaPatchesDropped(usize),
     /// The check's view of an owner (`VYGD_GC`): `gcinit` / `gcupd` and its maximal rectangles.
     Gc(String),
     /// An entry pushed onto the queue (after its batch was sorted).
@@ -329,7 +332,10 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                     events.push(Event::Gc(format!("gcupd|{}", owner_tag(&owner)) + &gw.dump(&owner)));
                 }
                 gw.target = Some(owner.clone());
-                let (m, pw) = gc_main_surgical(&mut gw, q, nets, &state, &rq, Some(i));
+                let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, Some(i));
+                if dropped > 0 {
+                    events.push(Event::AreaPatchesDropped(dropped));
+                }
                 // `modEolCosts_poly` reads the check's net, which already holds the new patches.
                 let mut with_patches = figs.clone();
                 with_patches.extend(pw.iter().map(|(_, p)| DrFig::Patch { layer: p.layer, origin: p.origin, offset: p.offset }));
@@ -379,7 +385,10 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
         crate::dr::route::edge_watch(w, "after-marker-cost");
     }
     gw.target = None;
-    let (m, pw) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None);
+    let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None);
+    if dropped > 0 {
+        events.push(Event::AreaPatchesDropped(dropped));
+    }
     events.push(Event::Final { markers: m, patches: pw.iter().map(|(_, p)| p.clone()).collect() });
     events.extend(write_gc_patches(q, &mut state, &mut rq, &pw, &[]));
     events
@@ -392,18 +401,10 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
 /// `patchMetalShape_cornerSpacing` — on the check as it stood before any patch; and the patched
 /// nets updated with their patches (`updateGCWorker`); then the full check and `modifyMarkers`.
 /// `target`: the worker net checked (`setTargetNet(drNet)`), none after the queue. The check's
-/// markers and patches. (The min-step patching of the same branch is not modelled: it does not
+/// markers and patches, and the count of area patches dropped for want of a worker net. (The min-step patching of the same branch is not modelled: it does not
 /// fire on any design of the corpora.)
-fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>) -> (Vec<Marker>, Vec<(usize, PatchWire)>) {
-    let mut pw = Vec::new();
-    let rb = q.route_box;
-    for p in gw.area_patches() {
-        let Some(ni) = area_patch_owner(q, nets, state, &p) else { continue };
-        let pwire = PatchWire { layer: p.layer, origin: p.origin, offset: p.offset, owner: p.owner };
-        if is_patch_valid(&pwire, &rb) {
-            pw.push((ni, pwire));
-        }
-    }
+fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>) -> (Vec<Marker>, Vec<(usize, PatchWire)>, usize) {
+    let (mut pw, dropped) = own_area_patches(gw.area_patches(), &|p| area_patch_owner(q, nets, state, p), &q.route_box);
     if q.mcfg.tech.layers.iter().any(|l| !l.corner_spacing.is_empty()) {
         let markers = gw.corner_markers();
         pw.extend(patch_corner_spacing(q, state, rq, &markers, target));
@@ -412,7 +413,27 @@ fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state
         update_patched(gw, q, nets, state, &pw);
     }
     let patches: Vec<PatchWire> = pw.iter().map(|(_, p)| p.clone()).collect();
-    (gw.run_patched(&patches).to_vec(), pw)
+    (gw.run_patched(&patches).to_vec(), pw, dropped)
+}
+
+/// `checkMetalShape_addPatch`, its end, per area patch in order: the worker net (`owner`), then
+/// [`is_patch_valid`]. The patches kept with their worker nets, and how many were dropped for
+/// want of a worker net — the reference drops them silently; the run reports the count
+/// (OpenROAD issue #12191). An invalid patch is dropped too but not counted.
+fn own_area_patches(patches: Vec<crate::gc::AreaPatch>, owner: &dyn Fn(&crate::gc::AreaPatch) -> Option<usize>, rb: &Rect) -> (Vec<(usize, PatchWire)>, usize) {
+    let mut kept = Vec::new();
+    let mut dropped = 0;
+    for p in patches {
+        let Some(ni) = owner(&p) else {
+            dropped += 1;
+            continue;
+        };
+        let pwire = PatchWire { layer: p.layer, origin: p.origin, offset: p.offset, owner: p.owner };
+        if is_patch_valid(&pwire, rb) {
+            kept.push((ni, pwire));
+        }
+    }
+    (kept, dropped)
 }
 
 /// `gc_patch::isPatchValid`: a patch is kept when its box touches the route box (edges count) or
@@ -427,7 +448,9 @@ fn is_patch_valid(p: &PatchWire, rb: &Rect) -> bool {
 /// pin box, else one of its boundary shapes, else one of its route shapes (each in order) strictly
 /// overlaps the patch's box. Upstream rule: that box is `patch->getOffsetBox()`, the box RELATIVE
 /// to the patch's origin, not where the patch is, so a match needs a shape near the origin of
-/// the design; without one the patch is dropped (`!patch->hasNet()`).
+/// the design; without one the patch is dropped (`!patch->hasNet()`). Reported upstream as
+/// OpenROAD issue #12191; routed as the reference routes, the drops counted
+/// ([`own_area_patches`]).
 fn area_patch_owner(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], p: &crate::gc::AreaPatch) -> Option<usize> {
     let Owner::Net(name) = &p.owner else { return None };
     let mine: Vec<usize> = (0..nets.len()).filter(|&i| (q.name)(i) == *name).collect();
@@ -991,8 +1014,8 @@ mod tests {
     /// design net with several worker nets): the box compared is the patch's OFFSET box (relative
     /// to its origin — the reference's trace shows (-70, -300, 70, 0) for a patch at (87210,
     /// 68320)), so a worker net is found only when a shape of it reaches the design's origin;
-    /// otherwise the patch has no net and is dropped. First match in order; pin box before
-    /// shapes; touching is not overlapping.
+    /// otherwise the patch has no net and is dropped (OpenROAD issue #12191). First match in
+    /// order; pin box before shapes; touching is not overlapping.
     #[test]
     fn a_patch_owner_is_looked_up_by_the_patch_box_relative_to_its_origin() {
         let b = Rect::new(-70, -300, 70, 0);
@@ -1004,6 +1027,27 @@ mod tests {
         assert_eq!(patch_owner_helper(b, [near_pin, near_shape].into_iter()), Some(2), "the first in order");
         let touching = (3, Rect::new(70, -300, 200, 0), vec![Rect::new(-200, 0, 200, 50)]);
         assert_eq!(patch_owner_helper(b, [touching].into_iter()), None, "touching edges do not overlap");
+    }
+
+    /// Rule (`checkMetalShape_addPatch`, its end): per area patch in order, the owner first — a
+    /// patch without one is dropped and COUNTED (the reference drops it silently; OpenROAD issue
+    /// #12191) — then validity: an invalid patch is dropped but not counted. Kept patches keep
+    /// their order and worker nets.
+    #[test]
+    fn area_patches_without_a_worker_net_are_dropped_and_counted() {
+        use crate::gc::AreaPatch;
+        let rb = Rect::new(0, 0, 1000, 1000);
+        let p = |x: i32, net: &str| AreaPatch { layer: 2, origin: (x, 500), offset: Rect::new(0, -10, 100, 10), owner: Owner::Net(net.into()) };
+        let patches = vec![p(100, "a"), p(200, "lost"), p(5000, "a"), p(300, "b"), p(400, "lost")];
+        let owner = |q: &AreaPatch| match &q.owner {
+            Owner::Net(n) if n == "a" => Some(0),
+            Owner::Net(n) if n == "b" => Some(1),
+            _ => None,
+        };
+        let (kept, dropped) = own_area_patches(patches, &owner, &rb);
+        assert_eq!(dropped, 2, "two patches found no worker net; the invalid one is not counted");
+        assert_eq!(kept.iter().map(|(n, w)| (*n, w.origin.0)).collect::<Vec<_>>(), [(0, 100), (1, 300)]);
+        assert_eq!(own_area_patches(Vec::new(), &owner, &rb).1, 0);
     }
 
     /// Rule (`gc_patch::isPatchValid`, both patch passes): a patch is kept when its box touches

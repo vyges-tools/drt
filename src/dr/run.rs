@@ -73,6 +73,15 @@ pub struct Summary {
     /// LEF58 layer properties the database reader left unparsed, NOT checked (informational,
     /// [`crate::dr::db::lef58_not_checked`]).
     pub lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>,
+    /// Minimum-area and LEF58_AREA patches dropped for want of a worker net, over every worker
+    /// and iteration: the reference drops them silently (OpenROAD issue #12191) and so does this
+    /// router, to route as it does; the count says how many.
+    pub area_patches_dropped_no_owner: usize,
+}
+
+/// The one warning a run logs when [`Summary::area_patches_dropped_no_owner`] is not zero.
+pub fn area_patches_dropped_warning(n: usize) -> String {
+    format!("{n} minimum-area or LEF58_AREA patches were dropped for want of a worker net, as the reference drops them (its owner lookup compares the patch box relative to its origin; OpenROAD issue #12191); a minimum-area marker they would have fixed may remain, so sign-off DRC must cover minimum area.")
 }
 
 /// Route the design and write the routes into the database.
@@ -95,14 +104,17 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     }
     let t = ta(&d, &g, &p, log);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
-    let (routes, markers_by_iteration, flow_by_iteration) = dr(&d, &g, &p, &t, end, log)?;
+    let (routes, markers_by_iteration, flow_by_iteration, area_patches_dropped_no_owner) = dr(&d, &g, &p, &t, end, log)?;
+    if area_patches_dropped_no_owner > 0 {
+        log(Line::OwnWarnCode("DRT-PATCH-DROPPED", area_patches_dropped_warning(area_patches_dropped_no_owner)));
+    }
     let iterations = markers_by_iteration.len();
     let markers = routes.markers().count();
     // The writer's (`fillConnFigs`).
     log(Line::Info(180, "Post processing.".into()));
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
-    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone(), lef58_not_checked: d.lef58_not_checked.clone() })
+    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone(), lef58_not_checked: d.lef58_not_checked.clone(), area_patches_dropped_no_owner })
 }
 
 /// The design as the router reads it: technology, tracks, instances, ports, nets and their
@@ -601,12 +613,14 @@ struct DrCtx<'a> {
     index_trees: Vec<PackedRTree<usize>>,
     inst_index: HashMap<&'a str, usize>,
     term_base: Vec<usize>,
+    /// Area patches dropped for want of a worker net, summed over the workers (any thread).
+    area_patches_dropped: std::sync::atomic::AtomicUsize,
 }
 
 /// The main loop: the strategy's rows in order until no marker stands, each row one
 /// search-and-repair iteration and the connectivity check after it, none past `end_iteration`.
 /// The routes, the markers standing after each iteration run, and each iteration's flow.
-pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>)> {
+pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>, usize)> {
     log(Line::Info(187, "Start routing data preparation.".into()));
     let cx = dr_init(d, g, p, t);
     log(Line::Info(194, "Start detail routing.".into()));
@@ -654,7 +668,7 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
     log(Line::Warn(290, "Warning: no DRC report specified, skipped writing DRC report".into()));
     log(Line::Info(198, "Complete detail routing.".into()));
     crate::dr::log::route_stats(&p.tech, d.dbu, routes.shapes.iter().flatten().map(|s| &s.fig)).into_iter().for_each(&mut *log);
-    Ok((routes, markers_by_iteration, flow_by_iteration))
+    Ok((routes, markers_by_iteration, flow_by_iteration, cx.area_patches_dropped.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
 /// Routing's set-up: what the workers share.
@@ -703,7 +717,7 @@ fn dr_init<'a>(d: &'a DesignIn, g: &'a GuidesIn, p: &'a Prep, t: &'a TaOut) -> D
     for (i, x) in d.insts.iter().enumerate() {
         term_base[i + 1] = term_base[i] + d.masters[&x.unique.master].terms.len();
     }
-    DrCtx { d, g, p, t, guide_trees, gr_tree, bpins, min_area, through, term_aps, class_of, fixed_trees, index_trees, inst_index, term_base }
+    DrCtx { d, g, p, t, guide_trees, gr_tree, bpins, min_area, through, term_aps, class_of, fixed_trees, index_trees, inst_index, term_base, area_patches_dropped: Default::default() }
 }
 
 impl DrCtx<'_> {
@@ -1058,6 +1072,9 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
             // A check patch joins the net's route (and marks it modified).
             Event::Patch { net, fig, .. } => last.entry(net).or_insert_with(|| nets[net].route.clone()).push(fig),
             Event::Final { markers, .. } => final_markers = markers,
+            Event::AreaPatchesDropped(n) => {
+                cx.area_patches_dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
             _ => {}
         }
     }
