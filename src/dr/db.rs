@@ -92,9 +92,10 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 continue;
             }
             if family == "lef58_cut_spacing_table" {
-                // Modelled for the different-net table on the layer itself (check, maze cost,
-                // via-to-via and the default `prep_cutSpcTbl` sets); the reader names any other kind.
-                if let Err(clause) = crate::tech::read::cut_spacing_table(db, &l.name, &l.cut_classes) {
+                // Modelled for the tables on the layer itself: different-net (check, maze cost,
+                // via-to-via and the default `prep_cutSpcTbl` sets) and SAMENET (check, via-to-via);
+                // the reader names any other kind.
+                if let Err(clause) = crate::tech::read::cut_spacing_tables(db, &l.name, &l.cut_classes) {
                     out.push(format!("{}: {family} ({n}, {clause})", l.name));
                 }
                 continue;
@@ -745,6 +746,25 @@ mod skipped_rule_tests {
         assert_eq!(tech.layers[m1].spacing, Some(crate::tech::MinSpacing::TwoWidths(want)));
         let m2 = tech.layer_num("M2").expect("M2");
         assert!(matches!(tech.layers[m2].spacing, Some(crate::tech::MinSpacing::Prl(_))));
+    }
+
+    /// Rule (reference io `setCutLayerProperties`, the LEF58_SPACINGTABLE loop): a SAMENET table
+    /// on the cut layer itself is kept beside the different-net one (each kind's last rule kept)
+    /// and MODELLED; a SAMEMETAL table (tested first, as io tests it) and an inter-layer table stay
+    /// refused, naming the kind.
+    #[test]
+    fn a_same_net_cut_spacing_table_is_modelled_beside_the_different_net_one() {
+        let tbl = |opt: &str, spc: &str| format!("  PROPERTY LEF58_SPACINGTABLE \"SPACINGTABLE DEFAULT {spc} {opt}CUTCLASS CA CA - - ;\" ;\n");
+        let d = db("sn", "", &format!("{}{}", tbl("", "0.06"), tbl("SAMENET ", "0.08")));
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let v1 = &tech.layers[tech.layer_num("V1").expect("V1")];
+        assert_eq!(v1.cut_table.as_ref().map(|t| t.default_spacing), Some((60, 60)));
+        assert_eq!(v1.cut_table_same_net.as_ref().map(|t| t.default_spacing), Some((80, 80)));
+        let d = db("sm", "", &format!("{}{}", tbl("", "0.06"), tbl("SAMEMETAL ", "0.08")));
+        let (_, refused, _) = census(&d);
+        assert_eq!(refused, ["V1: lef58_cut_spacing_table (2, a SAMEMETAL cut spacing table)"]);
     }
 
     /// Rule (reference io `setRoutingLayerProperties` then postProcess

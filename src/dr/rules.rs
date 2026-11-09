@@ -321,8 +321,9 @@ impl Ctx<'_> {
         // Different cut layers: spacing between cut layers is not modelled.
     }
 
-    /// `prep_via2viaForbiddenLen_lef58CutSpcTbl`: two cuts on the same layer under its LEF58
-    /// different-net cut spacing table — the spacing between their classes (`getSpacing`'s MAX of
+    /// `prep_via2viaForbiddenLen_lef58CutSpcTbl`: two cuts on the same layer under its LEF58 cut
+    /// spacing table — the SAMENET one when the layer has it, else the different-net one (io's
+    /// order; SAMEMETAL, which would come first, is refused) — the spacing between their classes (`getSpacing`'s MAX of
     /// first and second, END/SIDE by each cut's orientation across the direction) plus the cut's
     /// length along it (edge to edge); centre-and-edge: the larger of MAX and MIN plus the two half
     /// lengths; centre to centre: the spacing alone. Forbidden from 0. (Cuts on different layers
@@ -334,7 +335,7 @@ impl Ctx<'_> {
         if vd1.cut != vd2.cut {
             return;
         }
-        let Some(tb) = tech.layers[vd1.cut].cut_table.as_ref() else { return };
+        let Some(tb) = tech.layers[vd1.cut].cut_table_same_net.as_ref().or(tech.layers[vd1.cut].cut_table.as_ref()) else { return };
         let (cb1, cb2) = (bbox(&vd1.cut_figs), bbox(&vd2.cut_figs));
         let layer = &tech.layers[vd1.cut];
         let class = |r: &Rect| layer.cut_class_of(r.dx().min(r.dy()), r.dx().max(r.dy()));
@@ -858,6 +859,25 @@ mod tests {
         assert_eq!(range(false, false), vec![(0, 130)]);
         assert_eq!(range(false, true), vec![(0, 110)]);
         assert_eq!(range(true, false), vec![(0, 50)]);
+    }
+
+    // Rule (`prep_via2viaForbiddenLen_lef58CutSpcTbl`, one layer): the SAMENET table is read
+    // before the different-net one when the layer has both (the cut is 80 long, edge to edge).
+    #[test]
+    fn via_to_via_reads_the_same_net_table_first() {
+        let range = |same: Option<i32>| {
+            let mut t = tech(vec![via("v", r(-100, -100, 100, 100), r(-50, -50, 50, 50))]);
+            t.layers[3].cut_spacing = None;
+            let tbl = |s: i32| crate::tech::CutSpacingTable { n: 1, spacing: vec![(s, s); 4], center_to_center: vec![false], center_and_edge: vec![false], ..Default::default() };
+            t.layers[3].cut_table = Some(tbl(50));
+            t.layers[3].cut_table_same_net = same.map(tbl);
+            let c = Ctx { tech: &t, defaults: &[None, None, None, Some(0), None], cfg: &cfg(2, 4) };
+            let mut out = Ranges::new();
+            c.via2via_lef58_cut_spc_tbl(0, 0, true, &mut out);
+            out
+        };
+        assert_eq!(range(None), vec![(0, 130)]);
+        assert_eq!(range(Some(20)), vec![(0, 100)]);
     }
 
     // Via to via on one layer: only when BOTH vias are wider than the wire across the run, at

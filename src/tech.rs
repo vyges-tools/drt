@@ -49,8 +49,13 @@ pub struct Layer {
     pub cut_spacing: Option<i32>,
     /// A cut layer's LEF58 cut classes, in the technology's order.
     pub cut_classes: Vec<CutClass>,
-    /// A cut layer's LEF58 different-net cut spacing table (the only kind modelled).
+    /// A cut layer's LEF58 different-net cut spacing table (`getLef58DiffNetCutSpcTblConstraint`).
     pub cut_table: Option<CutSpacingTable>,
+    /// A cut layer's LEF58 SAMENET cut spacing table on the layer itself
+    /// (`getLef58SameNetCutSpcTblConstraint`): checked between cuts of one net, which the
+    /// different-net table then leaves to it; the via-to-via prep reads it before the
+    /// different-net one.
+    pub cut_table_same_net: Option<CutSpacingTable>,
     /// A cut layer's LEF58 enclosure rules as io keeps them (`frLef58EnclosureConstraint`), in the
     /// technology's order.
     pub cut_enclosures: Vec<CutEnclosure>,
@@ -723,8 +728,12 @@ pub mod read {
         }
     }
 
-    pub fn cut_spacing_table(db: &Db, layer: &str, classes: &[CutClass]) -> Result<Option<CutSpacingTable>, &'static str> {
-        let mut out = None;
+    /// The cut layer's LEF58 cut spacing tables as io `setCutLayerProperties` keeps them, in the
+    /// technology's order (a later table of a kind replaces an earlier one; SAMEMASK is skipped):
+    /// (different-net, SAMENET). SAMEMETAL is tested before SAMENET, as io tests it. Refused: a
+    /// LAYER (inter-layer) table and a SAMEMETAL table.
+    pub fn cut_spacing_tables(db: &Db, layer: &str, classes: &[CutClass]) -> Result<(Option<CutSpacingTable>, Option<CutSpacingTable>), &'static str> {
+        let (mut diff, mut same_net) = (None, None);
         for k in 0..db.num_layer_get_tech_layer_cut_spacing_table_def_rules(layer) {
             if db.cutspacingtablerule_is_same_mask(layer, k) {
                 continue;
@@ -732,9 +741,22 @@ pub mod read {
             if db.cutspacingtablerule_is_layer_valid(layer, k) {
                 return Err("a LAYER (inter-layer) cut spacing table");
             }
-            if db.cutspacingtablerule_is_same_net(layer, k) || db.cutspacingtablerule_is_same_metal(layer, k) {
-                return Err("a SAMENET or SAMEMETAL cut spacing table");
+            if db.cutspacingtablerule_is_same_metal(layer, k) {
+                return Err("a SAMEMETAL cut spacing table");
             }
+            let t = cut_spacing_table_rule(db, layer, k, classes)?;
+            if db.cutspacingtablerule_is_same_net(layer, k) {
+                same_net = Some(t);
+            } else {
+                diff = Some(t);
+            }
+        }
+        Ok((diff, same_net))
+    }
+
+    /// One LEF58 cut spacing table rule's lookups, evaluated for every class pair.
+    fn cut_spacing_table_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<CutSpacingTable, &'static str> {
+        {
             let names: Vec<&str> = std::iter::once("").chain(classes.iter().map(|c| c.name.as_str())).collect();
             let n = names.len();
             let mut t = CutSpacingTable { n, no_prl: db.cutspacingtablerule_is_no_prl(layer, k), horizontal: db.cutspacingtablerule_is_horizontal(layer, k), vertical: db.cutspacingtablerule_is_vertical(layer, k), ..Default::default() };
@@ -766,9 +788,8 @@ pub mod read {
             let c2 = first(db.cutspacingtablerule_get_spacing_table_row_map_names(layer, k));
             t.default_center_to_center = db.cutspacingtablerule_is_center_to_center(layer, k, &c1, &c2);
             t.default_center_and_edge = db.cutspacingtablerule_is_center_and_edge(layer, k, &c1, &c2);
-            out = Some(t);
+            Ok(t)
         }
-        Ok(out)
     }
 
     /// LEF58 corner spacing rule `k` of `layer`, as `io::Parser` translates it, or the first clause
@@ -1064,7 +1085,7 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1079,7 +1100,7 @@ pub mod read {
                     let width = db.layer_get_width(&name) as i32;
                     let cut_spacing = Some(db.layer_get_spacing(&name)).filter(|&s| s > 0);
                     let cut_classes = cut_classes(db, &name);
-                    let cut_table = cut_spacing_table(db, &name, &cut_classes).ok().flatten();
+                    let (cut_table, cut_table_same_net) = cut_spacing_tables(db, &name, &cut_classes).unwrap_or_default();
                     let cut_enclosures = (0..db.num_layer_get_tech_layer_cut_enclosure_rules(&name))
                         .filter(|&k| cut_enclosure_kept(db, &name, k))
                         .filter_map(|k| {
@@ -1101,7 +1122,7 @@ pub mod read {
                     if !rules.is_empty() {
                         layer_rules_by_name.push((layers.len(), rules));
                     }
-                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_enclosures, ..Layer::default() });
+                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_table_same_net, cut_enclosures, ..Layer::default() });
                 }
                 _ => {}
             }

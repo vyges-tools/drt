@@ -117,7 +117,8 @@ width, minimum area (patched, or reported where a patch cannot fix it), minimum 
 `LEF58_MINIMUMCUT` converted into the same rule as the reference converts it), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
 (its common clauses), corner spacing (convex corners, patched by the router), cut classes, the
-different-net cut spacing table, enclosure, and cut spacing to a concave corner or to a
+different-net and `SAMENET` cut spacing tables of a cut layer (a `SAMEMETAL` or inter-layer
+table is refused), enclosure, and cut spacing to a concave corner or to a
 non-end-of-line convex corner of the metal on another layer (`SPACING s LAYER l CUTCLASS c
 CONCAVECORNER`, its plain form, and `SPACING s LAYER l CUTCLASS c NONEOLCONVEXCORNER w [MINLENGTH
 m]`; every other LEF58 cut spacing form is refused). A cell obstruction with its own `DESIGNRULEWIDTH`
