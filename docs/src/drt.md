@@ -151,8 +151,10 @@ rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLY
 reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS c n`: the
 database reader keeps it with a cut count of 0, so the reference drops it unread; upstream
 OpenROAD issue #12176). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
-(`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`). The reference keeps it, but its check acts only on
-a rule with a cut class, so it never checks it and routes as if it were absent, without a warning.
+(`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`), or with a cut class but neither `CONCAVECORNER`
+nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`). The reference keeps it, but its check
+acts only on a cut class with one of those corners, so it never checks it and routes as if it were
+absent, without a warning.
 
 Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
 (it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,

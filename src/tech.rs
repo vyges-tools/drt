@@ -916,10 +916,11 @@ pub mod read {
     /// PARALLELOVERLAP, …), and on a LAYER rule each option io drops with a warning (STACK,
     /// ORTHOGONALSPACING, SHORTEDGEONLY, the CONCAVECORNER WIDTH / PARALLEL / EDGELENGTH branches,
     /// EXTENSION, ABOVEWIDTH, MASKOVERLAP, WRONGDIRECTION) or keeps but this engine does not model
-    /// (a class with neither corner — the reference's check then does nothing — CENTERTOCENTER,
-    /// SAMENET, SAMEMETAL, SAMEVIA, PRL). A rule with NO CUTCLASS (after STACK and
-    /// ORTHOGONALSPACING, which io tests first) is `Skipped`: io keeps it, and its check never
-    /// marks (`spc_layer` acts only under `hasCutClass()`).
+    /// (on a corner form: CENTERTOCENTER, SAMENET, SAMEMETAL, SAMEVIA, PRL). `Skipped`, as io
+    /// keeps them and their check never marks: a rule with NO CUTCLASS (after STACK and
+    /// ORTHOGONALSPACING, which io tests first; `spc_layer` acts only under `hasCutClass()`), and
+    /// a rule with a defined class but neither corner (after the branches io drops; `spc_layer`
+    /// has no third branch).
     pub fn cut_layer_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<Lef58CutRule, &'static str> {
         let ty = db.cutspacingrule_get_type(layer, k);
         if ty == "ADJACENTCUTS" {
@@ -958,7 +959,7 @@ pub mod read {
         if class.is_empty() {
             return Ok(Lef58CutRule::Skipped(if db.cutspacingrule_is_same_net(layer, k) { LAYER_NO_CLASS_SAME_NET } else { LAYER_NO_CLASS }));
         }
-        let unmodelled: [(bool, &'static str); 13] = [
+        let unmodelled: [(bool, &'static str); 8] = [
             (db.cutspacingrule_is_short_edge_only(layer, k), "SHORTEDGEONLY"),
             (db.cutspacingrule_is_concave_corner_width(layer, k), "CONCAVECORNER WIDTH"),
             (db.cutspacingrule_is_concave_corner_parallel(layer, k), "CONCAVECORNER PARALLEL"),
@@ -967,7 +968,21 @@ pub mod read {
             (db.cutspacingrule_is_above_width_valid(layer, k), "ABOVEWIDTH"),
             (db.cutspacingrule_is_mask_overlap(layer, k), "MASKOVERLAP"),
             (db.cutspacingrule_is_wrong_direction(layer, k), "WRONGDIRECTION"),
-            (!concave && !convex, "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER"),
+        ];
+        if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
+            return Err(clause);
+        }
+        let Some(c) = classes.iter().rposition(|c| c.name == class) else {
+            return Err("a CUTCLASS the layer does not define");
+        };
+        // io keeps a rule with a class but neither corner (with CENTERTOCENTER, SAMENET / SAMEMETAL
+        // / SAMEVIA, PRL), but `checkLef58CutSpacing_spc_layer`, past the class test, has only the
+        // CONCAVECORNER and NONEOLCONVEXCORNER branches, so the reference never checks it, and says
+        // nothing. Skipped here with a warning (a SAMENET one goes to io's same-net list).
+        if !concave && !convex {
+            return Ok(Lef58CutRule::Skipped(if db.cutspacingrule_is_same_net(layer, k) { LAYER_NO_CORNER_SAME_NET } else { LAYER_NO_CORNER }));
+        }
+        let unmodelled: [(bool, &'static str); 4] = [
             (db.cutspacingrule_is_center_to_center(layer, k), "CENTERTOCENTER"),
             (db.cutspacingrule_is_same_net(layer, k), "SAMENET"),
             (db.cutspacingrule_is_same_metal(layer, k) || db.cutspacingrule_is_same_via(layer, k), "SAMEMETAL/SAMEVIA"),
@@ -976,9 +991,6 @@ pub mod read {
         if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
             return Err(clause);
         }
-        let Some(c) = classes.iter().rposition(|c| c.name == class) else {
-            return Err("a CUTCLASS the layer does not define");
-        };
         // `getType` / the grammar: CONCAVECORNER and NONEOLCONVEXCORNER are alternatives, and the
         // check's concave branch comes first.
         let corner = if concave {
@@ -994,11 +1006,18 @@ pub mod read {
     pub const LAYER_NO_CLASS: &str = "LAYER without CUTCLASS";
     /// The same, with SAMENET (io's same-net list).
     pub const LAYER_NO_CLASS_SAME_NET: &str = "LAYER without CUTCLASS, SAMENET";
+    /// The skipped clause of a LEF58 cut spacing LAYER rule with a CUTCLASS but neither corner.
+    pub const LAYER_NO_CORNER: &str = "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER";
+    /// The same, with SAMENET (io's same-net list).
+    pub const LAYER_NO_CORNER_SAME_NET: &str = "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER, SAMENET";
+
+    /// Every clause of a LAYER rule io keeps but the reference's check never marks.
+    pub const LAYER_UNCHECKED: [&str; 4] = [LAYER_NO_CLASS, LAYER_NO_CLASS_SAME_NET, LAYER_NO_CORNER, LAYER_NO_CORNER_SAME_NET];
 
     /// Whether io puts LEF58 cut spacing rule `k` of `layer` in the layer's SAME-NET list: a rule it
     /// keeps (checked or skipped by this engine for being unchecked by the reference) with SAMENET.
     fn in_same_net_list(rule: &Result<Lef58CutRule, &'static str>) -> bool {
-        matches!(rule, Ok(Lef58CutRule::Skipped(c)) if *c == LAYER_NO_CLASS_SAME_NET)
+        matches!(rule, Ok(Lef58CutRule::Skipped(c)) if *c == LAYER_NO_CLASS_SAME_NET || *c == LAYER_NO_CORNER_SAME_NET)
     }
 
     /// `checkCutSpacing_main(rect)`: when the layer's same-net list holds any rule, every rule of
