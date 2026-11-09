@@ -3797,6 +3797,20 @@ mod cut_convex_tests {
         assert!(run(&pad, 150, Some(140)).is_empty(), "sides of 140 reach MINLENGTH 140");
     }
 
+    // Rule: MINLENGTH tests the edges on BOTH sides of the line end, each on its own. The 140-long
+    // end of a 1000-long arm whose other side steps in by 100 (a 100 edge to a concave corner):
+    // MINLENGTH 100 keeps it a line end (both corners skipped), MINLENGTH 200 does not (the short
+    // side alone fails it), so both corners mark — with the short side above, and mirrored below.
+    #[test]
+    fn min_length_tests_both_sides_of_the_line_end() {
+        let above = vec![("a", 4, Rect::new(0, 0, 1000, 140), false), ("a", 4, Rect::new(0, 140, 900, 1000), false), ("a", 3, Rect::new(880, 20, 980, 120), false)];
+        let below = vec![("a", 4, Rect::new(0, 860, 1000, 1000), false), ("a", 4, Rect::new(0, 0, 900, 860), false), ("a", 3, Rect::new(880, 880, 980, 980), false)];
+        assert!(run(&above, 150, Some(100)).is_empty());
+        assert_eq!(boxes(&run(&above, 150, Some(200))), [Rect::new(980, 0, 1000, 20), Rect::new(980, 120, 1000, 140)]);
+        assert!(run(&below, 150, Some(100)).is_empty());
+        assert_eq!(boxes(&run(&below, 150, Some(200))), [Rect::new(980, 860, 1000, 880), Rect::new(980, 980, 1000, 1000)]);
+    }
+
     // Rule: each leg of the triangle is the spacing CLIPPED to the corner's edge on that axis. At
     // the corner (1000, 0) of the block with a step 40 above it (the edge up to the concave corner
     // (1000, 40) is not a line end), the vertical leg is 40: (0, 45) does not mark (70 * 45 =
