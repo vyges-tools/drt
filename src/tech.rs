@@ -86,8 +86,14 @@ pub struct Layer {
     /// a layer that is not read as routing). More than one makes the layer unidirectional and
     /// right-way-on-grid-only; the router assigns no colour.
     pub num_masks: u32,
-    /// A routing layer's v5.4 MINIMUMCUT rules as io keeps them (`frMinimumcutConstraint`).
+    /// A routing layer's minimum-cut rules as io keeps them (`frMinimumcutConstraint`): the
+    /// v5.4 MINIMUMCUT rules, then the LEF58 ones io converts
+    /// ([`read::convert_lef58_min_cut_constraints`]).
     pub min_cuts: Vec<MinCut>,
+    /// The largest LENGTH … WITHIN distance of the layer's converted LEF58 minimum-cut rules (0
+    /// without one): io raises the router's multi-thread safe distance (MTSAFEDIST) to it. The
+    /// v5.4 rules' LENGTH does not raise it.
+    pub mt_safe_dist: i32,
     /// A routing layer's v5.8 MINSTEP rule as io keeps it (`frMinStepConstraint`).
     pub min_step: Option<MinStep>,
     /// A routing layer's v5.4 SPACING … RANGE rules, in the technology's order
@@ -1058,7 +1064,7 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, min_step, spacing_ranges });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1120,7 +1126,85 @@ pub mod read {
             let figs = |layer: usize| -> Vec<Rect> { boxes.iter().filter(|b| num_of(b.0) == Some(layer)).map(|b| Rect::new(b.1, b.2, b.3, b.4)).collect() };
             via_defs.push(ViaDef { name: via.clone(), is_default: db.techvia_is_default(&via), layer1: l1, cut, layer2: l2, layer1_figs: figs(l1), cut_figs: figs(cut), layer2_figs: figs(l2) });
         }
+        // io postProcess: `convertLef58MinCutConstraints` runs after the default vias are chosen.
+        convert_lef58_min_cut_constraints(db, &mut layers);
         Ok(Tech { layers, manufacturing_grid: db.tech_get_manufacturing_grid(), via_defs, obs_own_width: !db.tech_use_min_spacing_obs() })
+    }
+
+    /// io `setRoutingLayerProperties`, its LEF58 MINIMUMCUT loop: a rule with AREA,
+    /// SAMEMETALOVERLAP or FULLYENCLOSED is skipped (the reference warns and never checks it);
+    /// every other rule is kept for the conversion, in the layer's order.
+    pub fn lef58_min_cut_kept(db: &Db, layer: &str, k: usize) -> bool {
+        !(db.mincutrule_is_area_valid(layer, k) || db.mincutrule_is_same_metal_overlap(layer, k) || db.mincutrule_is_fully_enclosed(layer, k))
+    }
+
+    /// The clause that makes a LEF58 MINIMUMCUT rule SKIPPED with a warning: AREA,
+    /// SAMEMETALOVERLAP or FULLYENCLOSED (the reference's read loop, in its order, warns and skips
+    /// them), or CUTCLASS — a rule written per cut class, which the database's LEF reader keeps
+    /// with a count of 0 and without its PERCUTCLASS flag, so io drops it unread. Either way the
+    /// reference routes without the rule; so does this router, but it says so.
+    pub fn lef58_min_cut_skipped_clause(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
+        if db.mincutrule_is_area_valid(layer, k) {
+            Some("AREA")
+        } else if db.mincutrule_is_same_metal_overlap(layer, k) {
+            Some("SAMEMETALOVERLAP")
+        } else if db.mincutrule_is_fully_enclosed(layer, k) {
+            Some("FULLYENCLOSED")
+        } else if !db.mincutrule_is_per_cut_class(layer, k) && db.mincutrule_get_num_cuts(layer, k) == 0 {
+            Some("CUTCLASS")
+        } else {
+            None
+        }
+    }
+
+    /// The reason a kept LEF58 MINIMUMCUT rule is refused: PERCUTCLASS, whose count the reference
+    /// takes from the default via's cut class above or below (not modelled). The database's LEF
+    /// reader never sets that flag: a rule written per cut class (`MINIMUMCUT CUTCLASS c n …`)
+    /// keeps its count of 0 and is dropped by [`MinCut::applies`], so no LEF reaches this refusal.
+    pub fn lef58_min_cut_refusal(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
+        db.mincutrule_is_per_cut_class(layer, k).then_some("PERCUTCLASS")
+    }
+
+    /// io `convertLef58MinCutConstraints` (postProcess): per routing layer, bottom to top, each
+    /// kept LEF58 rule ([`lef58_min_cut_kept`]) asking for two or more cuts becomes a minimum-cut
+    /// rule appended after the v5.4 ones: NUMCUTS, WIDTH, WITHIN when given, FROMABOVE or
+    /// FROMBELOW, LENGTH … WITHIN (which also raises the layer's MTSAFEDIST contribution).
+    pub fn convert_lef58_min_cut_constraints(db: &Db, layers: &mut [Layer]) {
+        for l in layers.iter_mut().filter(|l| l.kind == LayerKind::Routing) {
+            for k in (0..db.num_layer_get_tech_layer_min_cut_rules(&l.name)).filter(|&k| lef58_min_cut_kept(db, &l.name, k)) {
+                if lef58_min_cut_refusal(db, &l.name, k).is_some() {
+                    continue;
+                }
+                if let Some(m) = lef58_min_cut(db, &l.name, k) {
+                    if let Some((_, within)) = m.length {
+                        l.mt_safe_dist = l.mt_safe_dist.max(within);
+                    }
+                    l.min_cuts.push(m);
+                }
+            }
+        }
+    }
+
+    /// One LEF58 rule as io converts it (`None` when it asks for a single cut or none).
+    fn lef58_min_cut(db: &Db, layer: &str, k: usize) -> Option<MinCut> {
+        let num_cuts = db.mincutrule_get_num_cuts(layer, k);
+        if !MinCut::applies(num_cuts) {
+            return None;
+        }
+        let mut from_above = None;
+        if db.mincutrule_is_from_above(layer, k) {
+            from_above = Some(true);
+        }
+        if db.mincutrule_is_from_below(layer, k) {
+            from_above = Some(false);
+        }
+        Some(MinCut {
+            num_cuts,
+            width: db.mincutrule_get_width(layer, k),
+            within: db.mincutrule_is_within_cut_dist_valid(layer, k).then(|| db.mincutrule_get_within_cut_dist(layer, k)),
+            from_above,
+            length: db.mincutrule_is_length_valid(layer, k).then(|| (db.mincutrule_get_length(layer, k), db.mincutrule_get_length_within_dist(layer, k))),
+        })
     }
 
     /// Every track pattern of the block, per layer: x patterns (vertical tracks), then y.

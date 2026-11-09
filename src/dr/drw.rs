@@ -1353,10 +1353,11 @@ pub fn init_edges(tech: &crate::tech::Tech, defaults: &[Option<usize>], cfg: &Gr
     g
 }
 
-/// The margin around a worker's route box: 2000, or the largest spacing any non-default rule
-/// sets on any layer when larger.
-pub fn mt_safe_dist(ndrs: &[&crate::dr::rules::NdrRule]) -> i32 {
-    ndrs.iter().flat_map(|n| n.spacings.iter().copied()).fold(2000, i32::max)
+/// The margin around a worker's route box (MTSAFEDIST): 2000, or when larger the largest spacing
+/// any non-default rule sets on any layer (io `setNDRs`) or the largest LENGTH … WITHIN distance of
+/// a converted LEF58 minimum-cut rule (io `convertLef58MinCutConstraints`).
+pub fn mt_safe_dist(tech: &crate::tech::Tech, ndrs: &[&crate::dr::rules::NdrRule]) -> i32 {
+    ndrs.iter().flat_map(|n| n.spacings.iter().copied()).chain(tech.layers.iter().map(|l| l.mt_safe_dist)).fold(2000, i32::max)
 }
 
 /// Each net's committed shapes placed on the worker's grid: a wire's ends (clamped into the

@@ -113,7 +113,8 @@ Design rules modelled: shorts, non-sufficient metal, parallel-run spacing (with 
 a width range), the two-widths spacing table (`SPACINGTABLE TWOWIDTHS`, looked up on both widths;
 kept over a parallel-run table on the same layer), cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing, minimum
 width, minimum area (patched, or reported where a patch cannot fix it), minimum enclosed area
-(`MINENCLOSEDAREA` without a width), minimum step, minimum cut, rect-only and
+(`MINENCLOSEDAREA` without a width), minimum step, minimum cut (`MINIMUMCUT`, and
+`LEF58_MINIMUMCUT` converted into the same rule as the reference converts it), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
 (its common clauses), corner spacing (convex corners, patched by the router), cut classes, the
 different-net cut spacing table, enclosure, and cut spacing to a concave corner or to a
@@ -123,7 +124,7 @@ m]`; every other LEF58 cut spacing form is refused). A cell obstruction with its
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
-report's `reason`), among them LEF58 minimum step and minimum cut, `SPACINGTABLE INFLUENCE` and a
+report's `reason`), among them LEF58 minimum step, `SPACINGTABLE INFLUENCE` and a
 metal-width via map; corner spacing in a design with a block master; a layer whose via pads break
 its minimum step; a non-default rule with hard spacing, via
 generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
@@ -136,7 +137,10 @@ Skipped with a warning, neither checked nor refused: a LEF58 end-of-line spacing
 load and lists each rule in the report's `skipped_rules` (layer, rule index, clause, `checked`
 false), in both commands; the status does not change. Sign-off DRC must cover these rules. The
 reference router reads both forms as a plain end-of-line rule with `WITHIN 0` (upstream OpenROAD
-issue #12174), a reading this router does not copy.
+issue #12174), a reading this router does not copy. Skipped the same way: a `LEF58_MINIMUMCUT`
+rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
+reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS c n`: the
+database reader keeps it with a cut count of 0, so the reference drops it unread).
 
 Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
 (it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,

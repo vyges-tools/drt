@@ -731,7 +731,7 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
     // the nets near them.
     let ripup_all = matches!(args.ripup, RipUp::All | RipUp::Incr);
     let tech = &cx.p.tech;
-    let mt = mt_safe_dist(&cx.d.ndrs.iter().collect::<Vec<_>>());
+    let mt = mt_safe_dist(tech, &cx.d.ndrs.iter().collect::<Vec<_>>());
     let batches: Vec<Vec<WorkerBoxes>> = match flow {
         Flow::Optimization => worker_batches(worker_groups(&cx.g.grid, args.size, args.offset, mt, 500), BATCH_SIZE),
         Flow::Guides => {
