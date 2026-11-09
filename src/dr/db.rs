@@ -145,6 +145,10 @@ pub const SKIPPED_EOL_UPSTREAM_ISSUE: &str = "OpenROAD issue #12174";
 /// database reader never marks them per cut class, so the reference drops them unread.
 pub const SKIPPED_MIN_CUT_UPSTREAM_ISSUE: &str = "OpenROAD issue #12176";
 
+/// The upstream issue for the LEF58 cut spacing LAYER rules [`skipped_rules`] lists: io keeps a
+/// rule with no CUTCLASS, or a CUTCLASS but no corner, and the check never acts on it.
+pub const SKIPPED_LAYER_UPSTREAM_ISSUE: &str = "OpenROAD issue #12187";
+
 /// A rule the technology carries that routing neither checks nor refuses: it is SKIPPED, with a
 /// warning at tech load and an entry in the run's report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,8 +171,8 @@ impl SkippedRule {
                 self.layer, self.index, SKIPPED_MIN_CUT_UPSTREAM_ISSUE
             ),
             ("lef58_cut_spacing", clause) if crate::tech::read::LAYER_UNCHECKED.contains(&clause) => format!(
-                "layer {}: LEF58_SPACING cut spacing rule {} is a {clause} rule. The reference keeps it but checks a LAYER rule only for a cut class with CONCAVECORNER or NONEOLCONVEXCORNER, so it never checks this one, and does not warn. This router routes as the reference does: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
-                self.layer, self.index
+                "layer {}: LEF58_SPACING cut spacing rule {} is a {clause} rule. The reference keeps it but checks a LAYER rule only for a cut class with CONCAVECORNER or NONEOLCONVEXCORNER, so it never checks this one, and does not warn. This router routes as the reference does: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (see {}).",
+                self.layer, self.index, SKIPPED_LAYER_UPSTREAM_ISSUE
             ),
             ("lef58_cut_spacing", clause) => format!(
                 "layer {}: LEF58_SPACING cut spacing rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
@@ -190,6 +194,7 @@ impl SkippedRule {
         match (self.family, self.clause) {
             ("lef58_spacing_eol", _) => Some(SKIPPED_EOL_UPSTREAM_ISSUE),
             ("lef58_min_cut", "CUTCLASS") => Some(SKIPPED_MIN_CUT_UPSTREAM_ISSUE),
+            ("lef58_cut_spacing", clause) if crate::tech::read::LAYER_UNCHECKED.contains(&clause) => Some(SKIPPED_LAYER_UPSTREAM_ISSUE),
             _ => None,
         }
     }
@@ -927,7 +932,7 @@ mod skipped_rule_tests {
         for (rule, clause) in [
             ("SPACING 0.07 SAMENET LAYER M2 CUTCLASS CA NONEOLCONVEXCORNER 0.05 ;", "SAMENET"),
             ("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER WIDTH 0.05 ENCLOSURE 0.01 EDGELENGTH 0.1 ;", "CONCAVECORNER WIDTH"),
-            ("SPACING 0.07 SAMENET LAYER M2 ;", "a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule)"),
+            ("SPACING 0.07 SAMENET LAYER M2 ;", "a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule: OpenROAD issue #12188)"),
             ("SPACING 0.07 LAYER M2 STACK ;", "STACK"),
             ("SPACING 0.07 CENTERTOCENTER LAYER M2 CUTCLASS CA CONCAVECORNER ;", "CENTERTOCENTER"),
             ("SPACING 0.07 LAYER M2 CUTCLASS CA SHORTEDGEONLY ;", "SHORTEDGEONLY"),
@@ -948,7 +953,7 @@ mod skipped_rule_tests {
     /// `checkLef58CutSpacing_spc_layer`): after STACK and ORTHOGONALSPACING, io KEEPS a LAYER rule
     /// with no CUTCLASS (spacing, CENTERTOCENTER, SAMENET, the second layer), a SAMENET one in the
     /// same-net list; but the check acts only under `hasCutClass()`, so the rule never marks and
-    /// nothing warns. SKIPPED here with a warning (no upstream issue yet), not in the layer's list,
+    /// nothing warns. SKIPPED here with a warning (OpenROAD issue #12187), not in the layer's list,
     /// and a checked rule beside a plain one is unaffected.
     #[test]
     fn a_layer_rule_without_a_cut_class_is_skipped() {
@@ -958,7 +963,7 @@ mod skipped_rule_tests {
         let (skipped, refused, _) = census(&d);
         assert!(refused.is_empty(), "{refused:?}");
         assert_eq!(skipped.iter().map(|s| (s.family, s.index, s.clause)).collect::<Vec<_>>(), [("lef58_cut_spacing", 0, LAYER_NO_CLASS), ("lef58_cut_spacing", 1, LAYER_NO_CLASS), ("lef58_cut_spacing", 2, LAYER_NO_CLASS_SAME_NET)]);
-        assert!(skipped.iter().all(|s| s.warning().contains("never checks this one") && s.warning().contains("SKIPPED") && s.upstream().is_none()), "{skipped:?}");
+        assert!(skipped.iter().all(|s| s.warning().contains("never checks this one") && s.warning().contains("SKIPPED") && s.warning().contains("#12187") && s.upstream() == Some(super::SKIPPED_LAYER_UPSTREAM_ISSUE)), "{skipped:?}");
         let tech = crate::tech::read::tech(&d).expect("tech");
         assert!(tech.layers[tech.layer_num("V1").expect("V1")].lef58_cut_spacing.is_empty());
         // Beside a checked rule: the checked rule alone is in the list; the plain one is skipped.
@@ -984,13 +989,13 @@ mod skipped_rule_tests {
         let (skipped, refused, _) = census(&d);
         assert!(refused.is_empty(), "{refused:?}");
         assert_eq!(skipped.iter().map(|s| (s.index, s.clause)).collect::<Vec<_>>(), [(0, LAYER_NO_CORNER), (1, LAYER_NO_CORNER), (2, LAYER_NO_CORNER_SAME_NET)]);
-        assert!(skipped.iter().all(|s| s.warning().contains("never checks this one") && s.upstream().is_none()), "{skipped:?}");
+        assert!(skipped.iter().all(|s| s.warning().contains("never checks this one") && s.upstream() == Some(super::SKIPPED_LAYER_UPSTREAM_ISSUE)), "{skipped:?}");
         let tech = crate::tech::read::tech(&d).expect("tech");
         assert!(tech.layers[tech.layer_num("V1").expect("V1")].lef58_cut_spacing.is_empty());
         // Its SAMENET form beside a checked rule is refused, as the no-class one is.
         let d = db("ncc-sn", "", &format!("{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol("SPACING 0.07 SAMENET LAYER M1 CUTCLASS CA ;")));
         let (_, refused, _) = census(&d);
-        assert_eq!(refused, ["V1: lef58_cut_spacing (2, a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule))"]);
+        assert_eq!(refused, ["V1: lef58_cut_spacing (2, a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule: OpenROAD issue #12188))"]);
     }
 
     /// Rule (reference GC `checkCutSpacing_main(rect)`): any rule in the layer's LEF58 SAME-NET
@@ -999,7 +1004,7 @@ mod skipped_rule_tests {
     /// beside skipped rules only, it changes nothing and is skipped.
     #[test]
     fn a_same_net_layer_rule_beside_a_checked_rule_is_refused() {
-        let reason = "a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule)";
+        let reason = "a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule: OpenROAD issue #12188)";
         for (checked, refused_want) in [
             ("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;", true),
             ("SPACING 0.1 CENTERTOCENTER ADJACENTCUTS 2 WITHIN 0.12 CUTCLASS CA ;", true),

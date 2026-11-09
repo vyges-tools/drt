@@ -1029,7 +1029,7 @@ pub mod read {
         let rules: Vec<_> = (0..db.num_layer_get_tech_layer_cut_spacing_rules(layer)).map(|k| cut_layer_rule(db, layer, k, classes)).collect();
         let same_net = rules.iter().any(in_same_net_list);
         let checked = rules.iter().any(|r| matches!(r, Ok(Lef58CutRule::Layer(_) | Lef58CutRule::AdjacentCuts(_))));
-        (same_net && checked).then_some("a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule)")
+        (same_net && checked).then_some("a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule: OpenROAD issue #12188)")
     }
 
     /// io's ADJACENTCUTS branch for LEF58 cut spacing rule `k` of cut layer `layer`: EXACTALIGNED,
