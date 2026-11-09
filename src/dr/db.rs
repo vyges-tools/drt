@@ -69,12 +69,13 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 continue;
             }
             if family == "lef58_cut_spacing" {
-                // Modelled for the cut-to-concave-corner form alone (`SPACING s LAYER l CUTCLASS c
+                // Modelled for the cut-to-corner forms alone (`SPACING s LAYER l CUTCLASS c
                 // CONCAVECORNER`: the check, the only consumer reached — the via-to-via prep that
                 // also reads it runs only for one named process node, an option this router does
-                // not take); the first rule outside it names the refusal.
+                // not take; `… NONEOLCONVEXCORNER w [MINLENGTH m]`: the check, its only consumer);
+                // the first rule outside them names the refusal.
                 let classes = &l.cut_classes;
-                if let Some(clause) = (0..n).find_map(|k| crate::tech::read::cut_concave_rule(db, &l.name, k, classes).err()) {
+                if let Some(clause) = (0..n).find_map(|k| crate::tech::read::cut_layer_rule(db, &l.name, k, classes).err()) {
                     out.push(format!("{}: {family} ({n}, {clause})", l.name));
                 }
                 continue;
@@ -675,25 +676,49 @@ mod skipped_rule_tests {
         let tech = crate::tech::read::tech(&d).expect("tech");
         let v1 = tech.layer_num("V1").expect("V1");
         let m2 = tech.layer_num("M2").expect("M2");
-        assert_eq!(tech.layers[v1].cut_concave, [crate::tech::CutConcaveSpacing { spacing: 70, second_layer: m2, class: 1 }]);
+        assert_eq!(tech.layers[v1].cut_layer_spacing, [crate::tech::CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: crate::tech::CutCorner::Concave }]);
         // The second layer is the one the rule names, below the cut as well as above it.
         let d = db("cc-below", "", &eol("SPACING 0.07 LAYER M1 CUTCLASS CA CONCAVECORNER ;"));
         let tech = crate::tech::read::tech(&d).expect("tech");
         let m1 = tech.layer_num("M1").expect("M1");
-        assert_eq!(tech.layers[v1].cut_concave, [crate::tech::CutConcaveSpacing { spacing: 70, second_layer: m1, class: 1 }]);
+        assert_eq!(tech.layers[v1].cut_layer_spacing, [crate::tech::CutLayerSpacing { spacing: 70, second_layer: m1, class: 1, corner: crate::tech::CutCorner::Concave }]);
+    }
+
+    /// Rule (reference io `setCutLayerProperties`, LAYER branch): `SPACING s LAYER m CUTCLASS c
+    /// NONEOLCONVEXCORNER w [MINLENGTH l]` is kept as a different-net LEF58 cut spacing rule with
+    /// the end-of-line width, and the minimum length only when MINLENGTH is given (it is read
+    /// under NONEOLCONVEXCORNER alone), so it is MODELLED, in the technology's order beside a
+    /// CONCAVECORNER rule.
+    #[test]
+    fn the_cut_spacing_layer_non_eol_convex_corner_form_is_modelled() {
+        use crate::tech::{CutCorner, CutLayerSpacing};
+        let rules = format!("{}{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol("SPACING 0.07 LAYER M2 CUTCLASS CA NONEOLCONVEXCORNER 0.05 ;"), eol("SPACING 0.08 LAYER M1 CUTCLASS CA NONEOLCONVEXCORNER 0.06 MINLENGTH 0.03 ;"));
+        let d = db("cv", "", &rules);
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let (v1, m1, m2) = (tech.layer_num("V1").expect("V1"), tech.layer_num("M1").expect("M1"), tech.layer_num("M2").expect("M2"));
+        assert_eq!(
+            tech.layers[v1].cut_layer_spacing,
+            [
+                CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: CutCorner::Concave },
+                CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: CutCorner::NonEolConvex { eol_width: 50, min_length: None } },
+                CutLayerSpacing { spacing: 80, second_layer: m1, class: 1, corner: CutCorner::NonEolConvex { eol_width: 60, min_length: Some(30) } },
+            ]
+        );
     }
 
     /// Every other LEF58 cut spacing form stays refused, naming its first clause outside the
-    /// modelled one; a modelled rule beside it does not lift the refusal.
+    /// modelled ones; a modelled rule beside it does not lift the refusal.
     #[test]
     fn other_lef58_cut_spacing_forms_stay_refused_naming_the_clause() {
         for (rule, clause) in [
-            ("SPACING 0.07 LAYER M2 CUTCLASS CA NONEOLCONVEXCORNER 0.05 ;", "NONEOLCONVEXCORNER"),
+            ("SPACING 0.07 SAMENET LAYER M2 CUTCLASS CA NONEOLCONVEXCORNER 0.05 ;", "SAMENET"),
             ("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER WIDTH 0.05 ENCLOSURE 0.01 EDGELENGTH 0.1 ;", "CONCAVECORNER WIDTH"),
             ("SPACING 0.07 LAYER M2 ;", "LAYER without CUTCLASS"),
             ("SPACING 0.07 SAMENET LAYER M2 ;", "LAYER without CUTCLASS"),
             ("SPACING 0.07 CENTERTOCENTER LAYER M2 CUTCLASS CA CONCAVECORNER ;", "CENTERTOCENTER"),
-            ("SPACING 0.07 LAYER M2 CUTCLASS CA ;", "LAYER CUTCLASS without CONCAVECORNER"),
+            ("SPACING 0.07 LAYER M2 CUTCLASS CA ;", "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER"),
             ("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS"),
         ] {
             let rules = format!("{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol(rule));
