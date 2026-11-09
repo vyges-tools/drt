@@ -1402,7 +1402,7 @@ mod tests {
         let sq = Rect::new(-150, -150, 150, 150);
         let mut t = Tech {
             layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, ..Default::default() }, routing(Dir::Vertical)],
-            via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq], cut_figs: vec![sq], layer2_figs: vec![sq] }],
+            via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq], cut_figs: vec![sq], layer2_figs: vec![sq], cut_class: None }],
             ..Default::default()
         };
         t.layers[4].rect_only = false;

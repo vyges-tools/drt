@@ -1553,7 +1553,7 @@ mod tests {
         let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, min_width: 100, pitch: 200, spacing: Some(table.clone().into()), ..Default::default() };
         Tech {
             layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing: Some(100), ..Default::default() }, routing(Dir::Vertical)],
-            via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-150, -50, 150, 50)], cut_figs: vec![r(-50, -50, 50, 50)], layer2_figs: vec![r(-50, -150, 50, 150)] }],
+            via_defs: vec![ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-150, -50, 150, 50)], cut_figs: vec![r(-50, -50, 50, 50)], layer2_figs: vec![r(-50, -150, 50, 150)], cut_class: None }],
             ..Default::default()
         }
     }
@@ -1673,7 +1673,7 @@ mod tests {
     #[test]
     fn a_unidirectional_guide_keeps_its_tracks_half_a_via_inside_the_die() {
         let mut f = rect_only(fixture());
-        f.tech.via_defs.push(ViaDef { name: "s".into(), is_default: true, layer1: 0, cut: 1, layer2: 2, layer1_figs: vec![r(-20, -20, 20, 20)], cut_figs: vec![r(-20, -20, 20, 20)], layer2_figs: vec![r(-20, -20, 20, 20)] });
+        f.tech.via_defs.push(ViaDef { name: "s".into(), is_default: true, layer1: 0, cut: 1, layer2: 2, layer1_figs: vec![r(-20, -20, 20, 20)], cut_figs: vec![r(-20, -20, 20, 20)], layer2_figs: vec![r(-20, -20, 20, 20)], cut_class: None });
         f.defaults[1] = Some(1);
         let st = state(&f, vec![TaGuide { net: 0, layer: 2, begin: (500, 500), end: (4500, 500), route: None }]);
         let mut w = worker(&st, 0);

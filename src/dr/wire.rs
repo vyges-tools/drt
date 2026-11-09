@@ -196,7 +196,7 @@ mod tests {
         let routing = |name: &str, dir, width, wrong_way_width| Layer { name: name.into(), kind: LayerKind::Routing, dir, width, min_width: width, wrong_way_width, ..Default::default() };
         Tech {
             layers: vec![Layer::default(), Layer::default(), routing("M1", Dir::Horizontal, 100, 120), Layer { name: "V1".into(), kind: LayerKind::Cut, ..Default::default() }, routing("M2", Dir::Vertical, 140, 160)],
-            via_defs: vec![ViaDef { name: "V12".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-50, -50, 50, 50)], cut_figs: vec![r(-20, -20, 20, 20)], layer2_figs: vec![r(-70, -70, 70, 70)] }],
+            via_defs: vec![ViaDef { name: "V12".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![r(-50, -50, 50, 50)], cut_figs: vec![r(-20, -20, 20, 20)], layer2_figs: vec![r(-70, -70, 70, 70)], cut_class: None }],
             ..Default::default()
         }
     }

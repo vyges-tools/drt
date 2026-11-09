@@ -86,7 +86,7 @@ mod tests {
     }
 
     fn via(name: &str, is_default: bool, cuts: usize, lower: Rect) -> ViaDef {
-        ViaDef { name: name.into(), is_default, layer1: 0, cut: 1, layer2: 2, layer1_figs: vec![lower], cut_figs: vec![r(-5, -5, 5, 5); cuts], layer2_figs: vec![r(-5, -10, 5, 10)] }
+        ViaDef { name: name.into(), is_default, layer1: 0, cut: 1, layer2: 2, layer1_figs: vec![lower], cut_figs: vec![r(-5, -5, 5, 5); cuts], layer2_figs: vec![r(-5, -10, 5, 10)], cut_class: None }
     }
 
     fn tp(vertical_tracks: bool, start: i32, num: i32, spacing: i32) -> TrackPattern {

@@ -136,7 +136,12 @@ patched on the routed net as the reference patches it; a rule with `EXCEPTMINWID
 the reference skips it), and the orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
 and closer than `s` across that run, is marked; the marker names the pair as its victims with the
-boxes the reference gives them, which the router reads when it picks the nets to rip up). A cell obstruction with its own `DESIGNRULEWIDTH`
+boxes the reference gives them, which the router reads when it picks the nets to rip up). LEF58 max spacing (`LEF58_MAXSPACING max CUTCLASS c`) runs the router's repair pass as the reference
+runs it, after an iteration that ends with no marker: its secondary via defs and its search for
+vias of the class with no other cut within `max`; a rule with no `CUTCLASS` is skipped with the
+reference's warning (DRT-350). The pass's repair (markers, the pin-access re-run for the terminals
+of such vias, the via-swap workers) is not modelled: a run in which the search finds such a via is
+refused at that point (`reason` names `lef58_max_spacing` and the count), and nothing is written. A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the

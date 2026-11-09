@@ -253,11 +253,14 @@ pub struct FlowState {
     pub(crate) current: Flow,
     pub last_effective: bool,
     last_args: Option<IterArgs>,
+    /// `setFixingMaxSpacing`: the max-spacing pass ran at the end of the last iteration (cleared
+    /// after every connectivity check, set by the pass); it makes the next flow OPTIMIZATION.
+    pub fixing_max_spacing: bool,
 }
 
 impl Default for FlowState {
     fn default() -> Self {
-        FlowState { current: Flow::Optimization, last_effective: true, last_args: None }
+        FlowState { current: Flow::Optimization, last_effective: true, last_args: None, fixing_max_spacing: false }
     }
 }
 

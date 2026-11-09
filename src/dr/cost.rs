@@ -1362,7 +1362,7 @@ mod tests {
     /// two-column run-length spacing table: `near` under a 500 run, `far` over it.
     fn tech_via(width: i32, via: Rect, min_area: i64, near: i32, far: i32, cut_spacing: Option<i32>) -> Tech {
         let routing = |dir| Layer { kind: LayerKind::Routing, dir, width, min_width: width, min_area, spacing: Some(SpacingTable { widths: vec![0], prls: vec![0, 500], values: vec![vec![near, far]] }.into()), ..Default::default() };
-        let vd = crate::tech::ViaDef { name: "V".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![via], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![via] };
+        let vd = crate::tech::ViaDef { name: "V".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![via], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![via], cut_class: None };
         Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, cut_spacing, ..Default::default() }, routing(Dir::Vertical)], manufacturing_grid: 5, via_defs: vec![vd], obs_own_width: false }
     }
 
@@ -1400,7 +1400,7 @@ mod tests {
     fn a_special_via_node_uses_the_access_points_via() {
         let mut t = tech_via(100, Rect { xl: -50, yl: -50, xh: 50, yh: 50 }, 0, 100, 100, None);
         // The access via: metal 130 each way.
-        t.via_defs.push(crate::tech::ViaDef { name: "AP".into(), is_default: false, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![Rect { xl: -130, yl: -130, xh: 130, yh: 130 }], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }] });
+        t.via_defs.push(crate::tech::ViaDef { name: "AP".into(), is_default: false, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![Rect { xl: -130, yl: -130, xh: 130, yh: 130 }], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }], cut_class: None });
         let mut g = grid();
         g.xs = vec![0, 100, 200, 300, 430, 500, 600, 700, 800, 900];
         g.ys = vec![0, 100, 200, 230, 300, 400, 500, 600, 700, 800];
@@ -1500,7 +1500,7 @@ mod tests {
         let cost = |second: usize, shape_cut: usize, upper: bool, zs: Vec<usize>| {
             let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, ..Default::default() };
             let cut = || Layer { kind: LayerKind::Cut, ..Default::default() };
-            let via = |c: usize| crate::tech::ViaDef { name: format!("V{c}"), is_default: true, layer1: c - 1, cut: c, layer2: c + 1, layer1_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }] };
+            let via = |c: usize| crate::tech::ViaDef { name: format!("V{c}"), is_default: true, layer1: c - 1, cut: c, layer2: c + 1, layer1_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }], cut_class: None };
             let mut t = Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), cut(), routing(Dir::Vertical), cut(), routing(Dir::Horizontal)], manufacturing_grid: 5, via_defs: vec![via(3), via(5)], obs_own_width: false };
             let table = crate::tech::CutSpacingTable { default_spacing: (50, 80), ..Default::default() };
             t.layers[5].cut_table_inter = Some(crate::tech::InterCutTable { second_layer: second, no_stack: false, table });

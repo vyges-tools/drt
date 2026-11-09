@@ -139,8 +139,7 @@ pub fn default_vias(tech: &mut Tech, cfg: &RuleConfig) -> Vec<Option<usize>> {
             layer2: vd.layer2,
             layer1_figs: vec![turn(b1, tech.layers[vd.layer1].dir == Dir::Horizontal)],
             cut_figs: vec![bbox(&vd.cut_figs)],
-            layer2_figs: vec![turn(b2, tech.layers[vd.layer2].dir == Dir::Horizontal)],
-        };
+            layer2_figs: vec![turn(b2, tech.layers[vd.layer2].dir == Dir::Horizontal)], cut_class: None };
         tech.via_defs.push(generated);
         out[l] = Some(tech.via_defs.len() - 1);
     }
@@ -726,7 +725,7 @@ mod tests {
     }
 
     fn via(name: &str, lower: Rect, upper: Rect) -> ViaDef {
-        ViaDef { name: name.into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![lower], cut_figs: vec![r(-40, -40, 40, 40)], layer2_figs: vec![upper] }
+        ViaDef { name: name.into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![lower], cut_figs: vec![r(-40, -40, 40, 40)], layer2_figs: vec![upper], cut_class: None }
     }
 
     fn cfg(bottom: usize, top: usize) -> RuleConfig {

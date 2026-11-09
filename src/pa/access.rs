@@ -539,7 +539,7 @@ mod tests {
     fn tech() -> crate::tech::Tech {
         let mut t = crate::gc::tests::tech();
         let sq = |h: i32| Rect::new(-h, -h, h, h);
-        t.via_defs.push(ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)] });
+        t.via_defs.push(ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)], cut_class: None });
         t
     }
 
@@ -562,8 +562,8 @@ mod tests {
     fn tech3() -> crate::tech::Tech {
         let mut t = tech();
         let sq = |h: i32| Rect::new(-h, -h, h, h);
-        t.via_defs.push(ViaDef { name: "w".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![Rect::new(-200, -85, 200, 85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)] });
-        t.via_defs.push(ViaDef { name: "x".into(), is_default: false, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)] });
+        t.via_defs.push(ViaDef { name: "w".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![Rect::new(-200, -85, 200, 85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)], cut_class: None });
+        t.via_defs.push(ViaDef { name: "x".into(), is_default: false, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)], cut_class: None });
         t
     }
 

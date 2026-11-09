@@ -426,7 +426,7 @@ mod tests {
     /// A via of the gc test technology: l2 and c3 170 square, l4 140 square.
     fn via() -> ViaDef {
         let sq = |h: i32| Rect::new(-h, -h, h, h);
-        ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)] }
+        ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)], cut_class: None }
     }
 
     fn pin<'a>(term: usize, pin: usize, aps: &[((i32, i32), i32)], via: Option<&'a ViaDef>) -> Pin<'a> {

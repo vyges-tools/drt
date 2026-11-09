@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn default_vias_warn_then_list() {
         let l = |name: &str, kind| Layer { name: name.into(), kind, ..Layer::default() };
-        let v = |name: &str, layer1| ViaDef { name: name.into(), is_default: false, layer1, cut: layer1 + 1, layer2: layer1 + 2, layer1_figs: vec![Rect::new(0, 0, 1, 1)], cut_figs: vec![], layer2_figs: vec![] };
+        let v = |name: &str, layer1| ViaDef { name: name.into(), is_default: false, layer1, cut: layer1 + 1, layer2: layer1 + 2, layer1_figs: vec![Rect::new(0, 0, 1, 1)], cut_figs: vec![], layer2_figs: vec![], cut_class: None };
         let tech = Tech {
             layers: vec![l("li", LayerKind::Routing), l("mcon", LayerKind::Cut), l("m1", LayerKind::Routing), l("via", LayerKind::Cut), l("m2", LayerKind::Routing), l("via2", LayerKind::Cut), l("m3", LayerKind::Routing)],
             via_defs: vec![v("V1", 2), v("via_FR", 2)],
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn route_stats_as_the_reference_prints_them() {
         let mut t = sky130_stack();
-        let v = |name: &str, cut: usize, cuts: usize| ViaDef { name: name.into(), is_default: true, layer1: cut - 1, cut, layer2: cut + 1, layer1_figs: vec![], cut_figs: vec![Rect::new(0, 0, 1, 1); cuts], layer2_figs: vec![] };
+        let v = |name: &str, cut: usize, cuts: usize| ViaDef { name: name.into(), is_default: true, layer1: cut - 1, cut, layer2: cut + 1, layer1_figs: vec![], cut_figs: vec![Rect::new(0, 0, 1, 1); cuts], layer2_figs: vec![], cut_class: None };
         t.via_defs = vec![v("L1M1", 3, 1), v("M1M2", 5, 1), v("M2M3", 7, 1), v("M2M3x2", 7, 2)];
         let seg = |layer: usize, len: i32| DrFig::Seg { layer, begin: (0, 0), end: (len, 0), width: 1, begin_ext: 0, end_ext: 0, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false };
         let via = |via: usize| DrFig::Via { via, origin: (0, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false };

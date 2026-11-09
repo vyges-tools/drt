@@ -12,6 +12,32 @@ use crate::polygon90::Rect;
 use crate::tech::{LayerKind, Master, Tech};
 pub use crate::dr::wire::InitialRouting;
 
+/// The design's vias (DEF VIAS) that io adds to the technology (`setVias`: one on a layer the
+/// router does not hold, or on the masterslice, is skipped — `held`), in the database's order,
+/// with the cut class the max-spacing pass reads: from the parameters' cut size when the via has
+/// parameters (every cut is that size), else unknown.
+pub fn block_vias(db: &Db, tech: &Tech, held: &dyn Fn(&str) -> bool) -> Vec<crate::dr::max_spacing::BlockVia> {
+    let mut out = Vec::new();
+    for v in db.block_get_vias() {
+        let (top, bottom) = (db.via_get_top_layer(&v), db.via_get_bottom_layer(&v));
+        if !held(&top) || !held(&bottom) {
+            continue;
+        }
+        let Some(cut) = tech.layer_num(&bottom).map(|b| b + 1).filter(|&c| c < tech.layers.len() && tech.layers[c].kind == LayerKind::Cut) else {
+            out.push(crate::dr::max_spacing::BlockVia { name: v.clone(), cut: usize::MAX, cut_class: Err(()) });
+            continue;
+        };
+        let cut_class = if db.via_has_params(&v) {
+            let (x, y) = (db.via_params_get_x_cut_size(&v), db.via_params_get_y_cut_size(&v));
+            Ok(tech.layers[cut].cut_class_of(x.min(y), x.max(y)).checked_sub(1))
+        } else {
+            Err(())
+        };
+        out.push(crate::dr::max_spacing::BlockVia { name: v, cut, cut_class });
+    }
+    out
+}
+
 /// The rule families and layer properties routing does not model, as `layer: family` for each
 /// layer that carries one — a design with any must be refused, not routed with the rule ignored.
 /// A cut layer may carry one plain spacing rule (more than one is refused too). A multi-patterned
@@ -33,11 +59,12 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         // here from the generated accessors — only the rules io KEEPS (it drops the rest with a
         // warning, and sky130's cut layers carry two LEF58 enclosure rules without a CUTCLASS that
         // it drops that way) — and refused (none is modelled). SPACINGTABLE ORTHOGONAL is
-        // modelled (the check, its only consumer) and no longer listed here.
+        // modelled (the check, its only consumer) and no longer listed here; neither is
+        // LEF58_MAXSPACING, whose pass refuses at run time when it reaches a stage not ported
+        // (`crate::dr::max_spacing`).
         let name = l.name.as_str();
         let kept = |n: usize, keeps: &dyn Fn(usize) -> bool| (0..n).filter(|&k| keeps(k)).count();
         let untracked = [
-            ("lef58_max_spacing", kept(db.num_layer_get_tech_layer_max_spacing_rules(name), &|k| db.maxspacingrule_has_cut_class(name, k))),
             ("lef58_two_wires_forbidden_spacing", db.num_layer_get_tech_layer_two_wires_forbidden_spc_rules(name)),
             ("lef58_width_table_orthogonal", kept(db.num_layer_get_tech_layer_width_table_rules(name), &|k| db.widthtablerule_is_orthogonal(name, k))),
             ("lef58_wrong_dir_spacing", kept(db.num_layer_get_tech_layer_wrong_dir_spacing_rules(name), &|k| !db.wrongdirspacingrule_is_length_valid(name, k) && db.wrongdirspacingrule_get_prl_length(name, k) >= 0)),
@@ -712,6 +739,22 @@ mod skipped_rule_tests {
         let tech = crate::tech::read::tech(db).expect("tech");
         let m1 = tech.layers.iter().find(|l| l.name == "M1").expect("M1").lef58_eol.len();
         (skipped_rules(db, &tech), unmodelled_rules(db, &tech), m1)
+    }
+
+    /// Rule (reference io `setCutLayerProperties`, its LEF58_MAXSPACING loop): a rule with a
+    /// CUTCLASS of the layer is kept (max, class index), one with no CUTCLASS is skipped with
+    /// DRT-350 (io would also drop one naming a class the layer lacks, but the database's parser
+    /// already rejects such a property whole). Nothing is refused up front: the pass refuses at
+    /// run time only if it reaches a stage that is not ported.
+    #[test]
+    fn a_max_spacing_rule_is_kept_by_class_skipped_without_one_and_never_refused_up_front() {
+        let d = db("maxspc", "", "  PROPERTY LEF58_MAXSPACING \"MAXSPACING 0.4 CUTCLASS CA ;\" ;\n  PROPERTY LEF58_MAXSPACING \"MAXSPACING 0.5 ;\" ;\n");
+        let (skipped, refused, _) = census(&d);
+        assert!(refused.is_empty() && skipped.is_empty(), "{refused:?} {skipped:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let v1 = &tech.layers[tech.layer_num("V1").expect("V1")];
+        assert_eq!(v1.lef58_max_spacing, [crate::tech::MaxSpacingRule { max: 400, cut_class: 0 }]);
+        assert_eq!(crate::tech::read::max_spacing_skips(&d, "V1"), [(350, "LEF58_MAXSPACING with no CUTCLASS is not supported. Skipping for layer V1".to_string())]);
     }
 
     #[test]

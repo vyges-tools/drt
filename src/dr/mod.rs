@@ -10,6 +10,7 @@ pub mod drw;
 pub mod flow;
 pub mod guides;
 pub mod log;
+pub mod max_spacing;
 pub mod maze;
 pub mod queue;
 pub mod route;

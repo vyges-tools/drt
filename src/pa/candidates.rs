@@ -369,7 +369,7 @@ mod tests {
     }
 
     fn via(name: &str, l1: Rect) -> ViaDef {
-        ViaDef { name: name.into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![l1], cut_figs: vec![Rect::new(-85, -85, 85, 85)], layer2_figs: vec![Rect::new(-145, -85, 145, 85)] }
+        ViaDef { name: name.into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![l1], cut_figs: vec![Rect::new(-85, -85, 85, 85)], layer2_figs: vec![Rect::new(-145, -85, 145, 85)], cut_class: None }
     }
 
     /// Rule: two vias with the same priority tuple — the LATER one in technology order stays.

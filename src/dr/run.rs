@@ -20,6 +20,7 @@ use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig
 use crate::dr::maze::{MazeCfg, MazeState};
 use crate::dr::queue::{initial_marker_cost, recheck_markers, route_queue, Event, QueueCtx, Start};
 use crate::dr::route::{abs_priority, init_queue, NetCtx};
+use crate::dr::max_spacing::{fix_max_spacing, BlockVia, MaxSpacingState};
 use crate::dr::rules::{default_vias, rule_tables, EolTable, NdrRule, NdrTables, RuleConfig, RuleTables};
 use crate::dr::ta::{track_assignment, Fixed, TaConfig, TaGuide, TaInput, TaState, TaTerm};
 use crate::gc::{Marker, Owner};
@@ -146,6 +147,8 @@ pub struct DesignIn {
     pub skipped_rules: Vec<crate::dr::db::SkippedRule>,
     /// LEF58 layer properties left unparsed, listed at tech load ([`crate::dr::db::lef58_not_checked`]).
     pub lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>,
+    /// The design's vias on layers the router holds, as the max-spacing pass reads them.
+    pub block_vias: Vec<BlockVia>,
 }
 
 /// The reader, then pin access.
@@ -171,20 +174,22 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     // The tech read generates the default vias (and warns), then the design read.
     let mut t = tech.clone();
     let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
-    // setLayers' skipped LEF58_ENCLOSURE rules, cut layer by cut layer.
+    // setLayers' skipped LEF58_ENCLOSURE rules, then its skipped LEF58_MAXSPACING rules (no
+    // CUTCLASS, DRT-350), cut layer by cut layer (`setCutLayerProperties` reads them in that order).
     let skipped: Vec<(u16, String)> = t.layers.iter().filter(|l| l.kind == LayerKind::Cut)
         .flat_map(|l| (0..db.num_layer_get_tech_layer_cut_enclosure_rules(&l.name))
             .filter_map(|k| crate::tech::read::cut_enclosure_skip(db, &l.name, k))
             .map(|(id, what)| (id, format!("LEF58_ENCLOSURE {what}. Skipping for layer {}", l.name)))
+            .chain(crate::tech::read::max_spacing_skips(db, &l.name))
             .collect::<Vec<_>>())
         .collect();
     // The block's vias join the technology's (`setVias`), skipping one on a layer the router
     // does not hold or on the masterslice.
     let held = |name: &str| t.layers.iter().any(|l| l.name == name && l.kind != LayerKind::Placeholder);
-    let block_vias = db.block_get_vias().iter().filter(|v| held(&db.via_get_top_layer(v)) && held(&db.via_get_bottom_layer(v))).count();
+    let block_vias = crate::dr::db::block_vias(db, &t, &held);
     let stats = crate::dr::log::TechStats {
         dbu: db.tech_get_db_units_per_micron(),
-        vias: t.via_defs.len() + block_vias,
+        vias: t.via_defs.len() + block_vias.len(),
         masters: db.num_masters().unwrap_or(0),
         via_rule_generates: db.tech_get_via_generate_rules().len(),
     };
@@ -246,7 +251,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let no_taper: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| n.ndr.is_some() && !db.net_is_auto_taper_enabled(&n.name)).map(|(i, _)| i).collect();
     let die = Rect { xl: db.block_get_die_area_x_min(), yl: db.block_get_die_area_y_min(), xh: db.block_get_die_area_x_max(), yh: db.block_get_die_area_y_max() };
     let jumpers: HashSet<usize> = design.nets.iter().enumerate().filter(|(_, n)| db.net_has_jumpers(&n.name)).map(|(i, _)| i).collect();
-    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()), db_markers, skipped_rules, lef58_not_checked })
+    Ok(DesignIn { tech: tech.clone(), tracks, cfg, masters, insts, ports, pa, design, ndrs, no_taper, bottom_layer, die, initial, jumpers, dbu: i64::from(db.tech_get_db_units_per_micron()), db_markers, skipped_rules, lef58_not_checked, block_vias })
 }
 
 /// Each net's non-default rule, by the name the database gives it (`dbNet::getNonDefaultRule`),
@@ -631,6 +636,8 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
     let mut increase_clip = false;
     let mut markers_by_iteration = Vec::new();
     let mut flow_by_iteration = Vec::new();
+    // What the LEF58_MAXSPACING pass keeps between its calls (its secondary via lists grow).
+    let mut max_spacing = MaxSpacingState::default();
     // Markers read from the database stand as the design's (and in its region query) from the
     // start, and make the run resume past the first, rip-up-everything rows.
     for m in &d.db_markers {
@@ -650,7 +657,7 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
         // flow that resets and sets it), read at the start of every row that does not rip up all.
         args.size = clip.size(&row, increase_clip);
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
-        search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip)?;
+        search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip, &mut max_spacing, &mut *log)?;
         flow_by_iteration.push(flow.current.name());
         let standing = routes.markers().count();
         markers_by_iteration.push(standing);
@@ -736,8 +743,10 @@ impl DrCtx<'_> {
 
 /// One search-and-repair iteration: the flow for this iteration, its workers in batches, each batch
 /// routed then written back worker by worker; the connectivity check after.
-fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut FlowState, iter: usize, args: &crate::dr::flow::IterArgs, increase_clip: &mut bool) -> Res<()> {
-    let flow = flow_state.next(routes.markers().count(), args, false);
+#[allow(clippy::too_many_arguments)]
+fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut FlowState, iter: usize, args: &crate::dr::flow::IterArgs, increase_clip: &mut bool, max_spacing: &mut MaxSpacingState, log: Sink) -> Res<()> {
+    let fixing_max_spacing = flow_state.fixing_max_spacing;
+    let flow = flow_state.next(routes.markers().count(), args, fixing_max_spacing);
     if matches!(args.ripup, RipUp::Drc | RipUp::NearDrc) && routes.markers().next().is_none() {
         return Ok(());
     }
@@ -776,9 +785,10 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         }
         Flow::Stubborn => {
             stubborn_tiles_flow(cx, routes, flow_state, iter, args, ripup_all, mt)?;
-            return check(cx, routes);
+            return check_then_fix_max_spacing(cx, routes, flow_state, max_spacing, log);
         }
-        Flow::Skip => Vec::new(),
+        // `case SKIP: return;` — before the connectivity check and the max-spacing pass.
+        Flow::Skip => return check(cx, routes),
     };
     let mut changed = false;
     // optimizationFlow clears the flag before its workers; endWorkersBatch sets it for any
@@ -805,7 +815,21 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
     if flow == Flow::Guides {
         flow_state.last_effective = changed;
     }
-    check(cx, routes)
+    check_then_fix_max_spacing(cx, routes, flow_state, max_spacing, log)
+}
+
+/// The end of `searchRepair` after its flow: the connectivity check, the max-spacing flag
+/// cleared, and — when no marker stands and the technology keeps a LEF58_MAXSPACING rule — the
+/// max-spacing pass, which sets the flag again (it makes the next flow an optimization one).
+fn check_then_fix_max_spacing(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut FlowState, max_spacing: &mut MaxSpacingState, log: Sink) -> Res<()> {
+    check(cx, routes)?;
+    flow_state.fixing_max_spacing = false;
+    let has_max_spacing = cx.p.tech.layers.iter().any(|l| !l.lef58_max_spacing.is_empty());
+    if routes.markers().next().is_none() && has_max_spacing {
+        fix_max_spacing(&cx.p.tech, &cx.p.defaults, &cx.d.block_vias, &cx.d.design.fixed, routes, max_spacing, log)?;
+        flow_state.fixing_max_spacing = true;
+    }
+    Ok(())
 }
 
 /// The stubborn-tiles flow: route boxes grown around the markers, and per box nine workers (the

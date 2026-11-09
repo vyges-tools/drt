@@ -114,6 +114,18 @@ pub struct Layer {
     /// A cut layer's SPACINGTABLE ORTHOGONAL rows, (WITHIN, SPACING) in the technology's order
     /// (`frOrthSpacingTableConstraint`, io keeps the database's table as it is).
     pub orth_spacing: Vec<(i32, i32)>,
+    /// A cut layer's LEF58_MAXSPACING rules io keeps (`frLef58MaxSpacingConstraint`), in the
+    /// technology's order: the ones with a CUTCLASS naming a class of this layer.
+    pub lef58_max_spacing: Vec<MaxSpacingRule>,
+}
+
+/// A LEF58_MAXSPACING rule as io keeps it: `MAXSPACING max CUTCLASS c` — every via of class `c`
+/// on the layer needs another cut within `max` of it (the router's repair pass, not the check).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxSpacingRule {
+    pub max: i32,
+    /// The class's place among the layer's cut classes (`getCutClassIdx`, from 0).
+    pub cut_class: usize,
 }
 
 /// A LEF58_AREA rule io keeps on a routing layer (`frLef58AreaConstraint`): the forms it skips
@@ -628,6 +640,18 @@ pub struct ViaDef {
     pub layer1_figs: Vec<Rect>,
     pub cut_figs: Vec<Rect>,
     pub layer2_figs: Vec<Rect>,
+    /// The via's cut class (`frViaDef::getCutClassIdx`, a class index of its cut layer from 0),
+    /// set as io sets it for a technology or design via: the class of its FIRST cut figure that
+    /// has one ([`via_cut_class`]). `None` (-1) for a via the router generates (io's `_FR` vias,
+    /// [`crate::dr::rules::default_vias`]), which io never gives a class.
+    pub cut_class: Option<usize>,
+}
+
+/// io's cut class of a via read from the technology or the design: over its cut figures in
+/// order, the first whose (width, length) — the shorter and longer sides — is a class of the cut
+/// layer ([`Layer::cut_class_of`]).
+pub fn via_cut_class(cut_layer: &Layer, cut_figs: &[Rect]) -> Option<usize> {
+    cut_figs.iter().find_map(|f| cut_layer.cut_class_of(f.dx().min(f.dy()), f.dx().max(f.dy())).checked_sub(1))
 }
 
 impl ViaDef {
@@ -1385,7 +1409,7 @@ pub mod read {
                         })
                         .collect();
                     let lef58_area = lef58_area_rules(db, &name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges, lef58_area, orth_spacing: vec![] });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![] });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1429,7 +1453,8 @@ pub mod read {
                         layer_rules_by_name.push((layers.len(), rules));
                     }
                     let orth_spacing = read::orth_spacing_table(db, &name);
-                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_table_same_net, cut_enclosures, orth_spacing, ..Layer::default() });
+                    let lef58_max_spacing = read::max_spacing_rules(db, &name, &cut_classes);
+                    layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_table_same_net, cut_enclosures, orth_spacing, lef58_max_spacing, ..Layer::default() });
                 }
                 _ => {}
             }
@@ -1466,7 +1491,9 @@ pub mod read {
             nums.dedup();
             let [l1, cut, l2] = nums[..] else { continue };
             let figs = |layer: usize| -> Vec<Rect> { boxes.iter().filter(|b| num_of(b.0) == Some(layer)).map(|b| Rect::new(b.1, b.2, b.3, b.4)).collect() };
-            via_defs.push(ViaDef { name: via.clone(), is_default: db.techvia_is_default(&via), layer1: l1, cut, layer2: l2, layer1_figs: figs(l1), cut_figs: figs(cut), layer2_figs: figs(l2) });
+            let cut_figs = figs(cut);
+            let cut_class = via_cut_class(&layers[cut], &cut_figs);
+            via_defs.push(ViaDef { name: via.clone(), is_default: db.techvia_is_default(&via), layer1: l1, cut, layer2: l2, layer1_figs: figs(l1), cut_figs, layer2_figs: figs(l2), cut_class });
         }
         // io postProcess: `convertLef58MinCutConstraints` runs after the default vias are chosen.
         convert_lef58_min_cut_constraints(db, &mut layers);
@@ -1514,6 +1541,30 @@ pub mod read {
             return Vec::new();
         }
         db.layer_get_orth_spacing_table(layer).as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect()
+    }
+
+    /// A cut layer's LEF58_MAXSPACING rules as io `setCutLayerProperties` keeps them, in the
+    /// database's order: one with no CUTCLASS is skipped (io warns, DRT-350: [`max_spacing_skips`]),
+    /// one whose class the layer does not define is dropped silently (`getCutClassIdx(name)` is
+    /// -1; the name map keeps a class's LAST index).
+    pub fn max_spacing_rules(db: &Db, layer: &str, classes: &[CutClass]) -> Vec<MaxSpacingRule> {
+        (0..db.num_layer_get_tech_layer_max_spacing_rules(layer))
+            .filter(|&k| db.maxspacingrule_has_cut_class(layer, k))
+            .filter_map(|k| {
+                let name = db.maxspacingrule_get_cut_class(layer, k);
+                let cut_class = classes.iter().rposition(|c| c.name == name)?;
+                Some(MaxSpacingRule { max: db.maxspacingrule_get_max_spacing(layer, k), cut_class })
+            })
+            .collect()
+    }
+
+    /// io's DRT-350 warnings for a cut layer: one per LEF58_MAXSPACING rule with no CUTCLASS,
+    /// which it skips.
+    pub fn max_spacing_skips(db: &Db, layer: &str) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_max_spacing_rules(layer))
+            .filter(|&k| !db.maxspacingrule_has_cut_class(layer, k))
+            .map(|_| (350, format!("LEF58_MAXSPACING with no CUTCLASS is not supported. Skipping for layer {layer}")))
+            .collect()
     }
 
     /// The clause that makes a LEF58_AREA rule SKIPPED with a warning: io
