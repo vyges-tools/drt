@@ -838,7 +838,8 @@ impl CostWorker<'_, '_> {
     /// parallel, else first; centre to centre per the default's flags) gets a via cost on the z of
     /// cut 2 (z + 1 / z - 1). (The plain inter-layer cut spacing rule this also reads is not
     /// modelled.) ⚠️ A cut 2 outside the grid's z range (the cut above the top routing layer, or
-    /// below the lowest) is skipped: the reference indexes off its grid there.
+    /// below the lowest) is skipped: the reference indexes off its grid there (OpenROAD issue
+    /// #12184).
     pub fn mod_inter_layer_cut_spacing_cost(&mut self, b: &Rect, z: usize, t: ModCost, upper: bool) {
         let tech = self.cx.tech;
         let cut1 = self.g.zs[z] + 1;
@@ -1491,7 +1492,8 @@ mod tests {
     // pair (second when they run parallel) is costed on THAT via's z — when the table belongs to
     // the upper of the two layers and names the lower (the kit's form): the upper layer's own
     // table looking down, or the table of the layer above looking down at this one. A second
-    // layer off the grid's z range is skipped. Layers: 2, 4, 6 routing; 3, 5 cut, each with a
+    // layer off the grid's z range is skipped (the reference writes past its grid there: OpenROAD
+    // issue #12184). Layers: 2, 4, 6 routing; 3, 5 cut, each with a
     // default via (cut 20 square); layer 5's table names layer 3, DEFAULT (50, 80).
     #[test]
     fn the_inter_layer_table_costs_the_other_layers_vias() {
@@ -1525,7 +1527,7 @@ mod tests {
         assert_eq!(cost(3, 3, false, vec![2, 4, 6]), vec![0, 0, 0], "layer 3 has no table and nothing below");
         assert_eq!(cost(3, 5, true, vec![2, 4, 6]), vec![0, 0, 0], "no cut layer two above 5");
         assert_eq!(cost(7, 3, true, vec![2, 4, 6]), vec![0, 0, 0], "a table naming another layer is not this pair's");
-        assert_eq!(cost(3, 5, false, vec![4, 6]), vec![0, 0], "layer 3's vias are off this grid: skipped");
+        assert_eq!(cost(3, 5, false, vec![4, 6]), vec![0, 0], "layer 3's vias are off this grid: skipped (OpenROAD #12184)");
     }
 
     // Rule: an instance pin UNBLOCKS the planar edges a blockage blocked under it (its access

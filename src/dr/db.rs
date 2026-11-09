@@ -69,11 +69,13 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 continue;
             }
             if family == "lef58_cut_spacing" {
-                // Modelled for the cut-to-corner forms alone (`SPACING s LAYER l CUTCLASS c
+                // Modelled for the cut-to-corner forms (`SPACING s LAYER l CUTCLASS c
                 // CONCAVECORNER`: the check, the only consumer reached — the via-to-via prep that
                 // also reads it runs only for one named process node, an option this router does
-                // not take; `… NONEOLCONVEXCORNER w [MINLENGTH m]`: the check, its only consumer);
-                // the first rule outside them names the refusal.
+                // not take; `… NONEOLCONVEXCORNER w [MINLENGTH m]`: the check, its only consumer)
+                // and for ADJACENTCUTS as io keeps it (the check, its only consumer; the forms io
+                // skips are skipped, see `skipped_rules`); the first rule outside them names the
+                // refusal.
                 let classes = &l.cut_classes;
                 if let Some(clause) = (0..n).find_map(|k| crate::tech::read::cut_layer_rule(db, &l.name, k, classes).err()) {
                     out.push(format!("{}: {family} ({n}, {clause})", l.name));
@@ -161,6 +163,10 @@ impl SkippedRule {
                 "layer {}: LEF58_MINIMUMCUT rule {} is written per cut class (CUTCLASS), which the database reader keeps with a cut count of 0; the reference then drops it, and so does this router: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (see {}).",
                 self.layer, self.index, SKIPPED_MIN_CUT_UPSTREAM_ISSUE
             ),
+            ("lef58_cut_spacing", clause) => format!(
+                "layer {}: LEF58_SPACING cut spacing rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
+                self.layer, self.index
+            ),
             ("lef58_min_cut", clause) => format!(
                 "layer {}: LEF58_MINIMUMCUT rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
@@ -186,8 +192,10 @@ impl SkippedRule {
 /// technology's order: each LEF58 end-of-line rule with TOCONCAVECORNER or TONOTCHLENGTH
 /// ([`crate::tech::read::lef58_eol_skipped_clause`]), then each LEF58 minimum-cut rule the
 /// reference skips or drops unread ([`crate::tech::read::lef58_min_cut_skipped_clause`]: AREA,
-/// SAMEMETALOVERLAP, FULLYENCLOSED, or written per cut class) — routed as the reference routes
-/// it, without the rule, but warned about. ⛔ Not enforced and not emulated: the
+/// SAMEMETALOVERLAP, FULLYENCLOSED, or written per cut class), then on each cut layer each LEF58
+/// cut spacing ADJACENTCUTS rule io skips ([`crate::tech::read::adjacent_cuts_rule`]:
+/// EXACTALIGNED, EXCEPTSAMEPGNET, TO ALL, SIDEPARALLELOVERLAP, SAMEMASK) — routed as the
+/// reference routes it, without the rule, but warned about. ⛔ Not enforced and not emulated: the
 /// reference checks these as a plain end-of-line rule with WITHIN 0 (upstream OpenROAD issue
 /// #12174), a reading we do not copy. Every other refusal of [`unmodelled_rules`] stands.
 pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
@@ -201,6 +209,13 @@ pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
         for k in 0..db.num_layer_get_tech_layer_min_cut_rules(&l.name) {
             if let Some(clause) = crate::tech::read::lef58_min_cut_skipped_clause(db, &l.name, k) {
                 out.push(SkippedRule { layer: l.name.clone(), family: "lef58_min_cut", index: k, clause });
+            }
+        }
+    }
+    for l in tech.layers.iter().filter(|l| l.kind == LayerKind::Cut) {
+        for k in 0..db.num_layer_get_tech_layer_cut_spacing_rules(&l.name) {
+            if let Ok(crate::tech::read::Lef58CutRule::Skipped(clause)) = crate::tech::read::cut_layer_rule(db, &l.name, k, &l.cut_classes) {
+                out.push(SkippedRule { layer: l.name.clone(), family: "lef58_cut_spacing", index: k, clause });
             }
         }
     }
@@ -727,12 +742,12 @@ mod skipped_rule_tests {
         let tech = crate::tech::read::tech(&d).expect("tech");
         let v1 = tech.layer_num("V1").expect("V1");
         let m2 = tech.layer_num("M2").expect("M2");
-        assert_eq!(tech.layers[v1].cut_layer_spacing, [crate::tech::CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: crate::tech::CutCorner::Concave }]);
+        assert_eq!(tech.layers[v1].lef58_cut_spacing, [crate::tech::Lef58CutSpacing::Layer(crate::tech::CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: crate::tech::CutCorner::Concave })]);
         // The second layer is the one the rule names, below the cut as well as above it.
         let d = db("cc-below", "", &eol("SPACING 0.07 LAYER M1 CUTCLASS CA CONCAVECORNER ;"));
         let tech = crate::tech::read::tech(&d).expect("tech");
         let m1 = tech.layer_num("M1").expect("M1");
-        assert_eq!(tech.layers[v1].cut_layer_spacing, [crate::tech::CutLayerSpacing { spacing: 70, second_layer: m1, class: 1, corner: crate::tech::CutCorner::Concave }]);
+        assert_eq!(tech.layers[v1].lef58_cut_spacing, [crate::tech::Lef58CutSpacing::Layer(crate::tech::CutLayerSpacing { spacing: 70, second_layer: m1, class: 1, corner: crate::tech::CutCorner::Concave })]);
     }
 
     /// Rule (reference io `setRoutingLayerProperties`): a SPACINGTABLE TWOWIDTHS is the layer's
@@ -880,7 +895,7 @@ mod skipped_rule_tests {
     /// CONCAVECORNER rule.
     #[test]
     fn the_cut_spacing_layer_non_eol_convex_corner_form_is_modelled() {
-        use crate::tech::{CutCorner, CutLayerSpacing};
+        use crate::tech::{CutCorner, CutLayerSpacing, Lef58CutSpacing::Layer};
         let rules = format!("{}{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol("SPACING 0.07 LAYER M2 CUTCLASS CA NONEOLCONVEXCORNER 0.05 ;"), eol("SPACING 0.08 LAYER M1 CUTCLASS CA NONEOLCONVEXCORNER 0.06 MINLENGTH 0.03 ;"));
         let d = db("cv", "", &rules);
         let (skipped, refused, _) = census(&d);
@@ -888,11 +903,11 @@ mod skipped_rule_tests {
         let tech = crate::tech::read::tech(&d).expect("tech");
         let (v1, m1, m2) = (tech.layer_num("V1").expect("V1"), tech.layer_num("M1").expect("M1"), tech.layer_num("M2").expect("M2"));
         assert_eq!(
-            tech.layers[v1].cut_layer_spacing,
+            tech.layers[v1].lef58_cut_spacing,
             [
-                CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: CutCorner::Concave },
-                CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: CutCorner::NonEolConvex { eol_width: 50, min_length: None } },
-                CutLayerSpacing { spacing: 80, second_layer: m1, class: 1, corner: CutCorner::NonEolConvex { eol_width: 60, min_length: Some(30) } },
+                Layer(CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: CutCorner::Concave }),
+                Layer(CutLayerSpacing { spacing: 70, second_layer: m2, class: 1, corner: CutCorner::NonEolConvex { eol_width: 50, min_length: None } }),
+                Layer(CutLayerSpacing { spacing: 80, second_layer: m1, class: 1, corner: CutCorner::NonEolConvex { eol_width: 60, min_length: Some(30) } }),
             ]
         );
     }
@@ -908,12 +923,63 @@ mod skipped_rule_tests {
             ("SPACING 0.07 SAMENET LAYER M2 ;", "LAYER without CUTCLASS"),
             ("SPACING 0.07 CENTERTOCENTER LAYER M2 CUTCLASS CA CONCAVECORNER ;", "CENTERTOCENTER"),
             ("SPACING 0.07 LAYER M2 CUTCLASS CA ;", "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER"),
-            ("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS"),
+            ("SPACING 0.07 SAMENET ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS with SAMENET"),
+            ("SPACING 0.07 SAMEMETAL ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS with SAMEMETAL or SAMEVIA"),
+            ("SPACING 0.07 ADJACENTCUTS 3 TWOCUTS 1 SAMECUT WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS TWOCUTS SAMECUT"),
+            ("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 0.12 CUTCLASS CA ;", "ADJACENTCUTS with a second WITHIN value"),
+            ("SPACING 0.07 PARALLELOVERLAP ;", "PARALLELOVERLAP"),
         ] {
             let rules = format!("{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol(rule));
             let d = db("cc-other", "", &rules);
             let (_, refused, _) = census(&d);
             assert_eq!(refused, [format!("V1: lef58_cut_spacing (2, {clause})")], "{rule}");
+        }
+    }
+
+    /// Rule (reference io `setCutLayerProperties`, ADJACENTCUTS): io keeps the spacing,
+    /// CENTERTOCENTER, the count, TWOCUTS, the first WITHIN value, the class and NOPRL — a rule
+    /// naming no class has none (the reference's -1, ours 0) — in the technology's order beside a
+    /// cut-to-corner rule; MODELLED.
+    #[test]
+    fn the_adjacent_cuts_form_is_modelled() {
+        use crate::tech::{AdjacentCuts, Lef58CutSpacing};
+        let rules = format!(
+            "{}{}{}",
+            eol("SPACING 0.1 CENTERTOCENTER ADJACENTCUTS 2 WITHIN 0.12 CUTCLASS CA ;"),
+            eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"),
+            eol("SPACING 0.08 ADJACENTCUTS 3 TWOCUTS 1 WITHIN 0.11 NOPRL ;")
+        );
+        let d = db("adj", "", &rules);
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let v1 = tech.layer_num("V1").expect("V1");
+        let l = &tech.layers[v1].lef58_cut_spacing;
+        assert_eq!(l.len(), 3);
+        assert_eq!(l[0], Lef58CutSpacing::AdjacentCuts(AdjacentCuts { spacing: 100, center_to_center: true, adjacent_cuts: 2, two_cuts: None, within: 120, class: 1, no_prl: false }));
+        assert!(matches!(l[1], Lef58CutSpacing::Layer(_)));
+        assert_eq!(l[2], Lef58CutSpacing::AdjacentCuts(AdjacentCuts { spacing: 80, center_to_center: false, adjacent_cuts: 3, two_cuts: Some(1), within: 110, class: 0, no_prl: true }));
+    }
+
+    /// Rule (reference io `setCutLayerProperties`, ADJACENTCUTS): EXACTALIGNED, EXCEPTSAMEPGNET,
+    /// TO ALL, SIDEPARALLELOVERLAP and SAMEMASK each make io warn and skip the rule, tested in
+    /// that order; SKIPPED here too (warned, not refused, not in the layer's list).
+    #[test]
+    fn the_adjacent_cuts_forms_io_skips_are_skipped() {
+        for (rule, clause) in [
+            ("SPACING 0.1 ADJACENTCUTS 2 EXACTALIGNED 1 WITHIN 0.12 EXCEPTSAMEPGNET CUTCLASS CA ;", "ADJACENTCUTS EXACTALIGNED"),
+            ("SPACING 0.1 CENTERTOCENTER ADJACENTCUTS 2 WITHIN 0.12 EXCEPTSAMEPGNET CUTCLASS CA ;", "ADJACENTCUTS EXCEPTSAMEPGNET"),
+            ("SPACING 0.1 ADJACENTCUTS 2 WITHIN 0.12 CUTCLASS CA TO ALL ;", "ADJACENTCUTS CUTCLASS TO ALL"),
+            ("SPACING 0.1 ADJACENTCUTS 2 WITHIN 0.12 CUTCLASS CA SIDEPARALLELOVERLAP ;", "ADJACENTCUTS SIDEPARALLELOVERLAP"),
+            ("SPACING 0.1 ADJACENTCUTS 2 WITHIN 0.12 CUTCLASS CA SAMEMASK ;", "ADJACENTCUTS SAMEMASK"),
+            ("SPACING 0.1 SAMENET ADJACENTCUTS 2 WITHIN 0.12 EXCEPTSAMEPGNET CUTCLASS CA ;", "ADJACENTCUTS EXCEPTSAMEPGNET"),
+        ] {
+            let d = db("adj-skip", "", &eol(rule));
+            let (skipped, refused, _) = census(&d);
+            assert!(refused.is_empty(), "{rule}: {refused:?}");
+            assert_eq!(skipped.iter().map(|s| (s.family, s.clause)).collect::<Vec<_>>(), [("lef58_cut_spacing", clause)], "{rule}");
+            let tech = crate::tech::read::tech(&d).expect("tech");
+            assert!(tech.layers[tech.layer_num("V1").expect("V1")].lef58_cut_spacing.is_empty(), "{rule}");
         }
     }
 

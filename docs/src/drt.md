@@ -119,11 +119,16 @@ right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-
 (its common clauses), corner spacing (convex corners, patched by the router), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and
-costed by the router around the other layer's vias; a `SAMEMETAL` table, and a `SAMENET` or
+costed by the router around the other layer's vias, except where the other layer's vias fall
+outside the routing grid, which the reference indexes past its grid, OpenROAD issue #12184; a
+`SAMEMETAL` table, and a `SAMENET` or
 `SAMEMETAL` inter-layer one, are refused), enclosure, and cut spacing to a concave corner or to a
 non-end-of-line convex corner of the metal on another layer (`SPACING s LAYER l CUTCLASS c
 CONCAVECORNER`, its plain form, and `SPACING s LAYER l CUTCLASS c NONEOLCONVEXCORNER w [MINLENGTH
-m]`; every other LEF58 cut spacing form is refused). A cell obstruction with its own `DESIGNRULEWIDTH`
+m]`), and LEF58 cut spacing with adjacent cuts (`SPACING s [CENTERTOCENTER] ADJACENTCUTS n
+[TWOCUTS t] WITHIN w [CUTCLASS c] [NOPRL]`; with `EXACTALIGNED`, `EXCEPTSAMEPGNET`, `TO ALL`,
+`SIDEPARALLELOVERLAP` or `SAMEMASK` the rule is skipped with a warning, as the reference skips
+it; every other LEF58 cut spacing form is refused). A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the

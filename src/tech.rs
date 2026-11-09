@@ -63,11 +63,12 @@ pub struct Layer {
     /// A cut layer's LEF58 enclosure rules as io keeps them (`frLef58EnclosureConstraint`), in the
     /// technology's order.
     pub cut_enclosures: Vec<CutEnclosure>,
-    /// A cut layer's LEF58 cut spacing rules to a corner of the metal on another layer
-    /// (`frLef58CutSpacingConstraint` with a second layer, a cut class and CONCAVECORNER or
-    /// NONEOLCONVEXCORNER), the different-net list in the technology's order (the only forms
-    /// modelled; the census refuses every other LEF58 cut spacing rule).
-    pub cut_layer_spacing: Vec<CutLayerSpacing>,
+    /// A cut layer's LEF58 cut spacing rules (`frLef58CutSpacingConstraint`), the different-net
+    /// list io builds, in the technology's order: the rules to a corner of the metal on another
+    /// layer (a second layer, a cut class and CONCAVECORNER or NONEOLCONVEXCORNER) and the
+    /// ADJACENTCUTS rules io keeps (the only forms modelled; the census refuses every other LEF58
+    /// cut spacing rule, and the ADJACENTCUTS forms io skips are skipped here too).
+    pub lef58_cut_spacing: Vec<Lef58CutSpacing>,
     /// A routing layer's end-of-line spacing rules, in the technology's order.
     pub eol: Vec<EolRule>,
     /// A routing layer's LEF58 end-of-line SPACING rules, in the technology's order (the
@@ -272,6 +273,32 @@ pub struct CutLayerSpacing {
     pub second_layer: usize,
     pub class: usize,
     pub corner: CutCorner,
+}
+
+/// A LEF58 cut spacing rule `SPACING s [CENTERTOCENTER] ADJACENTCUTS n [TWOCUTS t] WITHIN w
+/// [CUTCLASS c] [NOPRL]` as `io::Parser` keeps it (`frLef58CutSpacingConstraint` with adjacent
+/// cuts): a cut with at least `adjacent_cuts` cuts of `class` (this crate's index, 0 for no class:
+/// the reference's -1) closer than `within` — itself among them when it is of that class; with
+/// NOPRL only those with no parallel run, itself always — or, with TWOCUTS, a pair of cuts each with
+/// at least `two_cuts` such cuts, needs `spacing` (centre to centre with CENTERTOCENTER, else edge
+/// to edge) to every other cut on its layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdjacentCuts {
+    pub spacing: i32,
+    pub center_to_center: bool,
+    pub adjacent_cuts: i32,
+    pub two_cuts: Option<i32>,
+    pub within: i32,
+    pub class: usize,
+    pub no_prl: bool,
+}
+
+/// One rule of a cut layer's LEF58 cut spacing list, as `checkLef58CutSpacing_main` dispatches
+/// it: a second layer first, then adjacent cuts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lef58CutSpacing {
+    Layer(CutLayerSpacing),
+    AdjacentCuts(AdjacentCuts),
 }
 
 /// The corner a LEF58 cut spacing LAYER rule is measured to (`checkLef58CutSpacing_spc_layer`'s
@@ -715,6 +742,15 @@ pub mod read {
     /// A cut-to-corner rule as read: spacing, second layer NAME, class index, corner form.
     type LayerRuleByName = (i32, String, usize, CutCorner);
 
+    /// A LEF58 cut spacing rule as io reads it: kept as a cut-to-corner rule (its second layer
+    /// still a name) or an adjacent-cuts rule, or SKIPPED with the clause io warns about.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Lef58CutRule {
+        Layer(LayerRuleByName),
+        AdjacentCuts(AdjacentCuts),
+        Skipped(&'static str),
+    }
+
     /// A cut layer's LEF58 cut classes, as `io::Parser` reads them.
     pub fn cut_classes(db: &Db, layer: &str) -> Vec<CutClass> {
         db.layer_get_tech_layer_cut_class_rules(layer)
@@ -882,11 +918,13 @@ pub mod read {
     /// EXTENSION, ABOVEWIDTH, MASKOVERLAP, WRONGDIRECTION) or keeps but this engine does not model
     /// (no CUTCLASS, or a class with neither corner — the reference's check then does nothing —
     /// CENTERTOCENTER, SAMENET, SAMEMETAL, SAMEVIA, PRL).
-    pub fn cut_layer_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<LayerRuleByName, &'static str> {
+    pub fn cut_layer_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<Lef58CutRule, &'static str> {
         let ty = db.cutspacingrule_get_type(layer, k);
+        if ty == "ADJACENTCUTS" {
+            return adjacent_cuts_rule(db, layer, k, classes);
+        }
         if ty != "LAYER" {
             return Err(match ty.as_str() {
-                "ADJACENTCUTS" => "ADJACENTCUTS",
                 "PARALLELOVERLAP" => "PARALLELOVERLAP",
                 "PARALLELWITHIN" => "PARALLELWITHIN",
                 "SAMEMETALSHAREDEDGE" => "SAMEMETALSHAREDEDGE",
@@ -935,7 +973,55 @@ pub mod read {
             let min_length = db.cutspacingrule_is_min_length_valid(layer, k).then(|| db.cutspacingrule_get_min_length(layer, k));
             CutCorner::NonEolConvex { eol_width: db.cutspacingrule_get_eol_width(layer, k), min_length }
         };
-        Ok((db.cutspacingrule_get_cut_spacing(layer, k), second, c + 1, corner))
+        Ok(Lef58CutRule::Layer((db.cutspacingrule_get_cut_spacing(layer, k), second, c + 1, corner)))
+    }
+
+    /// io's ADJACENTCUTS branch for LEF58 cut spacing rule `k` of cut layer `layer`: EXACTALIGNED,
+    /// EXCEPTSAMEPGNET, CUTCLASS … TO ALL, SIDEPARALLELOVERLAP and SAMEMASK, tested in that order,
+    /// skip the rule (io warns and drops it); otherwise io keeps the spacing, CENTERTOCENTER,
+    /// the adjacent-cut count, TWOCUTS, the (first) WITHIN value, the class (none when the rule
+    /// names none) and NOPRL. `Err` names a clause io keeps but this engine does not model:
+    /// SAMENET (the rule would join the same-net list, which changes how the different-net rules
+    /// judge one net), SAMEMETAL or SAMEVIA and TWOCUTS SAMECUT (kept by io, read by no check),
+    /// and a second WITHIN value (io keeps only the first).
+    pub fn adjacent_cuts_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<Lef58CutRule, &'static str> {
+        let skipped: [(bool, &'static str); 5] = [
+            (db.cutspacingrule_is_exact_aligned(layer, k), "ADJACENTCUTS EXACTALIGNED"),
+            (db.cutspacingrule_is_except_same_pgnet(layer, k), "ADJACENTCUTS EXCEPTSAMEPGNET"),
+            (db.cutspacingrule_is_cut_class_to_all(layer, k), "ADJACENTCUTS CUTCLASS TO ALL"),
+            (db.cutspacingrule_is_side_parallel_overlap(layer, k), "ADJACENTCUTS SIDEPARALLELOVERLAP"),
+            (db.cutspacingrule_is_same_mask(layer, k), "ADJACENTCUTS SAMEMASK"),
+        ];
+        if let Some((_, clause)) = skipped.iter().find(|(set, _)| *set) {
+            return Ok(Lef58CutRule::Skipped(clause));
+        }
+        let unmodelled: [(bool, &'static str); 4] = [
+            (db.cutspacingrule_is_same_net(layer, k), "ADJACENTCUTS with SAMENET"),
+            (db.cutspacingrule_is_same_metal(layer, k) || db.cutspacingrule_is_same_via(layer, k), "ADJACENTCUTS with SAMEMETAL or SAMEVIA"),
+            (db.cutspacingrule_is_same_cut(layer, k), "ADJACENTCUTS TWOCUTS SAMECUT"),
+            (db.cutspacingrule_get_second_within(layer, k) > 0, "ADJACENTCUTS with a second WITHIN value"),
+        ];
+        if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
+            return Err(clause);
+        }
+        let name = db.cutspacingrule_get_cut_class(layer, k);
+        let class = if name.is_empty() {
+            0
+        } else {
+            match classes.iter().rposition(|c| c.name == name) {
+                Some(c) => c + 1,
+                None => return Err("a CUTCLASS the layer does not define"),
+            }
+        };
+        Ok(Lef58CutRule::AdjacentCuts(AdjacentCuts {
+            spacing: db.cutspacingrule_get_cut_spacing(layer, k),
+            center_to_center: db.cutspacingrule_is_center_to_center(layer, k),
+            adjacent_cuts: db.cutspacingrule_get_adjacent_cuts(layer, k) as i32,
+            two_cuts: db.cutspacingrule_is_two_cuts_valid(layer, k).then(|| db.cutspacingrule_get_two_cuts(layer, k) as i32),
+            within: db.cutspacingrule_get_within(layer, k),
+            class,
+            no_prl: db.cutspacingrule_is_no_prl(layer, k),
+        }))
     }
 
     pub fn corner_spacing_rule(db: &Db, layer: &str, k: usize) -> Result<CornerSpacing, &'static str> {
@@ -1046,7 +1132,7 @@ pub mod read {
         // Cut-to-corner rules by cut layer, their second layer by name until every layer is read
         // (`io_parser_helper` resolves it after the technology, the metal above being defined
         // after the cut).
-        let mut layer_rules_by_name: Vec<(usize, Vec<LayerRuleByName>)> = Vec::new();
+        let mut layer_rules_by_name: Vec<(usize, Vec<Lef58CutRule>)> = Vec::new();
         // Default inter-layer cut spacing tables: (cut layer, rule index).
         let mut inter_tables: Vec<(usize, usize)> = Vec::new();
         for (name, dir) in db.layers_with_direction()? {
@@ -1162,7 +1248,7 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1199,7 +1285,9 @@ pub mod read {
                             })
                         })
                         .collect();
-                    let rules: Vec<LayerRuleByName> = (0..db.num_layer_get_tech_layer_cut_spacing_rules(&name)).filter_map(|k| cut_layer_rule(db, &name, k, &cut_classes).ok()).collect();
+                    // io's list: the rules it keeps, in order (a skipped rule is dropped when the
+                    // second layers are resolved, below).
+                    let rules: Vec<Lef58CutRule> = (0..db.num_layer_get_tech_layer_cut_spacing_rules(&name)).filter_map(|k| cut_layer_rule(db, &name, k, &cut_classes).ok()).collect();
                     if !rules.is_empty() {
                         layer_rules_by_name.push((layers.len(), rules));
                     }
@@ -1219,9 +1307,13 @@ pub mod read {
             }
         }
         for (cut, rules) in layer_rules_by_name {
-            layers[cut].cut_layer_spacing = rules
+            layers[cut].lef58_cut_spacing = rules
                 .into_iter()
-                .filter_map(|(spacing, second, class, corner)| Some(CutLayerSpacing { spacing, second_layer: layers.iter().position(|l| l.name == second && l.kind == LayerKind::Routing)?, class, corner }))
+                .filter_map(|r| match r {
+                    Lef58CutRule::Layer((spacing, second, class, corner)) => Some(Lef58CutSpacing::Layer(CutLayerSpacing { spacing, second_layer: layers.iter().position(|l| l.name == second && l.kind == LayerKind::Routing)?, class, corner })),
+                    Lef58CutRule::AdjacentCuts(a) => Some(Lef58CutSpacing::AdjacentCuts(a)),
+                    Lef58CutRule::Skipped(_) => None,
+                })
                 .collect();
         }
         let num_of = |n: i64| -> Option<usize> {

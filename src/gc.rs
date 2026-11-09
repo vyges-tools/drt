@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, MinSpacing, ParallelEdge, Tech};
+use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -524,6 +524,19 @@ fn same_net_table_skips(same_net_table: bool, one_net: bool, layer_has_same_net:
         !one_net
     } else {
         one_net && layer_has_same_net
+    }
+}
+
+/// Two cuts' squared distance as a cut spacing rule measures it: centre to centre (each centre
+/// the integer midpoint, `gtl::center`) or edge to edge (`square_euclidean_distance`, 0 when
+/// they touch or overlap).
+fn cut_d2(a: &Rect, b: &Rect, center_to_center: bool) -> i64 {
+    if center_to_center {
+        let c = |r: &Rect| (i64::from((r.xl + r.xh) / 2), i64::from((r.yl + r.yh) / 2));
+        let ((x1, y1), (x2, y2)) = (c(a), c(b));
+        (x1 - x2).pow(2) + (y1 - y2).pow(2)
+    } else {
+        i64::from(gap((a.xl, a.xh), (b.xl, b.xh))).pow(2) + i64::from(gap((a.yl, a.yh), (b.yl, b.yh))).pow(2)
     }
 }
 
@@ -2211,7 +2224,7 @@ impl<'a> Worker<'a> {
             // `checkCutSpacing_main` reads the default inter-layer table of the layer two above too,
             // while that layer is below the top routing layer.
             let above = (layer + 2 < self.top_routing_layer && layer + 2 < self.tech.layers.len()).then(|| self.tech.layers[layer + 2].cut_table_inter.clone()).flatten();
-            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_table_inter.is_none() && above.is_none() && l.cut_enclosures.is_empty() && l.cut_layer_spacing.is_empty()) {
+            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_table_inter.is_none() && above.is_none() && l.cut_enclosures.is_empty() && l.lef58_cut_spacing.is_empty()) {
                 continue;
             }
             let (table, same_net, inter) = (l.cut_table.clone(), l.cut_table_same_net.clone(), l.cut_table_inter.clone());
@@ -2231,7 +2244,7 @@ impl<'a> Worker<'a> {
                             self.cut_pair(layer, k, o, spc);
                         }
                     }
-                    for i in 0..self.tech.layers[layer].cut_layer_spacing.len() {
+                    for i in 0..self.tech.layers[layer].lef58_cut_spacing.len() {
                         self.lef58_cut_spacing_main(layer, k, i);
                     }
                     if let Some(t) = &same_net {
@@ -2253,27 +2266,100 @@ impl<'a> Worker<'a> {
     }
 
     /// `checkLef58CutSpacing_main(rect, con, skipDiffNet)` for rule `i`: every maximal rectangle
-    /// of the second layer's metal (any owner) touching the cut grown by the rule's spacing (its
-    /// `getMaxSpcVal`: no ADJACENTCUTS here), in the tree's order, is paired with the cut.
+    /// (any owner) touching the cut grown by the rule's `getMaxSpcVal` (its spacing, or with
+    /// ADJACENTCUTS the larger of spacing and WITHIN), on the second layer when the rule has one,
+    /// else on the cut's own layer, in the tree's order, is paired with the cut.
     fn lef58_cut_spacing_main(&mut self, layer: usize, k: usize, i: usize) {
-        let con = self.tech.layers[layer].cut_layer_spacing[i];
-        let q = bloat(&self.shapes[layer][k].rect, con.spacing);
-        for o in self.query(con.second_layer, &q) {
+        let (ql, max_spc) = match self.tech.layers[layer].lef58_cut_spacing[i] {
+            Lef58CutSpacing::Layer(con) => (con.second_layer, con.spacing),
+            Lef58CutSpacing::AdjacentCuts(con) => (layer, con.spacing.max(con.within)),
+        };
+        let q = bloat(&self.shapes[layer][k].rect, max_spc);
+        for o in self.query(ql, &q) {
             self.lef58_cut_spacing_pair(layer, k, o, i);
         }
     }
 
-    /// `checkLef58CutSpacing_main(rect1, rect2, con)`: the pair goes to the LAYER branch (the
-    /// same-object and same-net exits cannot fire: the shapes are on two layers and the rule is
-    /// not SAMENET).
+    /// `checkLef58CutSpacing_main(rect1, rect2, con)`: the cut itself is skipped (the same-net
+    /// exit cannot fire: no SAMENET rule is modelled); a rule with a second layer goes to the
+    /// LAYER branch, else one with adjacent cuts to the ADJACENTCUTS branch.
     fn lef58_cut_spacing_pair(&mut self, layer: usize, k: usize, o: usize, i: usize) {
-        self.lef58_cut_spacing_spc_layer(layer, k, o, i);
+        match self.tech.layers[layer].lef58_cut_spacing[i] {
+            Lef58CutSpacing::Layer(_) => self.lef58_cut_spacing_spc_layer(layer, k, o, i),
+            Lef58CutSpacing::AdjacentCuts(con) => {
+                if o != k {
+                    self.lef58_cut_spacing_spc_adj_cut(layer, k, o, i, con);
+                }
+            }
+        }
+    }
+
+    /// `checkLef58CutSpacing_spc_adjCut` (rect1 the cut `k`, rect2 the cut `o`): skipped unless
+    /// the first cut has the rule's adjacent cuts, or (TWOCUTS) both cuts have the two-cuts count;
+    /// then cuts closer than the spacing (squared, centre to centre with CENTERTOCENTER, else
+    /// edge to edge), not both fixed, give a marker on the cut layer, its box between the two
+    /// (`generalized_intersect`), victim the first, aggressor the second. No net test: cuts of one
+    /// net are judged too.
+    fn lef58_cut_spacing_spc_adj_cut(&mut self, layer: usize, k: usize, o: usize, i: usize, con: AdjacentCuts) {
+        let mut skip = true;
+        if self.lef58_cut_spacing_has_adj_cuts(layer, k, &con, con.adjacent_cuts, con.no_prl) {
+            skip = false;
+        }
+        if let Some(two) = con.two_cuts {
+            if self.lef58_cut_spacing_has_adj_cuts(layer, k, &con, two, false) && self.lef58_cut_spacing_has_adj_cuts(layer, o, &con, two, false) {
+                skip = false;
+            }
+        }
+        if skip {
+            return;
+        }
+        let (v1, v2) = (self.shapes[layer][k], self.shapes[layer][o]);
+        if cut_d2(&v1.rect, &v2.rect, con.center_to_center) >= i64::from(con.spacing).pow(2) {
+            return;
+        }
+        if v1.fixed && v2.fixed {
+            return;
+        }
+        let marker = generalized_intersect(&v1.rect, &v2.rect);
+        self.add_marker_of(Rule::Lef58CutSpacing(i as u16), layer, marker, (v1.net, v1.rect, v1.fixed), (v2.net, v2.rect, v2.fixed));
+    }
+
+    /// `checkLef58CutSpacing_spc_hasAdjCuts` (`no_prl` the rule's NOPRL) and, with `no_prl` false
+    /// and `need` the TWOCUTS value, `checkLef58CutSpacing_spc_hasTwoCuts_helper`: over the
+    /// maximal rectangles on the cut's layer (any owner, the cut itself among them) touching the
+    /// cut grown by WITHIN, count those closer than WITHIN (squared, as the spacing is measured)
+    /// whose class (by width and length) is the rule's — with NOPRL only those with no parallel
+    /// run on either axis (abutting counts as none), or at distance 0; the count starts at -1, so
+    /// the cut counts itself when it is of the class; at least `need` passes.
+    fn lef58_cut_spacing_has_adj_cuts(&self, layer: usize, k: usize, con: &AdjacentCuts, need: i32, no_prl: bool) -> bool {
+        let r = self.shapes[layer][k].rect;
+        let within2 = i64::from(con.within).pow(2);
+        let mut cnt = -1;
+        for p in self.query(layer, &bloat(&r, con.within)) {
+            let pr = self.shapes[layer][p].rect;
+            let d2 = cut_d2(&r, &pr, con.center_to_center);
+            if d2 >= within2 {
+                continue;
+            }
+            if self.tech.layers[layer].cut_class_of(pr.dx().min(pr.dy()), pr.dx().max(pr.dy())) != con.class {
+                continue;
+            }
+            if no_prl {
+                let none = (pr.xl >= r.xh || pr.xh <= r.xl) && (pr.yl >= r.yh || pr.yh <= r.yl);
+                if none || d2 == 0 {
+                    cnt += 1;
+                }
+            } else {
+                cnt += 1;
+            }
+        }
+        cnt >= need
     }
 
     /// `checkLef58CutSpacing_spc_layer`: a cut of the rule's class goes to the rule's corner branch,
     /// CONCAVECORNER first, as the source tests them.
     fn lef58_cut_spacing_spc_layer(&mut self, layer: usize, k: usize, o: usize, i: usize) {
-        let con = self.tech.layers[layer].cut_layer_spacing[i];
+        let Lef58CutSpacing::Layer(con) = self.tech.layers[layer].lef58_cut_spacing[i] else { return };
         let r1 = self.shapes[layer][k].rect;
         if self.tech.layers[layer].cut_class_of(r1.dx().min(r1.dy()), r1.dx().max(r1.dy())) != con.class {
             return;
@@ -2292,7 +2378,7 @@ impl<'a> Worker<'a> {
     /// spacing, not with both cut and corner fixed, gives a marker
     /// (`lef58_cut_spacing_marker`).
     fn lef58_cut_spacing_spc_layer_concave(&mut self, layer: usize, k: usize, o: usize, i: usize) {
-        let con = self.tech.layers[layer].cut_layer_spacing[i];
+        let Lef58CutSpacing::Layer(con) = self.tech.layers[layer].lef58_cut_spacing[i] else { return };
         let (sl, cut, metal) = (con.second_layer, self.shapes[layer][k], self.shapes[con.second_layer][o]);
         let (r1, r2) = (cut.rect, metal.rect);
         if !contains(&r2, &r1) {
@@ -2330,7 +2416,7 @@ impl<'a> Worker<'a> {
     /// fixed. No boundary-line test here (the concave branch's): a corner off the rectangle whose
     /// edge touches it is checked too.
     fn lef58_cut_spacing_spc_layer_convex(&mut self, layer: usize, k: usize, o: usize, i: usize, eol_width: i32, min_length: Option<i32>) {
-        let con = self.tech.layers[layer].cut_layer_spacing[i];
+        let Lef58CutSpacing::Layer(con) = self.tech.layers[layer].lef58_cut_spacing[i] else { return };
         let (sl, cut, metal) = (con.second_layer, self.shapes[layer][k], self.shapes[con.second_layer][o]);
         let (r1, r2) = (cut.rect, metal.rect);
         if !contains(&r2, &r1) {
@@ -2383,7 +2469,8 @@ impl<'a> Worker<'a> {
     /// spanning the cut and the corner; victim the cut, aggressor the RECTANGLE's owner with the
     /// corner as a point on the second layer; once per rule, box and owners.
     fn lef58_cut_spacing_marker(&mut self, layer: usize, k: usize, o: usize, i: usize, c: &Corner, bbox: Rect) {
-        let sl = self.tech.layers[layer].cut_layer_spacing[i].second_layer;
+        let Lef58CutSpacing::Layer(con) = self.tech.layers[layer].lef58_cut_spacing[i] else { return };
+        let sl = con.second_layer;
         let (cut, metal) = (self.shapes[layer][k], self.shapes[sl][o]);
         let rule = Rule::Lef58CutSpacing(i as u16);
         let mut owners = vec![self.owner(cut.net).clone(), self.owner(metal.net).clone()];
@@ -2730,9 +2817,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -3956,7 +4043,7 @@ mod cut_concave_tests {
         let mut t = tests::tech();
         t.layers[3].cut_spacing = None;
         t.layers[3].cut_classes = vec![crate::tech::CutClass { name: "CA".into(), width: 100, length: 100 }];
-        t.layers[3].cut_layer_spacing = vec![crate::tech::CutLayerSpacing { spacing: 70, second_layer: 4, class: 1, corner: crate::tech::CutCorner::Concave }; rules];
+        t.layers[3].lef58_cut_spacing = vec![Lef58CutSpacing::Layer(crate::tech::CutLayerSpacing { spacing: 70, second_layer: 4, class: 1, corner: crate::tech::CutCorner::Concave }); rules];
         let mut w = Worker::new(&t);
         for (o, l, r, f) in shapes {
             w.add(&Owner::Net((*o).into()), *l, *r, *f);
@@ -4055,7 +4142,7 @@ mod cut_convex_tests {
         let mut t = tests::tech();
         t.layers[3].cut_spacing = None;
         t.layers[3].cut_classes = vec![CutClass { name: "CA".into(), width: 100, length: 100 }];
-        t.layers[3].cut_layer_spacing = rules;
+        t.layers[3].lef58_cut_spacing = rules.into_iter().map(Lef58CutSpacing::Layer).collect();
         let mut w = Worker::new(&t);
         for (o, l, r, f) in shapes {
             w.add(&Owner::Net((*o).into()), *l, *r, *f);
@@ -4189,5 +4276,123 @@ mod cut_convex_tests {
         let concave = CutLayerSpacing { corner: CutCorner::Concave, ..convex(0, None) };
         let m = run_with(&block(Rect::new(880, 880, 980, 980)), vec![concave, convex(150, None)]);
         assert_eq!(m.iter().map(|m| m.rule).collect::<Vec<_>>(), [Rule::Lef58CutSpacing(1)]);
+    }
+}
+
+#[cfg(test)]
+mod adjacent_cuts_tests {
+    //! LEF58 cut spacing ADJACENTCUTS on cut layer 3 of `tests::tech()` (no plain cut spacing):
+    //! class CA a 40 × 40 cut, class CW 50 × 50; the rule SPACING 100 CENTERTOCENTER ADJACENTCUTS
+    //! 2 WITHIN 120 CUTCLASS CA unless a test says otherwise. Cuts are 40 squares centred at the
+    //! points given.
+    use super::*;
+    use crate::tech::CutClass;
+
+    fn rule() -> AdjacentCuts {
+        AdjacentCuts { spacing: 100, center_to_center: true, adjacent_cuts: 2, two_cuts: None, within: 120, class: 1, no_prl: false }
+    }
+
+    fn cut(x: i32, y: i32) -> Rect {
+        Rect::new(x - 20, y - 20, x + 20, y + 20)
+    }
+
+    fn run(rules: Vec<AdjacentCuts>, cuts: &[(&str, Rect, bool)]) -> Vec<Marker> {
+        let mut t = tests::tech();
+        t.layers[3].cut_spacing = None;
+        t.layers[3].cut_classes = vec![CutClass { name: "CA".into(), width: 40, length: 40 }, CutClass { name: "CW".into(), width: 50, length: 50 }];
+        t.layers[3].lef58_cut_spacing = rules.into_iter().map(Lef58CutSpacing::AdjacentCuts).collect();
+        let mut w = Worker::new(&t);
+        for (o, r, f) in cuts {
+            w.add(&Owner::Net((*o).into()), 3, *r, *f);
+        }
+        w.init();
+        w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58CutSpacing(_))).cloned().collect()
+    }
+
+    fn tri(c: Rect) -> Vec<(&'static str, Rect, bool)> {
+        vec![("a", cut(1000, 1000), false), ("b", cut(1090, 1000), false), ("c", c, false)]
+    }
+
+    // Rule (`checkLef58CutSpacing_spc_hasAdjCuts`, `_adjCut`): a cut with at least ADJACENTCUTS
+    // cuts of the class closer than WITHIN (the count starts at -1 and the cut counts itself)
+    // needs the spacing to every other cut; the pair is judged from the first cut alone, and a
+    // marker repeated from the other side is the same marker. Victim the first cut.
+    #[test]
+    fn a_cut_with_two_adjacent_cuts_needs_the_spacing() {
+        let m = run(vec![rule()], &tri(cut(1000, 1090)));
+        assert_eq!(m.len(), 2, "{m:?}");
+        let ab = m.iter().find(|x| x.bbox == Rect::new(1020, 980, 1070, 1020)).expect("the A-B marker");
+        assert_eq!((ab.layer, ab.victim.as_ref().map(|v| v.2), ab.aggressor.as_ref().map(|v| v.2)), (3, Some(cut(1000, 1000)), Some(cut(1090, 1000))));
+        assert!(run(vec![rule()], &tri(cut(1000, 1130))[..2]).is_empty(), "one neighbour");
+        assert!(run(vec![rule()], &tri(cut(1000, 1120))).is_empty(), "120 is not within 120");
+        let edge = [("a", cut(1000, 1000), false), ("b", cut(1100, 1000), false), ("c", cut(1000, 1090), false)];
+        assert_eq!(run(vec![rule()], &edge).len(), 1, "100 apart is not below 100");
+    }
+
+    // Rule (`_adjCut`): no net test — the cuts of one net are judged too; two fixed cuts are not.
+    #[test]
+    fn one_net_is_judged_and_two_fixed_cuts_are_not() {
+        let one: Vec<_> = tri(cut(1000, 1090)).into_iter().map(|(_, r, f)| ("a", r, f)).collect();
+        assert_eq!(run(vec![rule()], &one).len(), 2);
+        let fixed: Vec<_> = tri(cut(1000, 1090)).into_iter().map(|(o, r, _)| (o, r, true)).collect();
+        assert!(run(vec![rule()], &fixed).is_empty());
+        let mut one_fixed = tri(cut(1000, 1090));
+        one_fixed[0].2 = true;
+        assert_eq!(run(vec![rule()], &one_fixed).len(), 2, "one fixed cut is judged");
+    }
+
+    // Rule (marker merge, keyed by constraint): two rules on the layer mark the same pair once
+    // EACH.
+    #[test]
+    fn each_rule_keeps_its_own_marker() {
+        assert_eq!(run(vec![rule(), rule()], &tri(cut(1000, 1090))).len(), 4);
+    }
+
+    // Rule (`_hasAdjCuts`): only cuts of the rule's class count (by width and length); a rule
+    // with no class counts the cuts with none.
+    #[test]
+    fn only_cuts_of_the_class_count() {
+        let wide = [("a", cut(1000, 1000), false), ("b", Rect::new(1065, 975, 1115, 1025), false), ("c", cut(1000, 1090), false)];
+        assert!(run(vec![rule()], &wide).is_empty());
+        let none = AdjacentCuts { adjacent_cuts: 1, class: 0, ..rule() };
+        let big = |x: i32| Rect::new(x - 30, 970, x + 30, 1030);
+        assert_eq!(run(vec![none], &[("a", big(1000), false), ("b", big(1090), false)]).len(), 1);
+        assert!(run(vec![none], &tri(cut(1000, 1090))[..2]).is_empty());
+    }
+
+    // Rule (`_hasAdjCuts`, NOPRL): only cuts with no parallel run on either axis count (and the
+    // cut itself, at distance 0).
+    #[test]
+    fn noprl_counts_only_cuts_with_no_parallel_run() {
+        let np = AdjacentCuts { spacing: 120, no_prl: true, ..rule() };
+        assert!(run(vec![np], &tri(cut(1000, 1090))).is_empty());
+        let diag = [("a", cut(1000, 1000), false), ("b", cut(1080, 1080), false), ("c", cut(920, 1080), false)];
+        assert_eq!(run(vec![np], &diag).len(), 2);
+        // Cuts meeting A at a corner abut on both axes: no parallel run, so they count.
+        let corners = [("a", cut(1000, 1000), false), ("b", cut(1040, 1040), false), ("c", cut(960, 1040), false)];
+        assert_eq!(run(vec![np], &corners).len(), 2);
+    }
+
+    // Rule (`_adjCut`, TWOCUTS): when the count fails, a pair each of whose cuts has TWOCUTS cuts
+    // of the class within (itself counted) is judged.
+    #[test]
+    fn twocuts_judges_a_pair_with_its_own_count() {
+        let t = AdjacentCuts { adjacent_cuts: 3, two_cuts: Some(1), ..rule() };
+        assert_eq!(run(vec![t], &tri(cut(0, 0))[..2]).len(), 1);
+        assert!(run(vec![AdjacentCuts { two_cuts: None, ..t }], &tri(cut(0, 0))[..2]).is_empty());
+        // BOTH cuts need the count: B (class CW) does not count itself, so A alone leaves it at
+        // 0; A has C too (110 away: within, not below the spacing), so A alone would pass.
+        let one_side = [("a", cut(1000, 1000), false), ("b", Rect::new(1065, 975, 1115, 1025), false), ("c", cut(1000, 1110), false)];
+        assert!(run(vec![t], &one_side).is_empty());
+        // The TWOCUTS count ignores NOPRL: B runs parallel to A and still counts.
+        assert_eq!(run(vec![AdjacentCuts { no_prl: true, ..t }], &tri(cut(0, 0))[..2]).len(), 1);
+    }
+
+    // Rule (`_adjCut`): edge to edge without CENTERTOCENTER, for the spacing and for WITHIN.
+    #[test]
+    fn edge_to_edge_without_centertocenter() {
+        let e = AdjacentCuts { spacing: 70, center_to_center: false, within: 100, ..rule() };
+        // B and C 70.7 apart edge to edge: not below 70; A-B and A-C 50.
+        assert_eq!(run(vec![e], &tri(cut(1000, 1090))).len(), 2);
     }
 }
