@@ -128,7 +128,8 @@ CONCAVECORNER`, its plain form, and `SPACING s LAYER l CUTCLASS c NONEOLCONVEXCO
 m]`), and LEF58 cut spacing with adjacent cuts (`SPACING s [CENTERTOCENTER] ADJACENTCUTS n
 [TWOCUTS t] WITHIN w [CUTCLASS c] [NOPRL]`; with `EXACTALIGNED`, `EXCEPTSAMEPGNET`, `TO ALL`,
 `SIDEPARALLELOVERLAP` or `SAMEMASK` the rule is skipped with a warning, as the reference skips
-it; every other LEF58 cut spacing form is refused). A cell obstruction with its own `DESIGNRULEWIDTH`
+it; a `SAMENET` rule beside one of these is refused, since the reference then judges only cuts of one
+net in them; every other LEF58 cut spacing form is refused). A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
@@ -149,7 +150,9 @@ issue #12174), a reading this router does not copy. Skipped the same way: a `LEF
 rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
 reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS c n`: the
 database reader keeps it with a cut count of 0, so the reference drops it unread; upstream
-OpenROAD issue #12176).
+OpenROAD issue #12176). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
+(`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`). The reference keeps it, but its check acts only on
+a rule with a cut class, so it never checks it and routes as if it were absent, without a warning.
 
 Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
 (it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,
