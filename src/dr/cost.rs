@@ -829,6 +829,62 @@ impl CostWorker<'_, '_> {
     }
 }
 
+impl CostWorker<'_, '_> {
+    /// `modInterLayerCutSpacingCost(box, z, type, isUpperVia)`: around a cut shape on the cut layer
+    /// above `z` (cut 1), the second cut layer two up (`upper`) or two down (cut 2): with a
+    /// default via on cut 2 and a default inter-layer cut spacing table between the two — cut 1's
+    /// own table naming cut 2 (`upper` false), else cut 2's naming cut 1 — every node whose cut 2
+    /// default via cut lies closer than the table's DEFAULT pair (second where the two run
+    /// parallel, else first; centre to centre per the default's flags) gets a via cost on the z of
+    /// cut 2 (z + 1 / z - 1). (The plain inter-layer cut spacing rule this also reads is not
+    /// modelled.) ⚠️ A cut 2 outside the grid's z range (the cut above the top routing layer, or
+    /// below the lowest) is skipped: the reference indexes off its grid there.
+    pub fn mod_inter_layer_cut_spacing_cost(&mut self, b: &Rect, z: usize, t: ModCost, upper: bool) {
+        let tech = self.cx.tech;
+        let cut1 = self.g.zs[z] + 1;
+        let Some(cut2) = (if upper { Some(cut1 + 2) } else { cut1.checked_sub(2) }) else { return };
+        if cut2 >= tech.layers.len() {
+            return;
+        }
+        let Some(v) = self.cx.default_via(cut2 as i64) else { return };
+        let (l1, l2) = (&tech.layers[cut1], &tech.layers[cut2]);
+        let tb = if upper { l2.cut_table_inter.as_ref().filter(|t| t.second_layer == cut1) } else { l1.cut_table_inter.as_ref().filter(|t| t.second_layer == cut2) };
+        let Some(tb) = tb.map(|t| &t.table) else { return };
+        let Some(z2) = (if upper { Some(z + 1) } else { z.checked_sub(1) }).filter(|&z2| z2 < self.g.zs.len()) else { return };
+        let cf = &tech.via_defs[v].cut_figs;
+        let vb = bbox(cf);
+        let (first, second) = tb.default_spacing;
+        let d = first.max(second).max(0);
+        let bx = Rect { xl: b.xl - d - vb.xh + 1, yl: b.yl - d - vb.yh + 1, xh: b.xh + d - vb.xl - 1, yh: b.yh + d - vb.yl - 1 };
+        let Some((x1, y1, x2, y2)) = self.range(&bx) else { return };
+        let center = |r: &Rect| (i64::from((r.xl + r.xh) / 2), i64::from((r.yl + r.yh) / 2));
+        let bc = center(b);
+        for i in x1..=x2 {
+            for j in y1..=y2 {
+                let p = (self.g.xs[i], self.g.ys[j]);
+                for f in cf.clone() {
+                    let tmp = shift(&f, p);
+                    let (d2, dx, dy) = box_box_d2(b, &tmp);
+                    let prl = (-dx).max(-dy);
+                    let req = if prl > 0 { second } else { first };
+                    let c2c = tb.default_center_to_center || (tb.default_center_and_edge && req == first.max(second));
+                    let cur = if c2c {
+                        let tc = center(&tmp);
+                        (bc.0 - tc.0).pow(2) + (bc.1 - tc.1).pow(2)
+                    } else {
+                        d2
+                    };
+                    if cur < i64::from(req) * i64::from(req) {
+                        let k = self.g.idx(i, j, z2);
+                        self.g.mod_via(k, t, false);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A shape a route writes: a wire (its ends as maze indices too), a via (bottom and top maze
 /// indices), or a patch (its layer's metal around an origin).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -912,10 +968,14 @@ impl CostWorker<'_, '_> {
                         self.mod_eol_spacing_rules_cost(&b, z, t, false, eol_of(z), true, true);
                     }
                 }
-                if mod_cut {
-                    for f in vd.cut_figs.clone() {
+                // Per cut: its cut spacing (when asked), then, always, the inter-layer cut spacing
+                // up and down.
+                for f in vd.cut_figs.clone() {
+                    if mod_cut {
                         self.mod_cut_spacing_cost(&shift(&f, origin), bi.2, t, Some((bi.0, bi.1)));
                     }
+                    self.mod_inter_layer_cut_spacing_cost(&shift(&f, origin), bi.2, t, true);
+                    self.mod_inter_layer_cut_spacing_cost(&shift(&f, origin), bi.2, t, false);
                 }
             }
         }
@@ -1050,6 +1110,8 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
                     w.mod_blocked_via(b, z, true);
                 } else {
                     w.mod_cut_spacing_cost(b, z, ModCost::AddFixed, None);
+                    w.mod_inter_layer_cut_spacing_cost(b, z, ModCost::AddFixed, true);
+                    w.mod_inter_layer_cut_spacing_cost(b, z, ModCost::AddFixed, false);
                 }
             }
         }
@@ -1070,6 +1132,8 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
                         }
                     } else {
                         w.mod_cut_spacing_cost(b, z, ModCost::AddFixed, None);
+                        w.mod_inter_layer_cut_spacing_cost(b, z, ModCost::AddFixed, true);
+                        w.mod_inter_layer_cut_spacing_cost(b, z, ModCost::AddFixed, false);
                     }
                 }
                 Fixed::Seg { supply } => {
@@ -1091,6 +1155,8 @@ fn init_maze_cost_fixed_obj(w: &mut CostWorker<'_, '_>, ext_box: &Rect) -> Resul
                     } else {
                         // (Adjacent-cut spacing: refused, not modelled.)
                         w.mod_cut_spacing_cost(b, z, ModCost::AddFixed, None);
+                        w.mod_inter_layer_cut_spacing_cost(b, z, ModCost::AddFixed, true);
+                        w.mod_inter_layer_cut_spacing_cost(b, z, ModCost::AddFixed, false);
                     }
                 }
                 _ => {}
@@ -1418,6 +1484,48 @@ mod tests {
         // Centre to centre: 70 apart, the second value 60 — clean; edge to edge (50) it is not.
         assert_eq!(cost((50, 60), true), 0);
         assert_eq!(cost((50, 60), false), 1);
+    }
+
+    // Rule (`modInterLayerCutSpacingCost`): around a cut on the layer above z, the via of the cut
+    // layer two up (or down) whose cut lands closer than the default inter-layer table's DEFAULT
+    // pair (second when they run parallel) is costed on THAT via's z — when the table belongs to
+    // the upper of the two layers and names the lower (the kit's form): the upper layer's own
+    // table looking down, or the table of the layer above looking down at this one. A second
+    // layer off the grid's z range is skipped. Layers: 2, 4, 6 routing; 3, 5 cut, each with a
+    // default via (cut 20 square); layer 5's table names layer 3, DEFAULT (50, 80).
+    #[test]
+    fn the_inter_layer_table_costs_the_other_layers_vias() {
+        let cost = |second: usize, shape_cut: usize, upper: bool, zs: Vec<usize>| {
+            let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, ..Default::default() };
+            let cut = || Layer { kind: LayerKind::Cut, ..Default::default() };
+            let via = |c: usize| crate::tech::ViaDef { name: format!("V{c}"), is_default: true, layer1: c - 1, cut: c, layer2: c + 1, layer1_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }], cut_figs: vec![Rect { xl: -10, yl: -10, xh: 10, yh: 10 }], layer2_figs: vec![Rect { xl: -50, yl: -50, xh: 50, yh: 50 }] };
+            let mut t = Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), cut(), routing(Dir::Vertical), cut(), routing(Dir::Horizontal)], manufacturing_grid: 5, via_defs: vec![via(3), via(5)], obs_own_width: false };
+            let table = crate::tech::CutSpacingTable { default_spacing: (50, 80), ..Default::default() };
+            t.layers[5].cut_table_inter = Some(crate::tech::InterCutTable { second_layer: second, no_stack: false, table });
+            let node = Node { east: true, north: true, up: true, ..Default::default() };
+            let nz = zs.len();
+            let mut g = GridGraph { xs: (0..10).map(|i| i * 100).collect(), ys: vec![0, 100, 200, 300, 370, 500, 600, 700, 800, 900], zs, nodes: vec![node; 100 * nz] };
+            let z = g.zs.iter().position(|&l| l + 1 == shape_cut).expect("z");
+            let defaults = [None, None, None, Some(0), None, Some(1), None];
+            let none = |_: &Fixed| Vec::new();
+            let aps = |_: usize| Vec::new();
+            let block = |_: usize| false;
+            let fixed: Vec<PackedRTree<Fixed>> = Vec::new();
+            let cx = CostCtx { tech: &t, defaults: &defaults, eol: &[], ndrs: Vec::new(), use_min_spacing_obs: true, through: &[], via_access_layer: 2, fixed: &fixed, term_shapes: &none, port_aps: &aps, inst_is_block: &block, inst_is_macro: &block, inst_term_aps: &|_, _| Vec::new() };
+            let mut w = CostWorker { cx: &cx, g: &mut g, ap_svia: BTreeMap::new() };
+            w.mod_inter_layer_cut_spacing_cost(&Rect { xl: 290, yl: 290, xh: 310, yh: 310 }, z, ModCost::AddFixed, upper);
+            (0..nz).map(|z| (0..10).flat_map(|i| (0..10).map(move |j| (i, j))).filter(|&(i, j)| g.nodes[g.idx(i, j, z)].fixed_via > 0).count()).collect::<Vec<_>>()
+        };
+        // A cut on layer 3 (z 0), looking up: layer 5's table names it; layer 5's vias (z 1) cost.
+        // The nodes (300, 300) (stacked: overlapping, so parallel) and (300, 370) (cut 360..380, 50
+        // away, parallel: under the second value 80) cost; nothing on this layer's own vias.
+        assert_eq!(cost(3, 3, true, vec![2, 4, 6]), vec![0, 2, 0]);
+        // A cut on layer 5 (z 1), looking down: its own table names layer 3; layer 3's vias cost.
+        assert_eq!(cost(3, 5, false, vec![2, 4, 6]), vec![2, 0, 0]);
+        assert_eq!(cost(3, 3, false, vec![2, 4, 6]), vec![0, 0, 0], "layer 3 has no table and nothing below");
+        assert_eq!(cost(3, 5, true, vec![2, 4, 6]), vec![0, 0, 0], "no cut layer two above 5");
+        assert_eq!(cost(7, 3, true, vec![2, 4, 6]), vec![0, 0, 0], "a table naming another layer is not this pair's");
+        assert_eq!(cost(3, 5, false, vec![4, 6]), vec![0, 0], "layer 3's vias are off this grid: skipped");
     }
 
     // Rule: an instance pin UNBLOCKS the planar edges a blockage blocked under it (its access

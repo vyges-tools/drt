@@ -326,8 +326,9 @@ impl Ctx<'_> {
     /// order; SAMEMETAL, which would come first, is refused) — the spacing between their classes (`getSpacing`'s MAX of
     /// first and second, END/SIDE by each cut's orientation across the direction) plus the cut's
     /// length along it (edge to edge); centre-and-edge: the larger of MAX and MIN plus the two half
-    /// lengths; centre to centre: the spacing alone. Forbidden from 0. (Cuts on different layers
-    /// read only the SAMEMETAL / SAMENET inter-layer tables, refused.)
+    /// lengths; centre to centre: the spacing alone. Forbidden from 0. Cuts on different layers
+    /// read only the layer's SAMEMETAL / SAMENET inter-layer table (refused), and return without
+    /// one: the default inter-layer table adds nothing here.
     fn via2via_lef58_cut_spc_tbl(&self, v1: usize, v2: usize, along_x: bool, out: &mut Ranges) {
         let tech = self.tech;
         let (vd1, vd2) = (&tech.via_defs[v1], &tech.via_defs[v2]);
@@ -636,7 +637,10 @@ impl Ctx<'_> {
 /// table's DEFAULT (what the maze's cut cost reads) is REPLACED by the table's maximum for the
 /// default via's cut class against itself (`getMaxSpacing`, the most of END/SIDE either side),
 /// first and second, and that pair's centre flags — io's raw first entry stays only where the
-/// layer has no default via. (The inter-layer table's branch is not modelled: those are refused.)
+/// layer has no default via. Then the default inter-layer table's: where the second layer has a
+/// default via too, the table's maximum for the class of THIS layer's default via cut against
+/// the class the SECOND layer gives that same cut box (⚠️ the reference measures its own via's
+/// cut there, not the second layer's), first and second, and that pair's centre flags.
 pub fn prep_cut_spc_tbl(tech: &mut Tech, defaults: &[Option<usize>]) {
     for l in 0..tech.layers.len() {
         if tech.layers[l].kind != LayerKind::Cut {
@@ -644,16 +648,34 @@ pub fn prep_cut_spc_tbl(tech: &mut Tech, defaults: &[Option<usize>]) {
         }
         let Some(v) = defaults.get(l).copied().flatten() else { continue };
         let cb = bbox(&tech.via_defs[v].cut_figs);
-        let c = tech.layers[l].cut_class_of(cb.dx().min(cb.dy()), cb.dx().max(cb.dy()));
-        let Some(tb) = tech.layers[l].cut_table.as_mut() else { continue };
-        let sides = [(true, true), (true, false), (false, true), (false, false)];
-        let first = sides.iter().map(|&(a, b)| tb.get(c, a, c, b).0).max().unwrap_or(0);
-        let second = sides.iter().map(|&(a, b)| tb.get(c, a, c, b).1).max().unwrap_or(0);
-        let pair = tb.pair(c, c);
-        tb.default_spacing = (first, second);
-        tb.default_center_to_center = tb.center_to_center[pair];
-        tb.default_center_and_edge = tb.center_and_edge[pair];
+        let (w, len) = (cb.dx().min(cb.dy()), cb.dx().max(cb.dy()));
+        let c = tech.layers[l].cut_class_of(w, len);
+        if let Some(tb) = tech.layers[l].cut_table.as_mut() {
+            set_table_default(tb, c, c);
+        }
+        let Some(second) = tech.layers[l].cut_table_inter.as_ref().map(|t| t.second_layer) else { continue };
+        if defaults.get(second).copied().flatten().is_none() {
+            continue;
+        }
+        let c2 = tech.layers[second].cut_class_of(w, len);
+        let Some(t) = tech.layers[l].cut_table_inter.as_ref() else { continue };
+        let (i1, i2) = (t.table.class_index(&tech.layers[l], c), t.table.class_index(&tech.layers[second], c2));
+        if let Some(t) = tech.layers[l].cut_table_inter.as_mut() {
+            set_table_default(&mut t.table, i1, i2);
+        }
     }
+}
+
+/// `setDefaultSpacing({getMaxSpacing(c1, c2, FIRST), getMaxSpacing(c1, c2, SECOND)})` and the
+/// pair's centre flags (table indices).
+fn set_table_default(tb: &mut crate::tech::CutSpacingTable, c1: usize, c2: usize) {
+    let sides = [(true, true), (true, false), (false, true), (false, false)];
+    let first = sides.iter().map(|&(a, b)| tb.get(c1, a, c2, b).0).max().unwrap_or(0);
+    let second = sides.iter().map(|&(a, b)| tb.get(c1, a, c2, b).1).max().unwrap_or(0);
+    let pair = tb.pair(c1, c2);
+    tb.default_spacing = (first, second);
+    tb.default_center_to_center = tb.center_to_center[pair];
+    tb.default_center_and_edge = tb.center_and_edge[pair];
 }
 
 pub fn rule_tables(tech: &Tech, defaults: &[Option<usize>], ndrs: &[NdrRule], cfg: &RuleConfig) -> RuleTables {
@@ -839,6 +861,42 @@ mod tests {
         assert_eq!((tb.default_spacing, tb.default_center_to_center), ((30, 40), true));
         prep_cut_spc_tbl(&mut without, &[None, None, None, None, None]);
         assert_eq!(without.layers[3].cut_table.as_ref().unwrap().default_spacing, (99, 99));
+    }
+
+    // Rule (`prep_cutSpcTbl`, inter-layer branch): a cut layer with a default via whose default
+    // inter-layer table's second layer has one too takes, as that table's default, the most of
+    // END/SIDE either side for (this layer's via class, the class the SECOND layer gives THIS
+    // via's cut box) — the reference measures its own via's cut there. Without the second
+    // layer's default via, io's value stays. Classes by name: index 1 "CB" (layer 5's 80 square
+    // cut), 2 "CA" (layer 3's class of an 80 square cut; its own default via is 40 square, class
+    // CS, which the table does not hold: read there, the default would be 0). CS is layer 3's
+    // FIRST class so that this layer's class index read on layer 3 names CS, not CA.
+    #[test]
+    fn the_inter_layer_table_default_measures_this_layers_via_on_the_second_layer() {
+        use crate::tech::{CutClass, CutSpacingTable, InterCutTable};
+        let class = |name: &str, w: i32| CutClass { name: name.into(), width: w, length: w };
+        let mut t = tech(vec![via("v", r(-100, -100, 100, 100), r(-50, -50, 50, 50))]);
+        t.layers.push(crate::tech::Layer { kind: LayerKind::Cut, cut_classes: vec![class("CB", 80)], ..Default::default() });
+        t.layers[3].cut_classes = vec![class("CS", 40), class("CA", 80)];
+        let mut spacing = vec![(0, 0); 36];
+        let n = 3;
+        let at = |c1: usize, s1: bool, c2: usize, s2: bool| ((c1 * 2 + usize::from(s1)) * n + c2) * 2 + usize::from(s2);
+        spacing[at(1, false, 2, true)] = (60, 70);
+        spacing[at(1, true, 2, false)] = (65, 10);
+        let mut cae = vec![false; 9];
+        cae[n + 2] = true;
+        let table = CutSpacingTable { n, spacing, center_to_center: vec![false; 9], center_and_edge: cae, names: vec!["".into(), "CB".into(), "CA".into()], default_spacing: (99, 99), ..Default::default() };
+        t.layers[5].cut_table_inter = Some(InterCutTable { second_layer: 3, no_stack: false, table });
+        let mut v5 = t.via_defs[0].clone();
+        (v5.cut, v5.name) = (5, "v5".into());
+        t.via_defs.push(v5);
+        t.via_defs[0].cut_figs = vec![r(-20, -20, 20, 20)];
+        let mut without = t.clone();
+        prep_cut_spc_tbl(&mut t, &[None, None, None, Some(0), None, Some(1)]);
+        let it = &t.layers[5].cut_table_inter.as_ref().unwrap().table;
+        assert_eq!((it.default_spacing, it.default_center_and_edge), ((65, 70), true));
+        prep_cut_spc_tbl(&mut without, &[None, None, None, None, None, Some(1)]);
+        assert_eq!(without.layers[5].cut_table_inter.as_ref().unwrap().table.default_spacing, (99, 99));
     }
 
     // Rule (`prep_via2viaForbiddenLen_lef58CutSpcTbl`): two cuts on one layer under its LEF58

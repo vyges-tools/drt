@@ -158,6 +158,8 @@ pub struct MazeCfg<'a> {
     pub fixed_cost: u32,
     pub iter: i32,
     pub bottom_routing_layer: usize,
+    /// The router's top routing layer (the worker's check reads it).
+    pub top_routing_layer: usize,
     /// Everything ripped up at the start (the first reroute of a net gives back its via
     /// reservation).
     pub ripup_all: bool,
@@ -787,7 +789,7 @@ mod tests {
             tech.layers[4].rect_only = rect_only;
             let mut rules = RuleTables { layers: vec![LayerTables::default(); 2], ..Default::default() };
             rules.layers[0].via2via[6] = vec![(1, 250)];
-            let cfg = MazeCfg { tech: &tech, rules: &rules, drc_cost: 8, marker_cost: 50, fixed_cost: 0, iter, bottom_routing_layer: 2, ripup_all: false };
+            let cfg = MazeCfg { tech: &tech, rules: &rules, drc_cost: 8, marker_cost: 50, fixed_cost: 0, iter, bottom_routing_layer: 2, top_routing_layer: usize::MAX, ripup_all: false };
             let node = Node { east: true, north: true, up: true, ..Default::default() };
             let g = GridGraph { xs: (0..10).map(|i| i * 100).collect(), ys: (0..10).map(|i| i * 100).collect(), zs: vec![2, 4], nodes: vec![node; 200] };
             let mut st = MazeState::new(&tech, &g, crate::polygon90::Rect::new(0, 0, 900, 900));

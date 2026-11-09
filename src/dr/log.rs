@@ -212,7 +212,7 @@ pub fn viol_name(rule: Rule) -> &'static str {
         Rule::Lef58EolKeepOut => "eolKeepOut",
         Rule::Lef58SpacingEndOfLine => "EOL",
         Rule::CornerSpacing => "Corner Spacing",
-        Rule::Lef58CutSpacingTable => "CutSpcTbl",
+        Rule::Lef58CutSpacingTable | Rule::Lef58CutSpacingTableInter => "CutSpcTbl",
         Rule::Lef58CutSpacing(_) => "Cut Spacing",
         Rule::MinStep => "Min Step",
         Rule::MinimumCut => "Minimum Cut",

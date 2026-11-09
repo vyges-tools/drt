@@ -25,7 +25,7 @@ pub use crate::dr::wire::InitialRouting;
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
     let has_block_master = db.inst_names().iter().any(|i| db.master_get_type(&db.inst_get_master(i)).unwrap_or_default().starts_with("BLOCK"));
-    for l in &tech.layers {
+    for (num, l) in tech.layers.iter().enumerate() {
         if l.kind == LayerKind::Placeholder {
             continue;
         }
@@ -94,9 +94,13 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
             if family == "lef58_cut_spacing_table" {
                 // Modelled for the tables on the layer itself: different-net (check, maze cost,
                 // via-to-via and the default `prep_cutSpcTbl` sets) and SAMENET (check, via-to-via);
-                // the reader names any other kind.
-                if let Err(clause) = crate::tech::read::cut_spacing_tables(db, &l.name, &l.cut_classes) {
-                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                // and for the default inter-layer table (check, from either layer; maze cost
+                // between the two layers' vias, with the default `prep_cutSpcTbl` sets); the reader
+                // names any other kind.
+                match crate::tech::read::cut_spacing_tables(db, &l.name, num, &l.cut_classes) {
+                    Err(clause) => out.push(format!("{}: {family} ({n}, {clause})", l.name)),
+                    Ok(t) if t.inter.is_some() && l.cut_table_inter.is_none() => out.push(format!("{}: {family} ({n}, a LAYER (inter-layer) cut spacing table to a layer not read as a cut layer)", l.name)),
+                    Ok(_) => {}
                 }
                 continue;
             }
@@ -765,6 +769,65 @@ mod skipped_rule_tests {
         let d = db("sm", "", &format!("{}{}", tbl("", "0.06"), tbl("SAMEMETAL ", "0.08")));
         let (_, refused, _) = census(&d);
         assert_eq!(refused, ["V1: lef58_cut_spacing_table (2, a SAMEMETAL cut spacing table)"]);
+    }
+
+    /// Two cut layers, V1 (class CA) and V2 (class CB, and CA too), and `v2` extra lines in V2.
+    fn db2(name: &str, v2: &str) -> Db {
+        let lef = format!(
+            "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\nMANUFACTURINGGRID 0.005 ;\n\
+             LAYER M1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\nEND M1\n\
+             LAYER V1\n  TYPE CUT ;\n  SPACING 0.05 ;\n  WIDTH 0.04 ;\n  PROPERTY LEF58_CUTCLASS \"CUTCLASS CA WIDTH 0.04 ;\" ;\nEND V1\n\
+             LAYER M2\n  TYPE ROUTING ;\n  DIRECTION VERTICAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\nEND M2\n\
+             LAYER V2\n  TYPE CUT ;\n  SPACING 0.05 ;\n  WIDTH 0.04 ;\n  PROPERTY LEF58_CUTCLASS \"CUTCLASS CB WIDTH 0.04 ; CUTCLASS CA WIDTH 0.04 LENGTH 0.08 ;\" ;\n{v2}END V2\n\
+             LAYER M3\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\nEND M3\nEND LIBRARY\n"
+        );
+        let path = std::env::temp_dir().join(format!("vyges-drt-inter-{}-{name}.lef", std::process::id()));
+        std::fs::write(&path, lef).expect("write lef");
+        let mut db = Db::new();
+        db.read_lef(path.to_str().expect("utf-8 path")).expect("read lef");
+        let _ = std::fs::remove_file(&path);
+        db
+    }
+
+    /// Rule (reference io `setCutLayerProperties`, the LEF58_SPACINGTABLE loop): a LAYER table that
+    /// is neither SAMENET nor SAMEMETAL is the layer's DEFAULT inter-layer table (the last such
+    /// kept), its second layer resolved by name, its lookups by class NAME over both layers'
+    /// classes; NOSTACK kept; MODELLED. An inter-layer SAMENET or SAMEMETAL table stays refused.
+    #[test]
+    fn a_default_inter_layer_cut_spacing_table_is_modelled() {
+        let tbl = |opt: &str, body: &str| format!("  PROPERTY LEF58_SPACINGTABLE \"SPACINGTABLE {opt}{body}\" ;\n");
+        let d = db2("it", &format!("{}{}", tbl("DEFAULT 0.03 LAYER V1 ", "CUTCLASS CB CA 0.05 0.06 ;"), tbl("DEFAULT 0.04 LAYER V1 NOSTACK PRL 0.02 ", "CUTCLASS CB CA 0.05 0.08 ;")));
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let (v1, v2) = (tech.layer_num("V1").expect("V1"), tech.layer_num("V2").expect("V2"));
+        let it = tech.layers[v2].cut_table_inter.as_ref().expect("the inter-layer table");
+        assert_eq!((it.second_layer, it.no_stack), (v1, true), "the LAST table is kept");
+        assert_eq!(it.table.names, ["", "CB", "CA"], "both layers' class names, V2's first, CA once");
+        let (cb, ca_v1) = (it.table.class_index(&tech.layers[v2], 1), it.table.class_index(&tech.layers[v1], 1));
+        assert_eq!((cb, ca_v1), (1, 2));
+        assert_eq!(it.table.get(cb, false, ca_v1, false), (50, 80), "V2's CB against V1's CA, by name");
+        assert_eq!(it.table.get(0, false, 0, false), (40, 40), "no class: the DEFAULT");
+        assert_eq!(it.table.prl_entry[it.table.pair(cb, ca_v1)], 20);
+        assert!(tech.layers[v2].cut_table.is_none() && tech.layers[v1].cut_table_inter.is_none());
+        for (opt, kind) in [("SAMENET LAYER V1 ", "SAMENET"), ("SAMEMETAL LAYER V1 ", "SAMEMETAL")] {
+            let d = db2(kind, &tbl(opt, "CUTCLASS CB CA 0.05 0.06 ;"));
+            let (_, refused, _) = census(&d);
+            assert_eq!(refused, [format!("V2: lef58_cut_spacing_table (1, a {kind} LAYER (inter-layer) cut spacing table)")]);
+        }
+    }
+
+    /// Rule (reference io, the same loop): a LAYER table on layer NUMBER 1 is skipped before
+    /// anything else is read of it (the first cut layer is layer 1 when the technology starts
+    /// with it); on any other layer it is kept.
+    #[test]
+    fn a_layer_table_on_layer_one_is_skipped() {
+        let d = db2("l1", "");
+        let tables = crate::tech::read::cut_spacing_tables(&d, "V2", 1, &[]).expect("tables");
+        assert_eq!(tables, crate::tech::CutSpacingTables::default());
+        let d = db2("l1b", "  PROPERTY LEF58_SPACINGTABLE \"SPACINGTABLE LAYER V1 CUTCLASS CB CA 0.05 0.06 ;\" ;\n");
+        assert_eq!(crate::tech::read::cut_spacing_tables(&d, "V2", 1, &[]).expect("tables").inter, None, "layer 1: skipped");
+        assert_eq!(crate::tech::read::cut_spacing_tables(&d, "V2", 5, &[]).expect("tables").inter, Some(0), "layer 5: kept");
     }
 
     /// Rule (reference io `setRoutingLayerProperties` then postProcess

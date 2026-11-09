@@ -636,6 +636,7 @@ fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], mut dump
     let tech = q.mcfg.tech;
     let mut gw = Worker::new(tech);
     gw.drc_box = Some(q.drc_box);
+    gw.top_routing_layer = q.mcfg.top_routing_layer;
     for (o, l, b) in q.fixed {
         gw.add(o, *l, *b, true);
     }

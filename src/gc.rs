@@ -104,6 +104,11 @@ pub enum Rule {
     CornerSpacing,
     /// Two cuts closer than a LEF58 cut spacing table allows (`checkLef58CutSpacingTbl`).
     Lef58CutSpacingTable,
+    /// Two cuts on two layers closer than a cut layer's LEF58 inter-layer cut spacing table allows
+    /// (`checkLef58CutSpacingTbl` with a LAYER table): named as [`Rule::Lef58CutSpacingTable`],
+    /// kept apart from it because the reference keeps a marker once per CONSTRAINT (a pair of
+    /// stacked cuts beside a third can give both tables the same box and owners).
+    Lef58CutSpacingTableInter,
     /// A cut closer to a concave corner, or to a non-end-of-line convex corner, of the metal holding
     /// it than a LEF58 cut spacing LAYER … CONCAVECORNER / NONEOLCONVEXCORNER rule allows
     /// (`checkLef58CutSpacing_spc_layer`); the rule's place in its layer's list (the reference
@@ -449,6 +454,10 @@ pub struct Worker<'a> {
     pub drc_box: Option<Rect>,
     /// Per z, the largest spacing of any non-default rule in the technology.
     pub max_ndr_spacing: Vec<i32>,
+    /// The router's top routing layer (`TOP_ROUTING_LAYER`): the default inter-layer cut spacing
+    /// table of the layer two above a cut is read only below it. The technology's topmost routing
+    /// layer unless set (io's default, without a maximum routing layer on the block).
+    pub top_routing_layer: usize,
     /// Per layer, the special spacing rectangles (after `init`; by index, never reused), whether
     /// each is still in its owner's list, and the layer's tree of them — which the reference
     /// keeps by value: packed at `init`, a removal takes the first equal rectangle in tree order.
@@ -501,6 +510,15 @@ fn width(r: &Rect) -> i32 {
 /// `checkLef58CutSpacingTbl_main`'s net filter for a table on the cut's own layer: a SAMENET
 /// table skips cuts of two nets; the different-net table skips cuts of one net when the layer has
 /// a SAMENET table (it then judges them).
+/// The LEF58 cut spacing table a check reads: one on the cut's layer (SAMENET or different-net),
+/// or a default inter-layer table (`table_layer` its own layer, `second` its second layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutTableKind {
+    SameNet,
+    DiffNet,
+    Inter { table_layer: usize, second: usize, no_stack: bool },
+}
+
 fn same_net_table_skips(same_net_table: bool, one_net: bool, layer_has_same_net: bool) -> bool {
     if same_net_table {
         !one_net
@@ -709,7 +727,7 @@ fn max_rects_of_difference(r: &Rect, holes: &[Rect]) -> Vec<Rect> {
 impl<'a> Worker<'a> {
     /// A worker with the floating ground and power owners in place.
     pub fn new(tech: &'a Tech) -> Worker<'a> {
-        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), seg_rq: Vec::new(), seg_tree_id: Vec::new(), seg_at: Vec::new(), next_uid: 0, ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, ignore_corner_spacing: false, drc_box: None, max_ndr_spacing: Vec::new(), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
+        let mut w = Worker { tech, nets: Vec::new(), index: HashMap::new(), shapes: Vec::new(), edges: Vec::new(), segs: Vec::new(), seg_rq: Vec::new(), seg_tree_id: Vec::new(), seg_at: Vec::new(), next_uid: 0, ignore_long_side_eol: false, target: None, check_ndrs: false, ignore_min_area: false, ignore_corner_spacing: false, drc_box: None, max_ndr_spacing: Vec::new(), top_routing_layer: tech.layers.iter().rposition(|l| l.kind == LayerKind::Routing).unwrap_or(0), spc: Vec::new(), spc_listed: Vec::new(), spc_rq: Vec::new(), alive: Vec::new(), rq_id: Vec::new(), rq: Vec::new(), markers: Vec::new(), seen: BTreeSet::new() };
         w.net(&Owner::FloatingGround);
         w.net(&Owner::FloatingPower);
         w
@@ -1111,6 +1129,19 @@ impl<'a> Worker<'a> {
             let victim = (self.owner(v.0).clone(), layer, v.1, v.2);
             let aggressor = (self.owner(g.0).clone(), layer, g.1, g.2);
             self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
+        }
+    }
+
+    /// A marker whose two sides are on two layers (the box on the first's), once per rule, box and
+    /// owners.
+    fn add_marker_two_layers(&mut self, rule: Rule, bbox: Rect, v: (usize, usize, Rect, bool), g: (usize, usize, Rect, bool)) {
+        let mut owners = vec![self.owner(v.0).clone(), self.owner(g.0).clone()];
+        owners.sort();
+        owners.dedup();
+        if self.seen.insert((bbox, v.1, rule, owners.clone())) {
+            let victim = (self.owner(v.0).clone(), v.1, v.2, v.3);
+            let aggressor = (self.owner(g.0).clone(), g.1, g.2, g.3);
+            self.markers.push(Marker { rule, layer: v.1, bbox, owners, victim: Some(victim), aggressor: Some(aggressor) });
         }
     }
 
@@ -2177,10 +2208,13 @@ impl<'a> Worker<'a> {
     fn check_cut_spacing(&mut self) {
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_enclosures.is_empty() && l.cut_layer_spacing.is_empty()) {
+            // `checkCutSpacing_main` reads the default inter-layer table of the layer two above too,
+            // while that layer is below the top routing layer.
+            let above = (layer + 2 < self.top_routing_layer && layer + 2 < self.tech.layers.len()).then(|| self.tech.layers[layer + 2].cut_table_inter.clone()).flatten();
+            if l.kind != LayerKind::Cut || (l.cut_spacing.is_none() && l.cut_table.is_none() && l.cut_table_inter.is_none() && above.is_none() && l.cut_enclosures.is_empty() && l.cut_layer_spacing.is_empty()) {
                 continue;
             }
-            let (table, same_net) = (l.cut_table.clone(), l.cut_table_same_net.clone());
+            let (table, same_net, inter) = (l.cut_table.clone(), l.cut_table_same_net.clone(), l.cut_table_inter.clone());
             for net in 0..self.nets.len() {
                 if !self.checks_from(net) {
                     continue;
@@ -2188,7 +2222,8 @@ impl<'a> Worker<'a> {
                 let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).collect();
                 // `checkCutSpacing_main(rect)`: per cut, the plain rule, then the LEF58 rules
                 // (the different-net list; no same-net rule is modelled, so none skips a
-                // different net), then the LEF58 tables: SAMENET, then different-net.
+                // different net), then the LEF58 tables: SAMENET, then different-net, then the
+                // default inter-layer table of this layer, then that of the layer two above.
                 for k in mine {
                     if let Some(spc) = self.tech.layers[layer].cut_spacing {
                         let q = bloat(&self.shapes[layer][k].rect, spc);
@@ -2200,10 +2235,16 @@ impl<'a> Worker<'a> {
                         self.lef58_cut_spacing_main(layer, k, i);
                     }
                     if let Some(t) = &same_net {
-                        self.cut_spacing_table(layer, k, t, true);
+                        self.cut_spacing_table(layer, k, t, CutTableKind::SameNet);
                     }
                     if let Some(t) = &table {
-                        self.cut_spacing_table(layer, k, t, false);
+                        self.cut_spacing_table(layer, k, t, CutTableKind::DiffNet);
+                    }
+                    if let Some(t) = &inter {
+                        self.cut_spacing_table(layer, k, &t.table, CutTableKind::Inter { table_layer: layer, second: t.second_layer, no_stack: t.no_stack });
+                    }
+                    if let Some(t) = &above {
+                        self.cut_spacing_table(layer, k, &t.table, CutTableKind::Inter { table_layer: layer + 2, second: t.second_layer, no_stack: t.no_stack });
                     }
                     self.lef58_enclosure(layer, k);
                 }
@@ -2417,46 +2458,78 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// `checkLef58CutSpacingTbl` (a table on the cut's own layer, SAMENET when `same_net`, else
-    /// different-net): every other pin's cut within the largest spacing the cut's class can need —
-    /// its END spacing for a square cut, the larger of END and SIDE otherwise — not both fixed.
-    fn cut_spacing_table(&mut self, layer: usize, k: usize, t: &CutSpacingTable, same_net: bool) {
+    /// `checkLef58CutSpacingTbl`: every cut within the largest spacing the cut's class can need —
+    /// its END spacing for a square cut, the larger of END and SIDE otherwise — on the query layer,
+    /// not both fixed, not of the cut's own pin. A table on the cut's layer (SAMENET or
+    /// different-net) queries that layer. An inter-layer table queries its second layer when the
+    /// cut is not on that layer (the cut is then the pair's FIRST, `isUpperVia`), else the
+    /// table's own layer (the cut SECOND): the first of a pair is always on the table's side.
+    fn cut_spacing_table(&mut self, layer: usize, k: usize, t: &CutSpacingTable, kind: CutTableKind) {
         let v = self.shapes[layer][k];
         let (w, l) = (v.rect.dx().min(v.rect.dy()), v.rect.dx().max(v.rect.dy()));
-        let c = self.tech.layers[layer].cut_class_of(w, l);
+        let c = t.class_index(&self.tech.layers[layer], self.tech.layers[layer].cut_class_of(w, l));
         let max_spc = if w == l { t.max_spacing[c][0] } else { t.max_spacing[c][0].max(t.max_spacing[c][1]) };
-        for o in self.query(layer, &bloat(&v.rect, max_spc)) {
-            let p = self.shapes[layer][o];
-            if (p.fixed && v.fixed) || (p.net, p.pin) == (v.net, v.pin) {
+        let (upper, ql) = match kind {
+            CutTableKind::Inter { table_layer, second, .. } => {
+                let upper = second != layer;
+                (upper, if upper { second } else { table_layer })
+            }
+            _ => (true, layer),
+        };
+        for o in self.query(ql, &bloat(&v.rect, max_spc)) {
+            let p = self.shapes[ql][o];
+            // (A pin is one layer's: cuts on two layers are never one pin's.)
+            if (p.fixed && v.fixed) || (ql == layer && (p.net, p.pin) == (v.net, v.pin)) {
                 continue;
             }
-            self.cut_spacing_table_pair(layer, k, o, t, same_net);
+            if upper {
+                self.cut_spacing_table_pair((layer, k), (ql, o), t, kind);
+            } else {
+                self.cut_spacing_table_pair((ql, o), (layer, k), t, kind);
+            }
         }
     }
 
-    /// `checkLef58CutSpacingTbl_main` for a table on one layer. A SAMENET table judges only cuts of
-    /// one net; the different-net table judges cuts of two nets, and cuts of one net too unless the
-    /// layer has a SAMENET table to hand them to. Overlapping cuts are a cut SHORT (unless the
-    /// classes' largest spacing is 0); apart, each direction the second cut lies in is judged by
-    /// `helper`.
-    fn cut_spacing_table_pair(&mut self, layer: usize, k1: usize, k2: usize, t: &CutSpacingTable, same_net: bool) {
-        let (v1, v2) = (self.shapes[layer][k1], self.shapes[layer][k2]);
-        if same_net_table_skips(same_net, v1.net == v2.net, self.tech.layers[layer].cut_table_same_net.is_some()) {
-            return;
+    /// `checkLef58CutSpacingTbl_main`. On one layer: a SAMENET table judges only cuts of one net;
+    /// the different-net table judges cuts of two nets, and cuts of one net too unless the layer
+    /// has a SAMENET table to hand them to. A default inter-layer table judges cuts of two nets
+    /// only. Classes are each cut's on its own layer. Overlapping cuts: on one layer a cut SHORT
+    /// (unless the classes' largest spacing is 0); on two layers (that spacing not 0) a violation
+    /// under NOSTACK, else unless one cut contains the other. Apart, each direction the second
+    /// cut lies in is judged by `helper` until one violates.
+    fn cut_spacing_table_pair(&mut self, (l1, k1): (usize, usize), (l2, k2): (usize, usize), t: &CutSpacingTable, kind: CutTableKind) {
+        let (v1, v2) = (self.shapes[l1][k1], self.shapes[l2][k2]);
+        match kind {
+            CutTableKind::Inter { .. } => {
+                if v1.net == v2.net {
+                    return;
+                }
+            }
+            _ => {
+                if same_net_table_skips(kind == CutTableKind::SameNet, v1.net == v2.net, self.tech.layers[l1].cut_table_same_net.is_some()) {
+                    return;
+                }
+            }
         }
         let (r1, r2) = (v1.rect, v2.rect);
-        let class = |r: &Rect| self.tech.layers[layer].cut_class_of(r.dx().min(r.dy()), r.dx().max(r.dy()));
-        let (c1, c2) = (class(&r1), class(&r2));
+        let class = |l: usize, r: &Rect| t.class_index(&self.tech.layers[l], self.tech.layers[l].cut_class_of(r.dx().min(r.dy()), r.dx().max(r.dy())));
+        let (c1, c2) = (class(l1, &r1), class(l2, &r2));
         let marker = generalized_intersect(&r1, &r2);
         let (dx, dy) = (gap((r1.xl, r1.xh), (r2.xl, r2.xh)), gap((r1.yl, r1.yh), (r2.yl, r2.yh)));
         let dist2 = i64::from(dx).pow(2) + i64::from(dy).pow(2);
+        let mut viol = false;
         if dist2 == 0 {
             if t.max_pair_spacing(c1, c2) == 0 {
                 return;
             }
-            // `checkCutSpacing_short`.
-            if !(v1.fixed && v2.fixed) {
-                self.add_marker_of(Rule::Short, layer, marker, (v1.net, r1, v1.fixed), (v2.net, r2, v2.fixed));
+            match kind {
+                // `checkCutSpacing_short`.
+                CutTableKind::SameNet | CutTableKind::DiffNet => {
+                    if !(v1.fixed && v2.fixed) {
+                        self.add_marker_of(Rule::Short, l1, marker, (v1.net, r1, v1.fixed), (v2.net, r2, v2.fixed));
+                    }
+                }
+                CutTableKind::Inter { no_stack, .. } => viol = no_stack || !(r1 == r2 || contains(&r1, &r2) || contains(&r2, &r1)),
             }
         }
         let center = |r: &Rect| (i64::from((r.xl + r.xh) / 2), i64::from((r.yl + r.yh) / 2));
@@ -2469,31 +2542,37 @@ impl<'a> Worker<'a> {
         let prl_y = if dy != 0 { -(marker.yh - marker.yl) } else { marker.yh - marker.yl };
         let prl_valid = prl_x > req_prl || prl_y > req_prl;
         let prl = if prl_valid { prl_x.max(prl_y) } else { -1 };
-        let mut viol = false;
-        if up || down {
-            viol = self.cut_table_helper(layer, (&r1, &r2), (c1, c2), if up { EdgeDir::N } else { EdgeDir::S }, (dist2, c2c2), (prl_valid, prl), t);
+        let inter = matches!(kind, CutTableKind::Inter { .. });
+        if !viol && (up || down) {
+            viol = self.cut_table_helper(l2, (&r1, &r2), (c1, c2), if up { EdgeDir::N } else { EdgeDir::S }, (dist2, c2c2), (prl_valid, prl), t, inter);
         }
         if !viol && (right || left) {
-            viol = self.cut_table_helper(layer, (&r1, &r2), (c1, c2), if right { EdgeDir::E } else { EdgeDir::W }, (dist2, c2c2), (prl_valid, prl), t);
+            viol = self.cut_table_helper(l2, (&r1, &r2), (c1, c2), if right { EdgeDir::E } else { EdgeDir::W }, (dist2, c2c2), (prl_valid, prl), t, inter);
         }
         if viol {
             // ⚠️ The reference records each side's rectangle with its x-high as its y-high too.
             let side = |r: &Rect| Rect::new(r.xl, r.yl, r.xh, r.xh);
-            self.add_marker_of(Rule::Lef58CutSpacingTable, layer, marker, (v1.net, side(&r1), v1.fixed), (v2.net, side(&r2), v2.fixed));
+            if inter {
+                self.add_marker_two_layers(Rule::Lef58CutSpacingTableInter, marker, (v1.net, l1, side(&r1), v1.fixed), (v2.net, l2, side(&r2), v2.fixed));
+            } else {
+                self.add_marker_of(Rule::Lef58CutSpacingTable, l1, marker, (v1.net, side(&r1), v1.fixed), (v2.net, side(&r2), v2.fixed));
+            }
         }
     }
 
     /// `checkLef58CutSpacingTbl_helper`: whether the pair is too close with the second cut in
     /// direction `dir`. Each cut's facing edge is a SIDE when it is the cut's long edge. NOPRL with
     /// CENTERANDEDGE: centre to centre below the larger spacing, or edge to edge below the smaller;
-    /// the same class, exactly aligned (run equal to the cut's own width across `dir`, unless the
-    /// table is limited to that direction), with an EXACTALIGNED spacing: edge to edge below it;
+    /// the same class (a table on one layer only, `inter` false), exactly aligned (run equal to the
+    /// cut's own width across `dir`, unless the table is limited to that direction), with an
+    /// EXACTALIGNED spacing: edge to edge below it;
     /// otherwise the table's first value, or its second where the run is valid (back to the first
-    /// under PRLFORALIGNEDCUT when no metal edge above lies on the second cut's facing edge), centre
+    /// under PRLFORALIGNEDCUT when no metal edge on the layer above the SECOND cut's (`l2`) lies on
+    /// its facing edge), centre
     /// to centre for CENTERTOCENTER (or CENTERANDEDGE where it is the larger value), else edge to
     /// edge.
     #[allow(clippy::too_many_arguments)]
-    fn cut_table_helper(&self, layer: usize, (r1, r2): (&Rect, &Rect), (c1, c2): (usize, usize), dir: EdgeDir, (dist2, c2c2): (i64, i64), (prl_valid, prl): (bool, i32), t: &CutSpacingTable) -> bool {
+    fn cut_table_helper(&self, l2: usize, (r1, r2): (&Rect, &Rect), (c1, c2): (usize, usize), dir: EdgeDir, (dist2, c2c2): (i64, i64), (prl_valid, prl): (bool, i32), t: &CutSpacingTable, inter: bool) -> bool {
         let (h1, v1, h2, v2) = (r1.dx(), r1.dy(), r2.dx(), r2.dy());
         let ns = matches!(dir, EdgeDir::N | EdgeDir::S);
         let (side1, side2) = if ns { (h1 > v1, h2 > v2) } else { (v1 > h1, v2 > h2) };
@@ -2506,7 +2585,7 @@ impl<'a> Worker<'a> {
             }
             return dist2 < sq(f.min(s));
         }
-        if c1 == c2 {
+        if c1 == c2 && !inter {
             let aligned = if ns { prl == h1 && !t.horizontal } else { prl == v1 && !t.vertical };
             let ex = t.exact_aligned[c1];
             if aligned && ex != -1 {
@@ -2521,7 +2600,7 @@ impl<'a> Worker<'a> {
                 EdgeDir::E => Rect::new(r2.xl, r2.yl, r2.xl, r2.yh),
                 EdgeDir::W => Rect::new(r2.xh, r2.yl, r2.xh, r2.yh),
             };
-            if layer + 1 >= self.segs.len() || self.query_segs(layer + 1, &e).is_empty() {
+            if l2 + 1 >= self.segs.len() || self.query_segs(l2 + 1, &e).is_empty() {
                 second = false;
             }
         }
@@ -2651,9 +2730,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -3207,6 +3286,154 @@ mod cut_table_tests {
         let l = crate::tech::Layer { cut_classes: vec![class("A"), class("B")], ..Default::default() };
         assert_eq!(l.cut_class_of(18, 24), 2);
         assert_eq!(l.cut_class_of(24, 24), 0);
+    }
+}
+
+#[cfg(test)]
+mod inter_cut_table_tests {
+    //! A LEF58 default inter-layer cut spacing table (`SPACINGTABLE … LAYER c3`) on cut layer 5,
+    //! on constructed geometry: `tests::tech()` with a cut layer c5 and a routing layer l6 above
+    //! it; no classes, FIRST 50, SECOND 80 (a run past the PRL 20), the largest 80.
+    use super::*;
+    use crate::tech::{InterCutTable, Layer};
+
+    fn table() -> CutSpacingTable {
+        CutSpacingTable { n: 1, spacing: vec![(50, 80); 4], max_spacing: vec![[80, 80]], prl_entry: vec![20], center_to_center: vec![false], center_and_edge: vec![false], prl_aligned: vec![false], exact_aligned: vec![-1], names: vec![String::new()], ..Default::default() }
+    }
+
+    fn tech(no_stack: bool) -> Tech {
+        let mut t = tests::tech();
+        t.layers[3].cut_spacing = None;
+        t.layers.push(Layer { name: "c5".into(), kind: LayerKind::Cut, width: 40, ..Layer::default() });
+        let mut l6 = t.layers[4].clone();
+        l6.name = "l6".into();
+        t.layers.push(l6);
+        t.layers[5].cut_table_inter = Some(InterCutTable { second_layer: 3, no_stack, table: table() });
+        t
+    }
+
+    /// Cut `a` (net a) on c5 at the origin, the other cut on c3.
+    fn markers(t: &Tech, other: (&str, Rect), target: Option<&str>, top: Option<usize>) -> Vec<Marker> {
+        let mut w = Worker::new(t);
+        if let Some(top) = top {
+            w.top_routing_layer = top;
+        }
+        w.target = target.map(|n| Owner::Net(n.into()));
+        w.add(&Owner::Net("a".into()), 5, Rect::new(0, 0, 40, 40), false);
+        w.add(&Owner::Net(other.0.into()), 3, other.1, false);
+        w.init();
+        w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58CutSpacingTable | Rule::Lef58CutSpacingTableInter)).cloned().collect()
+    }
+
+    // Rule (`checkLef58CutSpacingTbl_main`, LAYER branch, default table): cuts of two nets on the
+    // two layers, edge to edge below the table's value (SECOND where they run past the PRL); one
+    // net is never judged. The marker is on the table's layer, its box between the cuts, the
+    // victim the cut on the table's layer and the aggressor the second layer's.
+    #[test]
+    fn cuts_of_two_nets_on_the_two_layers() {
+        let t = tech(false);
+        let m = markers(&t, ("b", Rect::new(85, 0, 125, 40)), None, None);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!((m[0].rule, m[0].layer, m[0].bbox), (Rule::Lef58CutSpacingTableInter, 5, Rect::new(40, 0, 85, 40)));
+        assert_eq!((m[0].victim.as_ref().map(|v| v.1), m[0].aggressor.as_ref().map(|v| v.1)), (Some(5), Some(3)));
+        assert_eq!(markers(&t, ("b", Rect::new(110, 0, 150, 40)), None, None).len(), 1, "70 apart, aligned: below SECOND 80");
+        assert!(markers(&t, ("b", Rect::new(125, 0, 165, 40)), None, None).is_empty(), "85 apart");
+        assert_eq!(markers(&t, ("b", Rect::new(70, 70, 110, 110)), None, None).len(), 1, "diagonal 30/30: no run, FIRST 50, 42.4 apart");
+        assert!(markers(&t, ("b", Rect::new(80, 80, 120, 120)), None, None).is_empty(), "diagonal 40/40: 56.6 apart");
+    }
+
+    // Rule (same): one net is never judged by the default inter-layer table.
+    #[test]
+    fn one_net_is_not_judged() {
+        assert!(markers(&tech(false), ("a", Rect::new(85, 0, 125, 40)), None, None).is_empty());
+    }
+
+    // Rule (`checkLef58CutSpacingTbl_main`, overlapping cuts of the two layers): without NOSTACK a
+    // cut containing the other (or equal to it) is no violation, a partial overlap is; with
+    // NOSTACK any overlap is.
+    #[test]
+    fn stacked_cuts_and_nostack() {
+        let (stacked, partial) = (Rect::new(0, 0, 40, 40), Rect::new(20, 0, 60, 40));
+        assert!(markers(&tech(false), ("b", stacked), None, None).is_empty());
+        assert_eq!(markers(&tech(false), ("b", partial), None, None).len(), 1);
+        assert_eq!(markers(&tech(true), ("b", stacked), None, None).len(), 1);
+        let inside = Rect::new(10, 10, 30, 30);
+        assert!(markers(&tech(false), ("b", inside), None, None).is_empty(), "contained, not equal: no violation");
+        assert_eq!(markers(&tech(true), ("b", inside), None, None).len(), 1);
+    }
+
+    // Rule (`checkLef58CutSpacingTbl_main`): the exact-aligned spacing of a class is read only
+    // for a table on one layer; an inter-layer table skips it, so two aligned cuts of one class
+    // 70 apart still break SECOND 80 with an exact-aligned value of 60 in the table.
+    #[test]
+    fn an_inter_layer_table_skips_exact_aligned() {
+        let mut t = tech(false);
+        t.layers[5].cut_table_inter.as_mut().expect("table").table.exact_aligned = vec![60];
+        assert_eq!(markers(&t, ("b", Rect::new(110, 0, 150, 40)), None, None).len(), 1);
+    }
+
+    // Call sequence (`checkCutSpacing_main`): a cut on c3 reads the table of the layer two above
+    // (c5) too, while c5 is below the top routing layer — so the pair is judged when only the
+    // LOWER cut's net is checked from, and not once the top routing layer is c5 itself.
+    #[test]
+    fn the_lower_cut_reads_the_table_two_above_below_the_top_routing_layer() {
+        let t = tech(false);
+        let b = ("b", Rect::new(85, 0, 125, 40));
+        assert!(markers(&t, b, Some("x"), None).is_empty(), "no net checked from");
+        let m = markers(&t, b, Some("b"), None);
+        assert_eq!(m.iter().map(|m| (m.rule, m.layer)).collect::<Vec<_>>(), vec![(Rule::Lef58CutSpacingTableInter, 5)]);
+        assert!(markers(&t, b, Some("b"), Some(5)).is_empty(), "5 + 0 is not below a top routing layer of 5");
+        assert_eq!(markers(&t, b, Some("b"), Some(6)).len(), 1);
+    }
+
+    // Rule (`addMarker`: once per box, layer, CONSTRAINT and sources): a cut of net b on c5
+    // stacked on one of b on c3, both 45 from cut a, gives the different-net table and the
+    // inter-layer table the same box and owners — both markers stand.
+    #[test]
+    fn the_two_tables_keep_one_marker_each() {
+        let mut t = tech(false);
+        t.layers[5].cut_table = Some(CutSpacingTable { names: vec![], ..table() });
+        let mut w = Worker::new(&t);
+        let b = Rect::new(85, 0, 125, 40);
+        w.add(&Owner::Net("a".into()), 5, Rect::new(0, 0, 40, 40), false);
+        w.add(&Owner::Net("b".into()), 5, b, false);
+        w.add(&Owner::Net("b".into()), 3, b, false);
+        w.init();
+        let mut got: Vec<(Rule, Rect)> = w.run().iter().filter(|m| m.layer == 5).map(|m| (m.rule, m.bbox)).collect();
+        got.sort();
+        assert_eq!(got, vec![(Rule::Lef58CutSpacingTable, Rect::new(40, 0, 85, 40)), (Rule::Lef58CutSpacingTableInter, Rect::new(40, 0, 85, 40))]);
+    }
+
+    // Rule (`checkLef58CutSpacingTbl_helper`, PRLFORALIGNEDCUT): the metal edge looked for is on
+    // the layer above the SECOND cut (c3 + 1 = l4), on its facing edge; none there: FIRST.
+    #[test]
+    fn prl_for_aligned_cut_looks_above_the_second_cut() {
+        let mut t = tech(false);
+        if let Some(i) = t.layers[5].cut_table_inter.as_mut() {
+            i.table.prl_aligned = vec![true];
+        }
+        let b = Rect::new(110, 0, 150, 40);
+        assert!(markers(&t, ("b", b), None, None).is_empty(), "no l4 edge on b's left edge: FIRST 50, 70 clears it");
+        let mut w = Worker::new(&t);
+        w.add(&Owner::Net("a".into()), 5, Rect::new(0, 0, 40, 40), false);
+        w.add(&Owner::Net("b".into()), 3, b, false);
+        w.add(&Owner::Net("b".into()), 4, Rect::new(110, -100, 300, 140), false);
+        w.init();
+        assert_eq!(w.run().iter().filter(|m| m.rule == Rule::Lef58CutSpacingTableInter).count(), 1, "l4 metal edge on b's left edge: SECOND 80");
+    }
+
+    // Rule (`checkLef58CutSpacingTbl_main`): classes are each cut's on its OWN layer, looked up in
+    // the table by NAME; a name the table does not hold is no class.
+    #[test]
+    fn classes_are_looked_up_by_name() {
+        let class = |name: &str| crate::tech::CutClass { name: name.into(), width: 40, length: 40 };
+        let t = CutSpacingTable { names: vec![String::new(), "CB".into(), "CA".into()], ..Default::default() };
+        let lower = Layer { cut_classes: vec![class("CA")], ..Default::default() };
+        let upper = Layer { cut_classes: vec![class("CB")], ..Default::default() };
+        let other = Layer { cut_classes: vec![class("CZ")], ..Default::default() };
+        assert_eq!((t.class_index(&lower, 1), t.class_index(&upper, 1), t.class_index(&other, 1), t.class_index(&lower, 0)), (2, 1, 0, 0));
+        let same_layer = CutSpacingTable::default();
+        assert_eq!(same_layer.class_index(&lower, 1), 1, "a table on one layer is indexed by its layer's classes");
     }
 }
 

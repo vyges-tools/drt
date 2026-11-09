@@ -56,6 +56,10 @@ pub struct Layer {
     /// different-net table then leaves to it; the via-to-via prep reads it before the
     /// different-net one.
     pub cut_table_same_net: Option<CutSpacingTable>,
+    /// A cut layer's LEF58 inter-layer cut spacing table, neither SAMENET nor SAMEMETAL
+    /// (`getLef58DefaultInterCutSpcTblConstraint`): checked between a cut of this layer and a cut
+    /// of the table's second layer, of two nets; the maze costs vias by its default.
+    pub cut_table_inter: Option<InterCutTable>,
     /// A cut layer's LEF58 enclosure rules as io keeps them (`frLef58EnclosureConstraint`), in the
     /// technology's order.
     pub cut_enclosures: Vec<CutEnclosure>,
@@ -328,9 +332,45 @@ pub struct CutSpacingTable {
     pub default_spacing: (i32, i32),
     pub default_center_to_center: bool,
     pub default_center_and_edge: bool,
+    /// An inter-layer table's class names ("" first, no class), in the order its lookups are
+    /// indexed; empty for a table on one layer (indexed by that layer's classes).
+    pub names: Vec<String>,
+}
+
+/// A cut layer's LEF58 cut spacing tables as io keeps them ([`read::cut_spacing_tables`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CutSpacingTables {
+    pub diff: Option<CutSpacingTable>,
+    pub same_net: Option<CutSpacingTable>,
+    /// The default inter-layer table's rule index.
+    pub inter: Option<usize>,
+}
+
+/// A LEF58 inter-layer cut spacing table (`SPACINGTABLE … LAYER l`, the default kind: neither
+/// SAMENET nor SAMEMETAL), with its second layer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct InterCutTable {
+    /// The table's second layer (a cut layer; the kit's is the one below).
+    pub second_layer: usize,
+    /// NOSTACK: overlapping cuts of the two layers violate even when one contains the other.
+    pub no_stack: bool,
+    /// Its lookups, by class NAME (`names`): the two layers' classes in one list.
+    pub table: CutSpacingTable,
 }
 
 impl CutSpacingTable {
+    /// The table's index for class `c` (0: no class) of `layer`. A same-layer table is indexed by
+    /// the layer's own classes; an inter-layer table holds both layers' class names (`names`) and
+    /// is looked up by the class's NAME, as the reference passes names to the database rule —
+    /// a name the table does not hold is "no class" (the database rule then falls to its default
+    /// alike).
+    pub fn class_index(&self, layer: &Layer, c: usize) -> usize {
+        if self.names.is_empty() || c == 0 {
+            return c;
+        }
+        let name = &layer.cut_classes[c - 1].name;
+        self.names.iter().position(|n| n == name).unwrap_or(0)
+    }
     pub fn get(&self, c1: usize, side1: bool, c2: usize, side2: bool) -> (i32, i32) {
         self.spacing[((c1 * 2 + usize::from(side1)) * self.n + c2) * 2 + usize::from(side2)]
     }
@@ -729,40 +769,75 @@ pub mod read {
     }
 
     /// The cut layer's LEF58 cut spacing tables as io `setCutLayerProperties` keeps them, in the
-    /// technology's order (a later table of a kind replaces an earlier one; SAMEMASK is skipped):
-    /// (different-net, SAMENET). SAMEMETAL is tested before SAMENET, as io tests it. Refused: a
-    /// LAYER (inter-layer) table and a SAMEMETAL table.
-    pub fn cut_spacing_tables(db: &Db, layer: &str, classes: &[CutClass]) -> Result<(Option<CutSpacingTable>, Option<CutSpacingTable>), &'static str> {
-        let (mut diff, mut same_net) = (None, None);
+    /// technology's order (a later table of a kind replaces an earlier one): a LAYER table on layer
+    /// number 1 (`num`) is skipped, then a SAMEMASK one; a LAYER table goes to the inter-layer
+    /// kinds, SAMEMETAL tested first, then SAMENET, else the default one; a table on the layer
+    /// itself to SAMEMETAL, then SAMENET, else different-net. Returned: (different-net, SAMENET,
+    /// the default inter-layer table's rule index — its lookups need the second layer's classes,
+    /// read after all layers). Refused: a SAMEMETAL table, and an inter-layer SAMENET or SAMEMETAL
+    /// one.
+    pub fn cut_spacing_tables(db: &Db, layer: &str, num: usize, classes: &[CutClass]) -> Result<CutSpacingTables, &'static str> {
+        let mut out = CutSpacingTables::default();
         for k in 0..db.num_layer_get_tech_layer_cut_spacing_table_def_rules(layer) {
+            if db.cutspacingtablerule_is_layer_valid(layer, k) && num == 1 {
+                continue;
+            }
             if db.cutspacingtablerule_is_same_mask(layer, k) {
                 continue;
             }
             if db.cutspacingtablerule_is_layer_valid(layer, k) {
-                return Err("a LAYER (inter-layer) cut spacing table");
+                if db.cutspacingtablerule_is_same_metal(layer, k) {
+                    return Err("a SAMEMETAL LAYER (inter-layer) cut spacing table");
+                }
+                if db.cutspacingtablerule_is_same_net(layer, k) {
+                    return Err("a SAMENET LAYER (inter-layer) cut spacing table");
+                }
+                if db.cutspacingtablerule_get_second_layer(layer, k).is_empty() {
+                    return Err("a LAYER (inter-layer) cut spacing table without its second layer");
+                }
+                out.inter = Some(k);
+                continue;
             }
             if db.cutspacingtablerule_is_same_metal(layer, k) {
                 return Err("a SAMEMETAL cut spacing table");
             }
-            let t = cut_spacing_table_rule(db, layer, k, classes)?;
+            let t = cut_spacing_table_rule(db, layer, k, &own_names(classes))?;
             if db.cutspacingtablerule_is_same_net(layer, k) {
-                same_net = Some(t);
+                out.same_net = Some(t);
             } else {
-                diff = Some(t);
+                out.diff = Some(t);
             }
         }
-        Ok((diff, same_net))
+        Ok(out)
+    }
+
+    /// "" (no class), then the layer's class names, in its order.
+    fn own_names(classes: &[CutClass]) -> Vec<&str> {
+        std::iter::once("").chain(classes.iter().map(|c| c.name.as_str())).collect()
+    }
+
+    /// The default inter-layer table (rule `k` of cut layer `layer`) over every class NAME of the
+    /// layer and of its second layer `second` (`second_classes`), with its second layer index.
+    pub fn inter_cut_table(db: &Db, layer: &str, k: usize, classes: &[CutClass], second: usize, second_classes: &[CutClass]) -> Result<InterCutTable, &'static str> {
+        let mut names = own_names(classes);
+        for c in second_classes {
+            if !names.contains(&c.name.as_str()) {
+                names.push(c.name.as_str());
+            }
+        }
+        let mut table = cut_spacing_table_rule(db, layer, k, &names)?;
+        table.names = names.iter().map(|n| n.to_string()).collect();
+        Ok(InterCutTable { second_layer: second, no_stack: db.cutspacingtablerule_is_no_stack(layer, k), table })
     }
 
     /// One LEF58 cut spacing table rule's lookups, evaluated for every class pair.
-    fn cut_spacing_table_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<CutSpacingTable, &'static str> {
+    fn cut_spacing_table_rule(db: &Db, layer: &str, k: usize, names: &[&str]) -> Result<CutSpacingTable, &'static str> {
         {
-            let names: Vec<&str> = std::iter::once("").chain(classes.iter().map(|c| c.name.as_str())).collect();
             let n = names.len();
             let mut t = CutSpacingTable { n, no_prl: db.cutspacingtablerule_is_no_prl(layer, k), horizontal: db.cutspacingtablerule_is_horizontal(layer, k), vertical: db.cutspacingtablerule_is_vertical(layer, k), ..Default::default() };
-            for &c1 in &names {
+            for &c1 in names {
                 for s1 in [false, true] {
-                    for &c2 in &names {
+                    for &c2 in names {
                         for s2 in [false, true] {
                             t.spacing.push((db.cutspacingtablerule_get_spacing(layer, k, c1, s1, c2, s2, "FIRST"), db.cutspacingtablerule_get_spacing(layer, k, c1, s1, c2, s2, "SECOND")));
                         }
@@ -770,7 +845,7 @@ pub mod read {
                 }
                 t.max_spacing.push([db.cutspacingtablerule_get_max_spacing_cut_class_side(layer, k, c1, false), db.cutspacingtablerule_get_max_spacing_cut_class_side(layer, k, c1, true)]);
                 t.exact_aligned.push(db.cutspacingtablerule_get_exact_aligned_spacing(layer, k, c1));
-                for &c2 in &names {
+                for &c2 in names {
                     t.prl_entry.push(db.cutspacingtablerule_get_prl_entry(layer, k, c1, c2));
                     t.center_to_center.push(db.cutspacingtablerule_is_center_to_center(layer, k, c1, c2));
                     t.center_and_edge.push(db.cutspacingtablerule_is_center_and_edge(layer, k, c1, c2));
@@ -972,6 +1047,8 @@ pub mod read {
         // (`io_parser_helper` resolves it after the technology, the metal above being defined
         // after the cut).
         let mut layer_rules_by_name: Vec<(usize, Vec<LayerRuleByName>)> = Vec::new();
+        // Default inter-layer cut spacing tables: (cut layer, rule index).
+        let mut inter_tables: Vec<(usize, usize)> = Vec::new();
         for (name, dir) in db.layers_with_direction()? {
             let kind = db.layer_get_type(&name)?;
             match kind.as_str() {
@@ -1085,7 +1162,7 @@ pub mod read {
                             }
                         })
                         .collect();
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], cut_layer_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1100,7 +1177,11 @@ pub mod read {
                     let width = db.layer_get_width(&name) as i32;
                     let cut_spacing = Some(db.layer_get_spacing(&name)).filter(|&s| s > 0);
                     let cut_classes = cut_classes(db, &name);
-                    let (cut_table, cut_table_same_net) = cut_spacing_tables(db, &name, &cut_classes).unwrap_or_default();
+                    let tables = cut_spacing_tables(db, &name, layers.len(), &cut_classes).unwrap_or_default();
+                    if let Some(k) = tables.inter {
+                        inter_tables.push((layers.len(), k));
+                    }
+                    let (cut_table, cut_table_same_net) = (tables.diff, tables.same_net);
                     let cut_enclosures = (0..db.num_layer_get_tech_layer_cut_enclosure_rules(&name))
                         .filter(|&k| cut_enclosure_kept(db, &name, k))
                         .filter_map(|k| {
@@ -1125,6 +1206,16 @@ pub mod read {
                     layers.push(Layer { name, kind: LayerKind::Cut, width, cut_spacing, cut_classes, cut_table, cut_table_same_net, cut_enclosures, ..Layer::default() });
                 }
                 _ => {}
+            }
+        }
+        // io's tables are built as the layer is read; the inter-layer table's lookups need its
+        // second layer's classes (a LAYER the table names that was not read as a cut layer is
+        // left out, and refused by the census).
+        for (cut, k) in inter_tables {
+            let second = db.cutspacingtablerule_get_second_layer(&layers[cut].name, k);
+            let Some(sl) = layers.iter().position(|l| l.name == second && l.kind == LayerKind::Cut) else { continue };
+            if let Ok(t) = inter_cut_table(db, &layers[cut].name, k, &layers[cut].cut_classes, sl, &layers[sl].cut_classes) {
+                layers[cut].cut_table_inter = Some(t);
             }
         }
         for (cut, rules) in layer_rules_by_name {
