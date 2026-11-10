@@ -94,7 +94,7 @@ const DESCRIBE: &str = r#"{
   "summary": "detailed routing on the design's route guides: pin access, track assignment and search-and-repair until no design-rule marker stands, the routes written as a DEF or a database; pin access alone is its own command",
   "maturity": "structured",
   "provenance_limitations": [
-    "detailed_route status is one of written, markers, refused or error: written is routed with no design-rule marker standing (exit 0); markers is routed and written with markers standing (exit 1, a finding, not a pass); error is exit 2; refused is exit 3, or exit 4 where the reference itself aborts on the input (an upstream defect: the report's reference_aborts gives its error code and issue).",
+    "detailed_route status is one of written, markers, vacuous, refused or error: written is routed with no design-rule marker standing (exit 0); markers is routed and written with markers standing (exit 1, a finding, not a pass); vacuous is a design with no net of two or more terminals, where the reference stops before pin access with DRT-0040: nothing is routed and the database is written back unchanged (exit 2, never a pass); error is exit 2; refused is exit 3, or exit 4 where the reference itself aborts on the input (an upstream defect: the report's reference_aborts gives its error code and issue).",
     "pin_access status is one of written, vacuous, refused or error. VACUOUS IS NOT WRITTEN: the design has no routed instance terminal and no routed port, and nothing is written. Exit status is 0 for written, 2 for vacuous and for error, 3 for refused.",
     "detailed_route is correlated end to end on the DEF it writes, compared WHOLE and byte for byte against a fresh reference run: 16 of 16 cases, 2026-09-25 -- 14 of the reference router's own regression scripts (the largest 16,880 nets over 5 search-and-repair iterations), its incremental-routing script, and one constructed incremental case. Each stage (guides, rule tables, track assignment, every worker of every iteration) is also correlated against an instrumented reference. The correlation harness is not part of this repository.",
     "An incremental run's DEF cannot tell incremental rip-up from rerouting everything, which writes the same DEF: the report's routed_before and rerouted counts say which ran.",
@@ -363,6 +363,12 @@ fn route(a: &Args) -> Outcome {
     let written = if out.ends_with(".def") { db.write_def(out) } else { db.write(out) };
     if let Err(e) = written {
         return fail("error", 2, e.to_string());
+    }
+    // DRT-0040: nothing routed, the database written back as it was read (the reference's script
+    // writes it the same way). Vacuous: no pass word for a run that routed nothing.
+    if s.no_routable_net {
+        let reason = format!("{} (DRT-0040): nothing routed, the database written back unchanged", vyges_drt::dr::run::NO_ROUTABLE_NET);
+        return Outcome { status: "vacuous", code: 2, fields: vec![("reason", json_str(&reason)), ("out", json_str(out)), ("skipped_rules", skipped_json(&s.skipped_rules)), ("lef58_not_checked", not_checked_json(&s.lef58_not_checked))], skipped: s.skipped_rules.len() };
     }
     Outcome {
         status: if s.markers == 0 { "written" } else { "markers" },

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Detailed routing end to end on a design database, in the router's call sequence: the design
-//! and its access points ([`init_design`]), the route guides ([`init_guide`]), the rule tables
+//! ([`init_design_io`]), the stop when no net has two terminals ([`has_routable_nets`], DRT-0040),
+//! the access points ([`pa_main`]), the route guides ([`init_guide`]), the rule tables
 //! ([`prep`]), track assignment ([`ta`]), the search-and-repair iterations ([`dr`]) and the
 //! write-out ([`end_fr`]). Each stage is its own function; [`detailed_route`] only calls them.
 //!
@@ -82,6 +83,9 @@ pub struct Summary {
     /// origin-relative box (OpenROAD issue #12191); this router looks it up where the patch is,
     /// as the reference fixed for that issue does (divergence D4), so the count should be 0.
     pub area_patches_dropped_no_owner: usize,
+    /// The run stopped before pin access because no net of the block has two or more terminals
+    /// (the reference's DRT-0040): nothing was routed and the database is as it was read.
+    pub no_routable_net: bool,
 }
 
 /// The one warning a run logs when [`Summary::area_patches_dropped_no_owner`] is not zero.
@@ -96,7 +100,14 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
 
 /// [`detailed_route`], each stage writing its log lines to `log` as it runs.
 pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Summary> {
-    let d = init_design(db, tech, opts, log)?;
+    let r = init_design_io(db, tech, opts, log)?;
+    // TritonRoute::main stops here, between initDesign and pin access, when no net could be
+    // routed: DRT-0040, nothing run and nothing written back.
+    if !has_routable_nets(db) {
+        log(Line::Warn(40, NO_ROUTABLE_NET.into()));
+        return Ok(Summary::no_routable_net(r.skipped_rules, r.lef58_not_checked));
+    }
+    let d = pa_main(db, r, log)?;
     let g = init_guide(db, &d, log)?;
     let p = prep(&d);
     // A layer whose default vias' pads break its MINSTEP makes the reference patch such shapes in
@@ -119,7 +130,29 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     log(Line::Info(180, "Post processing.".into()));
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
-    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone(), lef58_not_checked: d.lef58_not_checked.clone(), area_patches_dropped_no_owner })
+    Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone(), lef58_not_checked: d.lef58_not_checked.clone(), area_patches_dropped_no_owner, no_routable_net: false })
+}
+
+/// The reference's DRT-0040 warning text (TritonRoute::main).
+pub const NO_ROUTABLE_NET: &str = "Design does not have any routable net (with at least 2 terms)";
+
+/// Whether any net of the block could be routed, as `TritonRoute::main` asks after `initDesign`:
+/// a net (any net of the block, special nets included) with more than one instance terminal, more
+/// than one port, or at least one of each.
+pub fn has_routable_nets(db: &Db) -> bool {
+    db.net_names().iter().any(|n| routable_terms(db.net_iterms(n).len(), db.net_bterms(n).len()))
+}
+
+/// The per-net test of [`has_routable_nets`] on its instance-terminal and port counts.
+pub fn routable_terms(iterms: usize, bterms: usize) -> bool {
+    iterms > 1 || bterms > 1 || (iterms > 0 && bterms > 0)
+}
+
+impl Summary {
+    /// The run that stopped at DRT-0040: no iteration, nothing written, the tech load's lists kept.
+    fn no_routable_net(skipped_rules: Vec<crate::dr::db::SkippedRule>, lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>) -> Summary {
+        Summary { iterations: 0, markers: 0, markers_by_iteration: Vec::new(), flow_by_iteration: Vec::new(), nets_written: 0, routed_before: 0, rerouted: 0, skipped_rules, lef58_not_checked, area_patches_dropped_no_owner: 0, no_routable_net: true }
+    }
 }
 
 /// The design as the router reads it: technology, tracks, instances, ports, nets and their
@@ -186,6 +219,30 @@ pub fn pin_access_tech(db: &Db, tech: &Tech, top_routing_layer: usize) -> Res<Te
 
 /// The reader, then pin access.
 pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<DesignIn> {
+    let r = init_design_io(db, tech, opts, log)?;
+    pa_main(db, r, log)
+}
+
+/// The design as `initDesign` leaves it, before pin access.
+pub struct DesignRead {
+    tech: Tech,
+    tracks: Vec<TrackPattern>,
+    cfg: Config,
+    bottom_layer: usize,
+    masters: HashMap<String, Master>,
+    insts: Vec<DesignInst>,
+    ports: Vec<DesignPort>,
+    design: TaDesign,
+    shapes: Vec<crate::pa::verdict::TargetShape>,
+    db_markers: Vec<Marker>,
+    skipped_rules: Vec<crate::dr::db::SkippedRule>,
+    lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>,
+    block_vias: Vec<BlockVia>,
+}
+
+/// `TritonRoute::initDesign`: the technology, the design and the shape region query, up to
+/// (not including) pin access.
+pub fn init_design_io(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<DesignRead> {
     let unmodelled = crate::dr::db::unmodelled_rules(db, tech);
     if !unmodelled.is_empty() && !opts.unchecked_rules {
         return Err(format!("rule families not modelled: {}", unmodelled.join("; ")));
@@ -269,7 +326,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let uinsts: Vec<_> = insts.iter().map(|i| i.unique.clone()).collect();
     log(Line::Info(164, format!("Number of unique instances = {}.", crate::pa::unique::inst_analysis_count(tech, &tracks, &masters, &uinsts))));
     // The shape region query holds exactly the fixed shapes.
-    let mut design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
+    let design = crate::dr::db::ta_design(db, tech, &masters, &insts, &ports)?;
     log(Line::Info(168, "Init region query.".into()));
     crate::dr::log::layers_complete(tech, 24, "").into_iter().for_each(&mut *log);
     let sizes: Vec<usize> = design.fixed.iter().map(Vec::len).collect();
@@ -277,6 +334,14 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     // Every design shape with its check owner: what a via trial of a pin on a non-default-rule
     // net without auto-taper is checked against.
     let shapes: Vec<crate::pa::verdict::TargetShape> = design.fixed.iter().zip(&design.owners).enumerate().flat_map(|(l, (v, o))| v.iter().zip(o).map(move |((r, _), o)| (o.clone(), l, *r))).collect();
+    Ok(DesignRead { tech: tech.clone(), tracks, cfg, bottom_layer, masters, insts, ports, design, shapes, db_markers, skipped_rules, lef58_not_checked, block_vias })
+}
+
+/// `FlexPA::main` on the design read, then the reads the router needs after it (non-default
+/// rules, the routing already in the database, auto-taper and jumpers); those log nothing.
+pub fn pa_main(db: &Db, r: DesignRead, log: Sink) -> Res<DesignIn> {
+    let DesignRead { tech, tracks, cfg, bottom_layer, masters, insts, ports, mut design, shapes, db_markers, skipped_rules, lef58_not_checked, block_vias } = r;
+    let tech = &tech;
     log(Line::Info(165, "Start pin access.".into()));
     let pa = pin_access_with(tech, &tracks, &cfg, &masters, &insts, &ports, Some(&shapes)).map_err(|e| format!("pin access: {e:?}"))?;
     {
@@ -1401,5 +1466,19 @@ mod tests {
         }).collect();
         assert_eq!(names, ["PIN/clk", "u0/B", "u1/A"]);
         assert!(net_terminals(&insts, &masters, &ports, "none").is_empty());
+    }
+
+    /// `TritonRoute::main` (pin 4155ac31), after `initDesign`: a net is routable when it has more
+    /// than one instance terminal, more than one port, or at least one of each; when no net of
+    /// the block is, the reference warns DRT-0040 and returns before pin access.
+    #[test]
+    fn a_net_is_routable_with_two_terminals_of_any_kind() {
+        assert!(!routable_terms(0, 0));
+        assert!(!routable_terms(1, 0));
+        assert!(!routable_terms(0, 1));
+        assert!(routable_terms(2, 0));
+        assert!(routable_terms(0, 2));
+        assert!(routable_terms(1, 1));
+        assert_eq!(NO_ROUTABLE_NET, "Design does not have any routable net (with at least 2 terms)");
     }
 }

@@ -101,7 +101,12 @@ The JSON report carries `status`, `out`, `iterations` (search-and-repair iterati
 `rerouted`, `skipped_rules`, `lef58_not_checked` and `area_patches_dropped_no_owner` (below).
 
 `status` is `written` (routed with no marker standing, exit 0), `markers` (routed and written, but
-markers remain: exit 1, a finding rather than a pass), `refused` (exit 3) or `error` (exit 2).
+markers remain: exit 1, a finding rather than a pass), `vacuous`, `refused` (exit 3) or `error`
+(exit 2). `vacuous` (exit 2, never a pass) is a design where no net has two or more terminals (two
+instance terminals, two ports, or one of each, special nets included): the reference stops there,
+after reading the design and before pin access, with warning DRT-0040, and so does this router. It
+logs the same warning, routes nothing and writes the database back unchanged; the report carries
+`reason`, `out`, `skipped_rules` and `lef58_not_checked`.
 
 The routing layers are the block's minimum and maximum routing layers as the database holds them,
 and the non-default rules are the database's. **Incremental routing:** nets that already have wires
