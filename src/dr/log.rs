@@ -22,7 +22,7 @@ pub enum Line {
     OwnInfo(String),
     /// A warning of this engine's OWN under its own event code (never scored): a run-level count
     /// the reference does not report (`DRT-PATCH-DROPPED`: area patches dropped for want of a
-    /// worker net, OpenROAD issue #12191).
+    /// worker net, see OpenROAD issue #12191).
     OwnWarnCode(&'static str, String),
 }
 

@@ -166,7 +166,7 @@ const DESCRIBE: &str = r#"{
 /// | `DRT-REFUSED` | a step this engine does not model; the reason names it |
 /// | `DRT-NOT-CHECKED` | informational: a LEF58 layer property the database reader left unparsed, so routing does not check it (listed in the report's `lef58_not_checked`; the reference is silent about it too) |
 /// | `DRT-SKIPPED` | a rule SKIPPED with a warning, neither checked nor refused (listed in the report's `skipped_rules`); the `DRT-DONE` event is then a `warn` |
-/// | `DRT-PATCH-DROPPED` | detailed_route: one warning per run when minimum-area or LEF58_AREA patches were dropped for want of a worker net, as the reference drops them (OpenROAD issue #12191); the count is the report's `area_patches_dropped_no_owner` |
+/// | `DRT-PATCH-DROPPED` | detailed_route: one warning per run when minimum-area or LEF58_AREA patches were dropped for want of a worker net (none should be: the owner is looked up where the patch is, as the reference fixed for OpenROAD issue #12191 does); the count is the report's `area_patches_dropped_no_owner` |
 /// | `DRT-ERROR` | usage, unreadable input, or a failed write |
 mod events {
     use vyges_events::{emit, Event, Severity};

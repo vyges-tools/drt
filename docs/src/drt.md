@@ -194,13 +194,14 @@ not reach the routes still match the unpatched reference.
   issue #12182). This router reads `WITHIN` as written. Like the reference, it holds the rule on
   every pair whatever its masks; the colour step checks it per mask.
 
-Area patches dropped, counted: when a net has several pieces in one worker, the reference looks
-up the piece a minimum-area or `LEF58_AREA` patch belongs to by comparing the patch box relative
-to its origin, not where the patch is, so it usually finds none and drops the patch silently
-(upstream OpenROAD issue #12191). This router routes the same way, so its routes still match the
-reference, and counts the drops: the report's `area_patches_dropped_no_owner`, with one
-`DRT-PATCH-DROPPED` warning per run when it is not zero. A minimum-area marker such a patch would
-have fixed may remain, so sign-off DRC must cover minimum area.
+Area patches, owned where they are: when a net has several pieces in one worker, the unpatched
+reference looks up the piece a minimum-area or `LEF58_AREA` patch belongs to by comparing the
+patch box relative to its origin, not where the patch is, so it usually finds none and drops the
+patch silently (upstream OpenROAD issue #12191). This router follows the fixed reading, by
+decision: the patch goes to the first piece that touches it where it is. A patch still without a
+piece is dropped and counted: the report's `area_patches_dropped_no_owner`, with one
+`DRT-PATCH-DROPPED` warning per run when it is not zero, since a minimum-area marker such a patch
+would have fixed may remain and sign-off DRC must then cover minimum area.
 
 Not checked, informational: a LEF58 layer property the database's LEF reader leaves unparsed
 (it keeps the raw text only), such as `ENCLOSUREEDGE`, `JOINTCORNERSPACING`, `VIACLUSTER`,

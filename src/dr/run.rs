@@ -78,14 +78,15 @@ pub struct Summary {
     /// [`crate::dr::db::lef58_not_checked`]).
     pub lef58_not_checked: Vec<crate::dr::db::UnparsedProperty>,
     /// Minimum-area and LEF58_AREA patches dropped for want of a worker net, over every worker
-    /// and iteration: the reference drops them silently (OpenROAD issue #12191) and so does this
-    /// router, to route as it does; the count says how many.
+    /// and iteration. The unpatched reference drops many silently, looking the owner up by the
+    /// origin-relative box (OpenROAD issue #12191); this router looks it up where the patch is,
+    /// as the reference fixed for that issue does (divergence D4), so the count should be 0.
     pub area_patches_dropped_no_owner: usize,
 }
 
 /// The one warning a run logs when [`Summary::area_patches_dropped_no_owner`] is not zero.
 pub fn area_patches_dropped_warning(n: usize) -> String {
-    format!("{n} minimum-area or LEF58_AREA patches were dropped for want of a worker net, as the reference drops them (its owner lookup compares the patch box relative to its origin; OpenROAD issue #12191); a minimum-area marker they would have fixed may remain, so sign-off DRC must cover minimum area.")
+    format!("{n} minimum-area or LEF58_AREA patches were dropped for want of a worker net (no worker net of the patch's net meets it; see OpenROAD issue #12191); a minimum-area marker they would have fixed may remain, so sign-off DRC must cover minimum area.")
 }
 
 /// Route the design and write the routes into the database.

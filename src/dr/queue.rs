@@ -55,8 +55,9 @@ pub enum Event {
     Check { owner: Owner, markers: Vec<Marker> },
     /// After the queue, the check over every owner: the worker's markers.
     Final { markers: Vec<Marker>, patches: Vec<PatchWire> },
-    /// Area patches of one check dropped for want of a worker net (`!patch->hasNet()`; the owner
-    /// lookup compares the origin-relative box, OpenROAD issue #12191). Never zero.
+    /// Area patches of one check dropped for want of a worker net (`!patch->hasNet()`: no worker
+    /// net of the patch's design net meets the patch; divergence D4, OpenROAD issue #12191). Never
+    /// zero.
     AreaPatchesDropped(usize),
     /// The check's view of an owner (`VYGD_GC`): `gcinit` / `gcupd` and its maximal rectangles.
     Gc(String),
@@ -418,8 +419,9 @@ fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state
 
 /// `checkMetalShape_addPatch`, its end, per area patch in order: the worker net (`owner`), then
 /// [`is_patch_valid`]. The patches kept with their worker nets, and how many were dropped for
-/// want of a worker net — the reference drops them silently; the run reports the count
-/// (OpenROAD issue #12191). An invalid patch is dropped too but not counted.
+/// want of a worker net — the reference drops them silently; the run reports the count (with the
+/// absolute-box lookup of divergence D4 this should not happen; OpenROAD issue #12191). An
+/// invalid patch is dropped too but not counted.
 fn own_area_patches(patches: Vec<crate::gc::AreaPatch>, owner: &dyn Fn(&crate::gc::AreaPatch) -> Option<usize>, rb: &Rect) -> (Vec<(usize, PatchWire)>, usize) {
     let mut kept = Vec::new();
     let mut dropped = 0;
@@ -445,12 +447,16 @@ fn is_patch_valid(p: &PatchWire, rb: &Rect) -> bool {
 
 /// `checkMetalShape_addPatch`, its second half: the patch's worker net. The design net's only
 /// worker net; with several, `checkMetalShape_patchOwner_helper` — the first (worker order) whose
-/// pin box, else one of its boundary shapes, else one of its route shapes (each in order) strictly
-/// overlaps the patch's box. Upstream rule: that box is `patch->getOffsetBox()`, the box RELATIVE
-/// to the patch's origin, not where the patch is, so a match needs a shape near the origin of
-/// the design; without one the patch is dropped (`!patch->hasNet()`). Reported upstream as
-/// OpenROAD issue #12191; routed as the reference routes, the drops counted
-/// ([`own_area_patches`]).
+/// pin box, else one of its boundary shapes, else one of its route shapes (each in order) meets
+/// the patch's box.
+///
+/// ⛔ A DIVERGENCE from the reference by decision (drt divergence register D4; OpenROAD issue
+/// #12191). Upstream rule: that box is `patch->getOffsetBox()`, the box RELATIVE to the patch's
+/// origin, not where the patch is, and it must strictly overlap (`Rect::overlaps`), so a match
+/// needs a shape near the origin of the design; without one the patch is dropped silently. Our
+/// rule, the reference patched with vyges-openroad-patches upstream-fix 0007 v2: the patch's
+/// absolute box (`getBBox()`), touching included (`intersects`), since a patch abuts the shape
+/// it grows from. A patch still without a worker net is dropped and counted ([`own_area_patches`]).
 fn area_patch_owner(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], p: &crate::gc::AreaPatch) -> Option<usize> {
     let Owner::Net(name) = &p.owner else { return None };
     let mine: Vec<usize> = (0..nets.len()).filter(|&i| (q.name)(i) == *name).collect();
@@ -458,17 +464,19 @@ fn area_patch_owner(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], p: &cr
         return Some(mine[0]);
     }
     let tech = q.mcfg.tech;
-    patch_owner_helper(p.offset, mine.into_iter().map(|i| (i, nets[i].pin_box, state[i].ext.iter().chain(&state[i].figs).map(|f| fig_bbox(tech, f)).collect())))
+    let o = p.origin;
+    let at = Rect::new(p.offset.xl + o.0, p.offset.yl + o.1, p.offset.xh + o.0, p.offset.yh + o.1);
+    patch_owner_helper(at, mine.into_iter().map(|i| (i, nets[i].pin_box, state[i].ext.iter().chain(&state[i].figs).map(|f| fig_bbox(tech, f)).collect())))
 }
 
-/// `checkMetalShape_patchOwner_helper` on the patch's box as the reference passes it (`box`, the
-/// offset box): the first candidate worker net, in order, whose pin box, then one of its shapes'
-/// boxes (boundary shapes, then route shapes, in order) STRICTLY overlaps it (`Rect::overlaps`:
-/// interiors meet; touching is not enough).
+/// `checkMetalShape_patchOwner_helper` on the patch's absolute box (divergence D4, upstream-fix
+/// 0007 v2): the first candidate worker net, in order, whose pin box, then one of its shapes'
+/// boxes (boundary shapes, then route shapes, in order) meets it (`Rect::intersects`: closed
+/// boxes, so touching counts).
 fn patch_owner_helper(b: Rect, cands: impl Iterator<Item = (usize, Rect, Vec<Rect>)>) -> Option<usize> {
-    let overlaps = |r: &Rect| r.xh > b.xl && r.xl < b.xh && r.yh > b.yl && r.yl < b.yh;
+    let meets = |r: &Rect| r.xh >= b.xl && r.xl <= b.xh && r.yh >= b.yl && r.yl <= b.yh;
     for (i, pin_box, figs) in cands {
-        if overlaps(&pin_box) || figs.iter().any(overlaps) {
+        if meets(&pin_box) || figs.iter().any(meets) {
             return Some(i);
         }
     }
@@ -1014,23 +1022,25 @@ pub fn order_map(order: &[usize]) -> BTreeMap<usize, usize> {
 mod tests {
     use super::*;
 
-    /// Rule (`checkMetalShape_patchOwner_helper`, as `checkMetalShape_addPatch` calls it for a
-    /// design net with several worker nets): the box compared is the patch's OFFSET box (relative
-    /// to its origin — the reference's trace shows (-70, -300, 70, 0) for a patch at (87210,
-    /// 68320)), so a worker net is found only when a shape of it reaches the design's origin;
-    /// otherwise the patch has no net and is dropped (OpenROAD issue #12191). First match in
-    /// order; pin box before shapes; touching is not overlapping.
+    /// ⛔ Divergence D4 (register; OpenROAD issue #12191). Upstream rule
+    /// (`checkMetalShape_patchOwner_helper`, as `checkMetalShape_addPatch` calls it for a design
+    /// net with several worker nets): the box compared is the patch's OFFSET box (relative to its
+    /// origin — the reference's trace shows (-70, -300, 70, 0) for a patch at (87210, 68320)), and
+    /// it must strictly overlap, so a worker net is found only when a shape of it reaches the
+    /// design's origin. Our rule, the reference patched with upstream-fix 0007 v2: the patch's
+    /// ABSOLUTE box, and touching counts (a patch abuts the shape it grows from). First match in
+    /// order; pin box before shapes.
     #[test]
-    fn a_patch_owner_is_looked_up_by_the_patch_box_relative_to_its_origin() {
-        let b = Rect::new(-70, -300, 70, 0);
-        let far = |i| (i, Rect::new(87000, 68000, 88000, 69000), vec![Rect::new(87140, 68320, 87280, 68600)]);
-        assert_eq!(patch_owner_helper(b, [far(0), far(1)].into_iter()), None, "where the patch IS does not count");
-        let near_shape = (1, Rect::new(5000, 5000, 6000, 6000), vec![Rect::new(9000, 9000, 9100, 9100), Rect::new(0, -10, 100, 10)]);
-        assert_eq!(patch_owner_helper(b, [far(0), near_shape.clone()].into_iter()), Some(1));
-        let near_pin = (2, Rect::new(-10, -10, 10, 10), vec![]);
-        assert_eq!(patch_owner_helper(b, [near_pin, near_shape].into_iter()), Some(2), "the first in order");
-        let touching = (3, Rect::new(70, -300, 200, 0), vec![Rect::new(-200, 0, 200, 50)]);
-        assert_eq!(patch_owner_helper(b, [touching].into_iter()), None, "touching edges do not overlap");
+    fn a_patch_owner_is_looked_up_by_where_the_patch_is_touching_included() {
+        let b = Rect::new(87210 - 70, 68320 - 300, 87210 + 70, 68320);
+        let far = |i| (i, Rect::new(1000, 1000, 2000, 2000), vec![Rect::new(-70, -300, 70, 0)]);
+        assert_eq!(patch_owner_helper(b, [far(0), far(1)].into_iter()), None, "the origin-relative box does not count");
+        let abutting = (1, Rect::new(5000, 5000, 6000, 6000), vec![Rect::new(9000, 9000, 9100, 9100), Rect::new(87140, 68320, 87280, 68600)]);
+        assert_eq!(patch_owner_helper(b, [far(0), abutting.clone()].into_iter()), Some(1), "a shape sharing only an edge owns it");
+        let on_pin = (2, Rect::new(87000, 68000, 88000, 69000), vec![]);
+        assert_eq!(patch_owner_helper(b, [on_pin, abutting].into_iter()), Some(2), "the first in order, pin box first");
+        let apart = (3, Rect::new(87281, 68000, 87300, 68100), vec![Rect::new(87000, 68321, 87100, 68400)]);
+        assert_eq!(patch_owner_helper(b, [apart].into_iter()), None, "one unit apart");
     }
 
     /// Rule (`checkMetalShape_addPatch`, its end): per area patch in order, the owner first — a
