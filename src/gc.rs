@@ -2531,9 +2531,11 @@ impl<'a> Worker<'a> {
             owners.sort();
             owners.dedup();
             if self.seen.insert((bbox, layer, Rule::SpacingTableOrth, owners.clone())) {
-                // The reference's top is the cut's RIGHT edge (`ury = gtl::xh`), OpenROAD issue
-                // #12198; copied as written, normalised by `Rect::new`.
-                let side = |s: &Shape| (self.owner(s.net).clone(), layer, Rect::new(s.rect.xl, s.rect.yl, s.rect.xh, s.rect.xh), s.fixed);
+                // ⛔ Divergence D5 (register; OpenROAD issue #12198): each victim box is its cut,
+                // as the reference patched with vyges-openroad-patches upstream-fix 0011 records
+                // it; the unpatched reference takes the top from the cut's RIGHT edge
+                // (`ury = gtl::xh`, a typo).
+                let side = |s: &Shape| (self.owner(s.net).clone(), layer, s.rect, s.fixed);
                 let (victim, second_victim) = (side(&s1), side(&s2));
                 let aggressor = (self.owner(s3.net).clone(), layer, s3.rect, s3.fixed);
                 self.markers.push(Marker { rule: Rule::SpacingTableOrth, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: Some(second_victim) });
@@ -4899,18 +4901,21 @@ mod orth_spacing_tests {
         assert_eq!(run(vec![(60, 60)], &two_fixed).len(), 1, "one of the three not fixed");
     }
 
-    /// Rule (`checkCutSpacingTableOrthogonal_helper`, the marker's victims): the pair, each box
-    /// taking its RIGHT edge for its top — the reference writes `ury = gtl::xh(...)` — then
-    /// normalised (witness trace vyc-orth1: B (980,1070)-(1020,1110) recorded as
-    /// (980,1020)-(1020,1070)). Copied as written (OpenROAD issue #12198): the queue reads
-    /// victim boxes when a marker lies off the route box.
+    /// ⛔ Divergence D5 (register; OpenROAD issue #12198). Upstream rule
+    /// (`checkCutSpacingTableOrthogonal_helper`, the marker's victims): the pair, each box taking
+    /// its RIGHT edge for its top — `ury = gtl::xh(...)`, a typo — then normalised (pin probe: B
+    /// (980,1070)-(1020,1110) recorded as (980,1020)-(1020,1070)). Our rule, the reference patched
+    /// with vyges-openroad-patches upstream-fix 0011: each victim box is its cut (fixed probe,
+    /// orth-spacing-witness o1 col and row: B recorded as (980,1070)-(1020,1110), and (1070,980)-
+    /// (1110,1020) across). Marker boxes and counts are unchanged; the queue reads victim boxes
+    /// when a marker lies off the route box.
     #[test]
-    fn the_victim_boxes_take_the_right_edge_for_the_top() {
+    fn the_victim_boxes_are_the_cuts() {
         let m = run(vec![(60, 60)], &col(cut(1090, 1045)));
         assert_eq!(m[0].victim.as_ref().map(|v| v.2), Some(Rect::new(980, 980, 1020, 1020)));
-        assert_eq!(m[0].second_victim.as_ref().map(|v| v.2), Some(Rect::new(980, 1020, 1020, 1070)));
+        assert_eq!(m[0].second_victim.as_ref().map(|v| v.2), Some(Rect::new(980, 1070, 1020, 1110)));
         let row = [("a", cut(1000, 1000), false), ("b", cut(1090, 1000), false), ("c", cut(1045, 1090), false)];
-        assert_eq!(run(vec![(60, 60)], &row)[0].second_victim.as_ref().map(|v| v.2), Some(Rect::new(1070, 980, 1110, 1110)));
+        assert_eq!(run(vec![(60, 60)], &row)[0].second_victim.as_ref().map(|v| v.2), Some(Rect::new(1070, 980, 1110, 1020)));
     }
 
     /// Rule (`getRectsPrl`, the helper's first exit): a pair whose longest run is ZERO — two

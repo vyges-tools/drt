@@ -137,9 +137,10 @@ patched on the routed net as the reference patches it; a rule with `EXCEPTMINWID
 `EXCEPTEDGELENGTH`, `EXCEPTMINSIZE`, `EXCEPTSTEP`, `MASK` or `LAYER` is skipped with a warning, as
 the reference skips it), and the orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
-and closer than `s` across that run, is marked; the marker names the pair as its victims with the
-boxes the reference gives them (each box's top taken from the cut's right edge, upstream OpenROAD
-issue #12198), which the router reads when it picks the nets to rip up). LEF58 max spacing (`LEF58_MAXSPACING max CUTCLASS c`) runs the router's repair pass as the reference
+and closer than `s` across that run, is marked; the marker names the pair as its victims, each
+box its cut, which the router reads when it picks the nets to rip up; the unpatched reference
+takes each box's top from the cut's right edge, upstream OpenROAD issue #12198, and this router
+follows the fixed reading, by decision). LEF58 max spacing (`LEF58_MAXSPACING max CUTCLASS c`) runs the router's repair pass as the reference
 runs it, after an iteration that ends with no marker: its secondary via defs and its search for
 vias of the class with no other cut within `max`; a rule with no `CUTCLASS` is skipped with the
 reference's warning (DRT-350). Then, per such via, its marker, the three-by-three-gcell region
