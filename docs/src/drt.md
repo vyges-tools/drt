@@ -114,7 +114,10 @@ a width range), the two-widths spacing table (`SPACINGTABLE TWOWIDTHS`, looked u
 kept over a parallel-run table on the same layer), cut spacing (one plain rule per cut layer), LEF 5.4 end-of-line spacing, minimum
 width, minimum area (patched, or reported where a patch cannot fix it), minimum enclosed area
 (`MINENCLOSEDAREA` without a width), minimum step, minimum cut (`MINIMUMCUT`, and
-`LEF58_MINIMUMCUT` converted into the same rule as the reference converts it), rect-only and
+`LEF58_MINIMUMCUT` converted into the same rule as the reference converts it; one written per
+cut class, `MINIMUMCUT CUTCLASS c n`, takes the count of the class of the default via below,
+else above, as the reference fixed for upstream OpenROAD issue #12176 does, where the unpatched
+reference drops it unread, and a run whose default via there has no cut class is refused), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
 (its common clauses, with `MINLENGTH` / `MAXLENGTH` and `SAMEMASK`, the latter held on every pair
 whatever its masks, as the reference holds it), corner spacing (convex corners, patched by the router), cut classes, the
@@ -168,9 +171,7 @@ change. Sign-off DRC must cover these rules. The unpatched reference router read
 plain end-of-line rule with `WITHIN 0` (upstream OpenROAD issue #12174); this router follows the
 fixed reading instead, by decision. Skipped the same way: a `LEF58_MINIMUMCUT`
 rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
-reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS c n`: the
-database reader keeps it with a cut count of 0, so the reference drops it unread; upstream
-OpenROAD issue #12176). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
+reference warns and skips it). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
 (`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`), or with a cut class but neither `CONCAVECORNER`
 nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`), with the warning the reference's own
 fix prints (DRT-353 with no class, DRT-354 with neither corner). The unpatched reference keeps

@@ -116,11 +116,9 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 // Modelled through io's conversion into minimum-cut rules (the check, the maze cost
                 // around vias and macro pins, the via-to-via prep, MTSAFEDIST): AREA,
                 // SAMEMETALOVERLAP and FULLYENCLOSED rules are skipped and a rule asking for one
-                // cut or none is dropped, as the reference skips and drops them; PERCUTCLASS
-                // (never set by the database's LEF reader) is refused.
-                if let Some(clause) = (0..n).filter(|&k| crate::tech::read::lef58_min_cut_kept(db, &l.name, k)).find_map(|k| crate::tech::read::lef58_min_cut_refusal(db, &l.name, k)) {
-                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
-                }
+                // cut or none is dropped, as the reference skips and drops them; a rule written
+                // per cut class takes its count from the default vias (divergence D9), refused at
+                // run time only where its default via has no cut class.
                 continue;
             }
             if family == "lef58_cut_spacing_table" {
@@ -172,10 +170,6 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
 /// The upstream issue for the end-of-line forms [`skipped_rules`] lists.
 pub const SKIPPED_EOL_UPSTREAM_ISSUE: &str = "OpenROAD issue #12174";
 
-/// The upstream issue for the per-cut-class LEF58 minimum-cut rules [`skipped_rules`] lists: the
-/// database reader never marks them per cut class, so the reference drops them unread.
-pub const SKIPPED_MIN_CUT_UPSTREAM_ISSUE: &str = "OpenROAD issue #12176";
-
 /// The upstream issue for the LEF58 cut spacing LAYER rules [`skipped_rules`] lists: io keeps a
 /// rule with no CUTCLASS, or a CUTCLASS but no corner, and the check never acts on it.
 pub const SKIPPED_LAYER_UPSTREAM_ISSUE: &str = "OpenROAD issue #12187";
@@ -201,10 +195,6 @@ impl SkippedRule {
     /// The warning logged at tech load.
     pub fn warning(&self) -> String {
         match (self.family, self.clause) {
-            ("lef58_min_cut", "CUTCLASS") => format!(
-                "layer {}: LEF58_MINIMUMCUT rule {} is written per cut class (CUTCLASS), which the database reader keeps with a cut count of 0; the reference then drops it, and so does this router: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (see {}).",
-                self.layer, self.index, SKIPPED_MIN_CUT_UPSTREAM_ISSUE
-            ),
             ("lef58_cut_spacing", clause) if crate::tech::read::LAYER_UNCHECKED.contains(&clause) => format!(
                 "layer {}: LEF58_SPACING cut spacing rule {} is a {clause} rule. The reference checks a LAYER rule only for a cut class with CONCAVECORNER or NONEOLCONVEXCORNER, so it never checks this one; the rule is SKIPPED and NOT checked during routing, as the reference fixed for {} skips it, so sign-off DRC must cover it.",
                 self.layer, self.index, SKIPPED_LAYER_UPSTREAM_ISSUE
@@ -236,7 +226,6 @@ impl SkippedRule {
     pub fn upstream(&self) -> Option<&'static str> {
         match (self.family, self.clause) {
             ("lef58_spacing_eol", _) => Some(SKIPPED_EOL_UPSTREAM_ISSUE),
-            ("lef58_min_cut", "CUTCLASS") => Some(SKIPPED_MIN_CUT_UPSTREAM_ISSUE),
             ("lef58_cut_spacing", clause) if crate::tech::read::LAYER_UNCHECKED.contains(&clause) => Some(SKIPPED_LAYER_UPSTREAM_ISSUE),
             ("lef58_cut_spacing", crate::tech::read::ADJ_TWO_WITHIN) => Some(SKIPPED_ADJ_TWO_WITHIN_UPSTREAM_ISSUE),
             _ => None,
@@ -247,8 +236,8 @@ impl SkippedRule {
 /// The rules routing skips with a warning instead of refusing, layer by layer in the
 /// technology's order: each LEF58 end-of-line rule with TOCONCAVECORNER or TONOTCHLENGTH
 /// ([`crate::tech::read::lef58_eol_skipped_clause`]), then each LEF58 minimum-cut rule the
-/// reference skips or drops unread ([`crate::tech::read::lef58_min_cut_skipped_clause`]: AREA,
-/// SAMEMETALOVERLAP, FULLYENCLOSED, or written per cut class), then each LEF58_AREA rule io
+/// reference skips ([`crate::tech::read::lef58_min_cut_skipped_clause`]: AREA,
+/// SAMEMETALOVERLAP, FULLYENCLOSED), then each LEF58_AREA rule io
 /// skips ([`crate::tech::read::lef58_area_skipped_clause`]: EXCEPTMINWIDTH, EXCEPTEDGELENGTH,
 /// EXCEPTMINSIZE, EXCEPTSTEP, MASK, LAYER), then on each cut layer each LEF58
 /// cut spacing ADJACENTCUTS rule io skips ([`crate::tech::read::adjacent_cuts_rule`]:
@@ -985,12 +974,68 @@ mod skipped_rule_tests {
         assert_eq!(crate::tech::read::cut_spacing_tables(&d, "V2", 5, &[]).expect("tables").inter, Some(0), "layer 5: kept");
     }
 
+    /// A two-metal technology with one default via VA on V1 (cut 0.04 square, class CA); `m2dir`
+    /// sets M2's direction (a VERTICAL M2 makes VA's horizontal M2 pad misaligned, so the default
+    /// vias GENERATE `V1_FR`, which has no cut class).
+    fn db_via(name: &str, m1: &str, m2: &str, m2dir: &str) -> Db {
+        let lef = format!(
+            "VERSION 5.8 ;\nUNITS\n  DATABASE MICRONS 1000 ;\nEND UNITS\nMANUFACTURINGGRID 0.005 ;\n\
+             LAYER M1\n  TYPE ROUTING ;\n  DIRECTION HORIZONTAL ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\n{m1}END M1\n\
+             LAYER V1\n  TYPE CUT ;\n  SPACING 0.05 ;\n  WIDTH 0.04 ;\n  PROPERTY LEF58_CUTCLASS \"CUTCLASS CA WIDTH 0.04 ; CUTCLASS CB WIDTH 0.06 ;\" ;\nEND V1\n\
+             LAYER M2\n  TYPE ROUTING ;\n  DIRECTION {m2dir} ;\n  PITCH 0.12 ;\n  WIDTH 0.04 ;\n  SPACING 0.04 ;\n{m2}END M2\n\
+             VIA VA DEFAULT\n  LAYER M1 ;\n    RECT -0.05 -0.02 0.05 0.02 ;\n  LAYER V1 ;\n    RECT -0.02 -0.02 0.02 0.02 ;\n  LAYER M2 ;\n    RECT -0.05 -0.02 0.05 0.02 ;\nEND VA\n\
+             END LIBRARY\n"
+        );
+        let path = std::env::temp_dir().join(format!("vyges-drt-mincut-{}-{name}.lef", std::process::id()));
+        std::fs::write(&path, lef).expect("write lef");
+        let mut db = Db::new();
+        db.read_lef(path.to_str().expect("utf-8 path")).expect("read lef");
+        let _ = std::fs::remove_file(&path);
+        db
+    }
+
+    /// ⛔ Divergence D9 (register; upstream OpenROAD issue #12176). Upstream rule: the database's
+    /// LEF reader fills a per-cut-class LEF58 MINIMUMCUT rule's class map but never sets its
+    /// per-cut-class flag, so io `convertLef58MinCutConstraints` reads the count 0 and drops the
+    /// rule. Our rule, the reference patched with vyges-openroad-patches upstream-fix 0003 (the
+    /// flag set): after `initDefaultVias`, per (class, count) in map order (by class name), the
+    /// default via of the cut layer below unless FROMABOVE, then the one above unless FROMBELOW;
+    /// the first whose cut class matches gives the count; none matching drops the rule; one or
+    /// no cut drops it. Where the via looked at has no cut class (here the generated `V1_FR`) the
+    /// patched reference dereferences a null class: refused.
+    #[test]
+    fn a_per_cut_class_minimum_cut_rule_takes_its_count_from_the_default_vias() {
+        use crate::dr::rules::{default_vias, RuleConfig};
+        use crate::tech::MinCut;
+        let p = |r: &str| format!("  PROPERTY LEF58_MINIMUMCUT \"{r}\" ;\n");
+        let m1 = format!("{}{}{}", p("MINIMUMCUT CUTCLASS CB 3 CUTCLASS CA 2 WIDTH 0.2 ;"), p("MINIMUMCUT CUTCLASS CA 4 WIDTH 0.3 FROMBELOW ;"), p("MINIMUMCUT 2 WIDTH 0.5 ;"));
+        let m2 = format!("{}{}{}", p("MINIMUMCUT CUTCLASS CA 3 WIDTH 0.2 FROMABOVE ;"), p("MINIMUMCUT CUTCLASS CA 3 WIDTH 0.25 ;"), p("MINIMUMCUT CUTCLASS CB 5 WIDTH 0.25 ;"));
+        let resolved = |d: &Db| {
+            let mut t = crate::tech::read::tech(d).expect("tech");
+            let (lm1, lm2) = (t.layer_num("M1").expect("M1"), t.layer_num("M2").expect("M2"));
+            let read: Vec<usize> = [lm1, lm2].iter().map(|&l| t.layers[l].min_cuts.len()).collect();
+            let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: lm1, top_routing_layer: lm2, enable_via_gen: true });
+            crate::tech::read::resolve_lef58_min_cuts(d, &mut t, &defaults).map(|()| (read, t.layers[lm1].min_cuts.clone(), t.layers[lm2].min_cuts.clone()))
+        };
+        let d = db_via("pcc", &m1, &m2, "HORIZONTAL");
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let rule = |num_cuts, width| MinCut { num_cuts, width, within: None, from_above: None, length: None };
+        let (read, m1_rules, m2_rules) = resolved(&d).expect("every default via has a class");
+        assert_eq!(read, [1, 0], "as read, only the plain rule: the per-class ones wait for the default vias");
+        assert_eq!(m1_rules, [rule(2, 200), rule(2, 500)], "M1: CA (map order first) above gives 2; FROMBELOW sees no via below");
+        assert_eq!(m2_rules, [rule(3, 250)], "M2: FROMABOVE has no via above; CB matches no default via");
+        let d = db_via("pcc-gen", &m1, &m2, "VERTICAL");
+        let err = resolved(&d).expect_err("the generated default via has no cut class");
+        assert!(err.contains("V1_FR") && err.contains("#12176"), "{err}");
+    }
+
     /// Rule (reference io `setRoutingLayerProperties` then postProcess
     /// `convertLef58MinCutConstraints`): LEF58 MINIMUMCUT rules with AREA, SAMEMETALOVERLAP or
     /// FULLYENCLOSED are skipped; the rest become minimum-cut rules after the v5.4 ones, in order,
-    /// unless they ask for one cut or none. The database's LEF reader fills a per-cut-class rule's
-    /// class map but never sets its PERCUTCLASS flag, so its count stays 0 and it is dropped too.
-    /// LENGTH … WITHIN raises MTSAFEDIST (a v5.4 LENGTH does not). MODELLED, nothing refused.
+    /// unless they ask for one cut or none. LENGTH … WITHIN raises MTSAFEDIST (a v5.4 LENGTH does
+    /// not). MODELLED, nothing refused. A per-cut-class rule (index 1) waits for the default vias
+    /// (divergence D9): absent from the technology as read, NOT skipped.
     #[test]
     fn lef58_minimum_cut_rules_convert_after_the_v54_ones() {
         use crate::tech::MinCut;
@@ -1013,9 +1058,9 @@ mod skipped_rule_tests {
         // Skipped with a warning: the rules the reference skips or drops unread (a one-cut rule
         // is dropped as one that can never be broken, not skipped).
         let sk = |index, clause| super::SkippedRule { layer: "M1".into(), family: "lef58_min_cut", index, clause };
-        assert_eq!(skipped, [sk(1, "CUTCLASS"), sk(4, "AREA"), sk(5, "SAMEMETALOVERLAP"), sk(6, "FULLYENCLOSED")]);
-        assert!(skipped[0].warning().contains("per cut class") && skipped[0].warning().contains("#12176") && skipped[1].warning().contains("uses AREA"));
-        assert_eq!(skipped.iter().map(|s| s.upstream()).collect::<Vec<_>>(), [Some(super::SKIPPED_MIN_CUT_UPSTREAM_ISSUE), None, None, None]);
+        assert_eq!(skipped, [sk(4, "AREA"), sk(5, "SAMEMETALOVERLAP"), sk(6, "FULLYENCLOSED")]);
+        assert!(skipped[0].warning().contains("uses AREA"));
+        assert_eq!(skipped.iter().map(|s| s.upstream()).collect::<Vec<_>>(), [None, None, None]);
         let tech = crate::tech::read::tech(&d).expect("tech");
         let m1 = tech.layer_num("M1").expect("M1");
         let rule = |num_cuts, width, within, from_above, length| MinCut { num_cuts, width, within, from_above, length };

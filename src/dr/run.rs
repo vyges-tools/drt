@@ -155,6 +155,35 @@ pub struct DesignIn {
     pub block_vias: Vec<BlockVia>,
 }
 
+/// The block's bottom routing layer (its minimum routing level), else layer 2.
+pub fn bottom_routing_layer(db: &Db, tech: &Tech) -> usize {
+    let min_level = db.block_get_min_routing_layer();
+    (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2)
+}
+
+/// `tech` with every routing layer's minimum-cut rules as io's postProcess leaves them, the
+/// per-cut-class LEF58 rules converted against the default vias (`with_vias`: the technology with
+/// the generated vias, `defaults` its default per layer; [`crate::tech::read::resolve_lef58_min_cuts`],
+/// divergence D9). `Err`: a per-cut-class rule whose default via has no cut class, refused.
+pub fn with_resolved_min_cuts(db: &Db, tech: &Tech, with_vias: &Tech, defaults: &[Option<usize>]) -> Res<Tech> {
+    let mut t = with_vias.clone();
+    crate::tech::read::resolve_lef58_min_cuts(db, &mut t, defaults).map_err(|e| format!("rule families not modelled: {e}"))?;
+    let mut out = tech.clone();
+    for (o, l) in out.layers.iter_mut().zip(&t.layers) {
+        o.min_cuts = l.min_cuts.clone();
+        o.mt_safe_dist = l.mt_safe_dist;
+    }
+    Ok(out)
+}
+
+/// The tech as pin access reads it on its own (the `pin_access` command): the default vias for
+/// the block's routing layers, then [`with_resolved_min_cuts`].
+pub fn pin_access_tech(db: &Db, tech: &Tech, top_routing_layer: usize) -> Res<Tech> {
+    let mut t = tech.clone();
+    let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_routing_layer(db, tech), top_routing_layer, enable_via_gen: true });
+    with_resolved_min_cuts(db, tech, &t, &defaults)
+}
+
 /// The reader, then pin access.
 pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<DesignIn> {
     let unmodelled = crate::dr::db::unmodelled_rules(db, tech);
@@ -173,11 +202,14 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     }
     let tracks = read::tracks(db, tech).map_err(|e| e.to_string())?;
     let mut cfg = crate::pa::db::config(db, tech);
-    let min_level = db.block_get_min_routing_layer();
-    let bottom_layer = (0..tech.layers.len()).find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level).unwrap_or(2);
+    let bottom_layer = bottom_routing_layer(db, tech);
     // The tech read generates the default vias (and warns), then the design read.
     let mut t = tech.clone();
     let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
+    // postProcess `convertLef58MinCutConstraints`, once the default vias exist: the per-cut-class
+    // minimum-cut rules (divergence D9), on everything from pin access on.
+    let resolved = with_resolved_min_cuts(db, tech, &t, &defaults)?;
+    let tech = &resolved;
     // setLayers' io warnings, layer by layer in the technology's order: on a routing layer the
     // LEF58 end-of-line rules it skips (`setRoutingLayerProperties`); on a cut layer its skipped
     // LEF58 cut spacing rules (two WITHIN values DRT-359, unchecked LAYER rules DRT-353 / 354, in
