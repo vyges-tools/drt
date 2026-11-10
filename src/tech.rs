@@ -265,6 +265,9 @@ impl MinCut {
 /// `par_space` of a side (on both sides with `two_edges`), up to `par_within` behind the end.
 /// `end_to_end` (LEF58 only): the spacing when the facing edge is itself a line end.
 /// `length` (LEF58 only): MINLENGTH / MAXLENGTH on the edges beside the line end.
+/// `extension` (LEF58 only, under ENDTOEND): ENDTOEND's EXTENSION, read by the check alone
+/// (`frLef58SpacingEndOfLineWithinEndToEndConstraint::getExtension`, see the check's
+/// `eol_query_rect` and `eol_end_to_end`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EolRule {
     pub space: i32,
@@ -273,6 +276,7 @@ pub struct EolRule {
     pub parallel: Option<ParallelEdge>,
     pub end_to_end: Option<i32>,
     pub length: Option<EolLength>,
+    pub extension: Option<i32>,
 }
 
 /// A LEF58 end-of-line rule's `MINLENGTH l [TWOSIDES]` or `MAXLENGTH l [TWOSIDES]`
@@ -1295,9 +1299,9 @@ pub mod read {
     /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH — tested first, as it does) and for a rule
     /// this engine SKIPS with a warning of its own ([`lef58_eol_skipped_clause`]: TOCONCAVECORNER,
     /// TONOTCHLENGTH), `Err(clause)` for a clause outside the modelled subset (SPACING / ENDOFLINE /
-    /// WITHIN, ENDTOEND without its extension or cut spaces, PARALLELEDGE with only its space, within
-    /// and TWOEDGES, MINLENGTH / MAXLENGTH with TWOSIDES read as written: [`lef58_eol_length`];
-    /// SAMEMASK with its WITHIN as written).
+    /// WITHIN, ENDTOEND with its EXTENSION but without OTHERENDWIDTH or cut spaces, PARALLELEDGE
+    /// with only its space, within and TWOEDGES, MINLENGTH / MAXLENGTH with TWOSIDES read as
+    /// written: [`lef58_eol_length`]; SAMEMASK with its WITHIN as written).
     ///
     /// ⛔ SAMEMASK is a DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue
     /// #12182, vyges-openroad-patches upstream-fix 0002). Upstream rule:
@@ -1312,13 +1316,12 @@ pub mod read {
         if lef58_eol_dropped_by_reference(db, layer, k) || lef58_eol_skipped_clause(db, layer, k).is_some() {
             return Ok(None);
         }
-        let unmodelled: [(bool, &'static str); 18] = [
+        let unmodelled: [(bool, &'static str); 17] = [
             (db.spacingeolrule_is_exact_width_valid(layer, k), "EXACTWIDTH"),
             (db.spacingeolrule_is_wrong_dir_spacing_valid(layer, k), "WRONGDIRSPACING"),
             (db.spacingeolrule_is_opposite_width_valid(layer, k), "OPPOSITEWIDTH"),
             (db.spacingeolrule_is_end_prl_spacing_valid(layer, k), "ENDPRLSPACING"),
             (db.spacingeolrule_is_wrong_dir_within_valid(layer, k), "WRONGDIRWITHIN"),
-            (db.spacingeolrule_is_extension_valid(layer, k), "ENDTOEND EXTENSION"),
             (db.spacingeolrule_is_other_end_width_valid(layer, k), "ENDTOEND OTHERENDWIDTH"),
             (db.spacingeolrule_is_cut_spaces_valid(layer, k), "ENDTOEND cut spaces"),
             (db.spacingeolrule_is_subtract_eol_width_valid(layer, k), "PARALLELEDGE SUBTRACTEOLWIDTH"),
@@ -1347,6 +1350,12 @@ pub mod read {
             parallel,
             end_to_end: db.spacingeolrule_is_end_to_end_valid(layer, k).then(|| db.spacingeolrule_get_end_to_end_space(layer, k)),
             length: lef58_eol_length(db, layer, k),
+            // io keeps EXTENSION only under ENDTOEND (`setExtension` on the end-to-end
+            // constraint). Its wrong-direction value (`isWrongDirExtensionValid`) is set there
+            // too but nothing in drt reads it, so it is not kept.
+            extension: (db.spacingeolrule_is_end_to_end_valid(layer, k)
+                && db.spacingeolrule_is_extension_valid(layer, k))
+            .then(|| db.spacingeolrule_get_extension(layer, k)),
         }))
     }
 
@@ -1420,7 +1429,7 @@ pub mod read {
                     let eol = db
                         .layer_v54_eol_rules(&name)?
                         .into_iter()
-                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None, length: None })
+                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None, length: None, extension: None })
                         .collect();
                     let corner_spacing: Vec<CornerSpacing> = (0..db.num_layer_get_tech_layer_corner_spacing_rules(&name)).filter_map(|k| corner_spacing_rule(db, &name, k).ok()).collect();
                     let lef58_eol: Vec<EolRule> = (0..db.num_layer_get_tech_layer_spacing_eol_rules(&name)).filter_map(|k| lef58_eol_rule(db, &name, k).ok().flatten()).collect();

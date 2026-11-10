@@ -839,6 +839,19 @@ mod skipped_rule_tests {
         assert_eq!(tech.layers.iter().find(|l| l.name == "M1").expect("M1").lef58_eol[0].within, 25);
     }
 
+    /// Rule (reference io `setRoutingLayerProperties`, pin 4155ac31): ENDTOEND's EXTENSION is
+    /// kept on the end-to-end constraint (`setExtension`, with or without its wrong-direction
+    /// value, which drt never reads), so the rule is checked, neither refused nor skipped.
+    #[test]
+    fn an_end_to_end_extension_is_modelled() {
+        let d = db("ext", &eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ENDTOEND 0.08 EXTENSION 0.01 ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        assert_eq!(enforced, 1);
+        let r = crate::tech::read::lef58_eol_rule(&d, "M1", 0).expect("modelled").expect("kept");
+        assert_eq!((r.end_to_end, r.extension), (Some(80), Some(10)));
+    }
+
     /// The control: the same rule written as a plain end-of-line rule is checked, not skipped.
     #[test]
     fn a_plain_end_of_line_rule_is_checked_not_skipped() {
@@ -849,13 +862,13 @@ mod skipped_rule_tests {
     }
 
     /// The skip covers only its own rule: another rule on the layer keeps its own verdict (here an
-    /// end-of-line rule with ENDTOEND EXTENSION, refused), and only the skipped rule's index is listed.
+    /// end-of-line rule with ENDTOEND OTHERENDWIDTH, refused), and only the skipped rule's index is listed.
     #[test]
     fn another_refused_rule_on_the_layer_is_still_refused() {
-        let rules = format!("{}{}", eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ENDTOEND 0.08 EXTENSION 0.01 ;"), eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER ;"));
+        let rules = format!("{}{}", eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ENDTOEND 0.08 OTHERENDWIDTH 0.05 ;"), eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER ;"));
         let d = db("mixed", &rules, "");
         let (skipped, refused, _) = census(&d);
-        assert_eq!(refused, ["M1: lef58_spacing_eol (2, ENDTOEND EXTENSION)"]);
+        assert_eq!(refused, ["M1: lef58_spacing_eol (2, ENDTOEND OTHERENDWIDTH)"]);
         assert_eq!(skipped.iter().map(|s| (s.index, s.clause)).collect::<Vec<_>>(), [(1, "TOCONCAVECORNER")]);
     }
 

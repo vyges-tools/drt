@@ -625,6 +625,28 @@ fn strictly_intersects(a: &Rect, b: &Rect) -> bool {
     a.xl < b.xh && b.xl < a.xh && a.yl < b.yh && b.yl < a.yh
 }
 
+/// The half-width of the window beyond a line end past each of its sides
+/// (`checkMetalEndOfLine_eol_hasEol_getQueryBox`'s `eolWithin`): the rule's WITHIN, replaced by
+/// twice ENDTOEND's EXTENSION when the rule has one, even where that is the smaller.
+fn eol_query_within(r: &EolRule) -> i32 {
+    match (r.end_to_end, r.extension) {
+        (Some(_), Some(x)) => x * 2,
+        _ => r.within,
+    }
+}
+
+/// `gtl::bloat(rect, edge->getOrientation(), d)`: widen the edge's rectangle by `d` at both ends
+/// along the edge (x for a horizontal edge, y for a vertical one).
+fn bloat_along(r: &mut Rect, e: &Seg, d: i32) {
+    if e.from.1 == e.to.1 {
+        r.xl -= d;
+        r.xh += d;
+    } else {
+        r.yl -= d;
+        r.yh += d;
+    }
+}
+
 /// `getEolKeepOutQueryBox`, by the line end's direction (polygon edges run counter-clockwise).
 fn eol_keepout_box(e: &Seg, ko: &EolKeepOut) -> Rect {
     let (lo, hi) = (e.from, e.to);
@@ -1739,10 +1761,12 @@ impl<'a> Worker<'a> {
         sol
     }
 
-    /// The window beyond a line end: `space` out (at least the END-TO-END space), `within` past
-    /// each side.
+    /// `checkMetalEndOfLine_eol_hasEol_getQueryBox`: the window beyond a line end, `space` out
+    /// (at least the END-TO-END space) and `within` past each side, or with ENDTOEND's EXTENSION
+    /// twice the extension past each side INSTEAD of `within` (`eolWithin = getExtension() * 2`,
+    /// even where that is the smaller: [`eol_query_within`]).
     fn eol_query_rect(e: &Seg, r: &EolRule) -> Rect {
-        let (w, sp) = (r.within, r.space.max(r.end_to_end.unwrap_or(0)));
+        let (w, sp) = (eol_query_within(r), r.space.max(r.end_to_end.unwrap_or(0)));
         let (lo, hi) = (e.from, e.to);
         match e.dir() {
             EdgeDir::E => Rect { xl: lo.0 - w, yl: lo.1 - sp, xh: hi.0 + w, yh: hi.1 },
@@ -1795,24 +1819,25 @@ impl<'a> Worker<'a> {
     }
 
     /// `checkMetalEndOfLine_eol_hasEol_endToEndHelper` (LEF58 rules only): the two edges as
-    /// rectangles; a facing line end takes the END-TO-END space, anything else the rule's space with
-    /// the line end widened by `within` along itself. A violation needs a run (positive projection
-    /// on the axis where they overlap) and the larger axis gap below that space; touching (no gap
-    /// on either axis) is a short, handled elsewhere.
+    /// rectangles; a facing line end takes the END-TO-END space, BOTH edges widened along
+    /// themselves by ENDTOEND's EXTENSION when the rule has one (else neither); anything else the
+    /// rule's space with the line end widened by `within` along itself. A violation needs a run
+    /// (positive projection on the axis where they overlap) and the larger axis gap below that
+    /// space; touching (no gap on either axis) is a short, handled elsewhere.
     fn eol_end_to_end(&self, layer: usize, (k, i): (usize, usize), r: &EolRule) -> bool {
         let (e1, e2) = (self.segs[layer][k], self.segs[layer][i]);
         let rect = |s: &Seg| Rect::new(s.from.0.min(s.to.0), s.from.1.min(s.to.1), s.from.0.max(s.to.0), s.from.1.max(s.to.1));
-        let (mut r1, r2) = (rect(&e1), rect(&e2));
+        let (mut r1, mut r2) = (rect(&e1), rect(&e2));
         let space = match r.end_to_end {
-            Some(ete) if self.is_eol_edge(layer, i, r) => ete,
-            _ => {
-                if e1.from.1 == e1.to.1 {
-                    r1.xl -= r.within;
-                    r1.xh += r.within;
-                } else {
-                    r1.yl -= r.within;
-                    r1.yh += r.within;
+            Some(ete) if self.is_eol_edge(layer, i, r) => {
+                if let Some(x) = r.extension {
+                    bloat_along(&mut r1, &e1, x);
+                    bloat_along(&mut r2, &e2, x);
                 }
+                ete
+            }
+            _ => {
+                bloat_along(&mut r1, &e1, r.within);
                 r.space
             }
         };
@@ -4195,7 +4220,7 @@ mod eol_tests {
     }
 
     fn rule() -> EolRule {
-        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None, length: None }
+        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None, length: None, extension: None }
     }
 
     fn net(n: &str) -> Owner {
@@ -4316,6 +4341,33 @@ mod eol_tests {
         assert_eq!(lef58(r, &[("a", WIRE, false), ("b", end_220, false)]), vec![Rect::new(1000, 0, 1220, 140)], "a line end inside end-to-end");
         assert!(lef58(rule(), &[("a", WIRE, false), ("b", end_220, false)]).is_empty(), "no end-to-end clause: the space alone");
         assert!(lef58(r, &[("a", WIRE, false), ("b", Rect::new(1270, 0, 2200, 140), false)]).is_empty(), "a line end past end-to-end");
+    }
+
+    // Rule (`checkMetalEndOfLine_eol_hasEol_getQueryBox` / `_endToEndHelper`, pin 4155ac31, the
+    // kit's ENDTOEND e EXTENSION x): with an EXTENSION the window past each side of the line end is
+    // 2x INSTEAD of WITHIN (even where 2x is the smaller), and a facing LINE END is judged with
+    // BOTH edges widened along themselves by x before the run and the END-TO-END space are
+    // measured. A facing edge that is not a line end keeps WITHIN on the first edge alone.
+    #[test]
+    fn an_end_to_end_extension_widens_both_line_ends_and_sets_the_window() {
+        let e2e = EolRule { end_to_end: Some(260), ..rule() };
+        let ext = EolRule { extension: Some(40), ..e2e };
+        // b's line end (140 long) 220 past a's, 20 above it: no run without the extension; widened
+        // by 40 each, the ends overlap 60 in y.
+        let offset_end = Rect::new(1220, 160, 2200, 300);
+        assert!(lef58(e2e, &[("a", WIRE, false), ("b", offset_end, false)]).is_empty(), "no extension: the ends do not run");
+        assert_eq!(lef58(ext, &[("a", WIRE, false), ("b", offset_end, false)]).len(), 1, "extension 40: both ends widened run 60");
+        // 80 above: b's end only touches the 2x window and, widened, a's widened end: no run.
+        assert!(lef58(ext, &[("a", WIRE, false), ("b", Rect::new(1220, 220, 2200, 360), false)]).is_empty(), "widened ends touching do not run");
+        assert_eq!(lef58(ext, &[("a", WIRE, false), ("b", Rect::new(1220, 210, 2200, 350), false)]).len(), 1, "widened ends run 10");
+        // Past END-TO-END (270 > 260): none, extension or not.
+        assert!(lef58(ext, &[("a", WIRE, false), ("b", Rect::new(1270, 160, 2200, 300), false)]).is_empty(), "past end-to-end");
+        // A block (no line end) 20 above a's end, 150 away: the first edge widened by WITHIN 100
+        // runs with it; the window, 2x = 20 with an extension of 10, never reaches it.
+        let wide = EolRule { within: 100, ..e2e };
+        let block = Rect::new(1150, 160, 1500, 600);
+        assert_eq!(lef58(wide, &[("a", WIRE, false), ("b", block, true)]).len(), 1, "WITHIN 100 window: the block is held to the space");
+        assert!(lef58(EolRule { extension: Some(10), ..wide }, &[("a", WIRE, false), ("b", block, true)]).is_empty(), "the 2x window replaces WITHIN even when smaller");
     }
 
     // Rule (`checkMetalEndOfLine_eol_hasMinMaxLength`, last in `qualifiesAsEol`): with MINLENGTH

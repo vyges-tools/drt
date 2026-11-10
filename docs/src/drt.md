@@ -126,8 +126,11 @@ cut class, `MINIMUMCUT CUTCLASS c n`, takes the count of the class of the defaul
 else above, as the reference fixed for upstream OpenROAD issue #12176 does, where the unpatched
 reference drops it unread, and a run whose default via there has no cut class is refused), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
-(its common clauses, with `MINLENGTH` / `MAXLENGTH` and `SAMEMASK`, the latter held on every pair
-whatever its masks, as the reference holds it), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207), cut classes, the
+(its common clauses, with `MINLENGTH` / `MAXLENGTH`, `ENDTOEND … EXTENSION` (twice the extension
+replaces `WITHIN` beside the line end, and a facing line end is measured with both ends widened by
+the extension, as the reference's check does; the router's costs do not read it, nor do the
+reference's) and `SAMEMASK`, the latter held on every pair whatever its masks, as the reference
+holds it), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and
 costed by the router around the other layer's vias, except where the other layer's vias fall

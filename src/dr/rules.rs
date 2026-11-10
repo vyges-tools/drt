@@ -791,7 +791,7 @@ mod tests {
     #[test]
     fn the_eol_rule_is_the_narrowest_less_one() {
         let mut t = tech(vec![]);
-        t.layers[2].eol = vec![EolRule { space: 60, width: 140, within: 20, parallel: None, end_to_end: None, length: None }, EolRule { space: 90, width: 180, within: 10, parallel: None, end_to_end: None, length: None }];
+        t.layers[2].eol = vec![EolRule { space: 60, width: 140, within: 20, parallel: None, end_to_end: None, length: None, extension: None }, EolRule { space: 90, width: 180, within: 10, parallel: None, end_to_end: None, length: None, extension: None }];
         let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
         assert_eq!(c.eol_table(2, 100), EolTable { width: 139, space: 90, within: 20 });
         assert_eq!(c.eol_table(2, 150), EolTable { width: 150, space: 90, within: 10 });
@@ -808,7 +808,7 @@ mod tests {
     #[test]
     fn the_eol_table_reads_the_lef58_eol_and_keep_out_rules() {
         let mut t = tech(vec![]);
-        t.layers[2].lef58_eol = vec![EolRule { space: 72, width: 100, within: 80, parallel: None, end_to_end: Some(124), length: None }];
+        t.layers[2].lef58_eol = vec![EolRule { space: 72, width: 100, within: 80, parallel: None, end_to_end: Some(124), length: None, extension: None }];
         t.layers[2].eol_keepout = vec![EolKeepOut { width: 90, backward: 0, forward: 50, side: 124, corner_only: true, ..Default::default() }];
         let c = Ctx { tech: &t, defaults: &[], cfg: &cfg(2, 4) };
         // Narrowest 90 less one; both rules wider: space max(72, 124, 50), within max(80, 124).
