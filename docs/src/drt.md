@@ -131,7 +131,7 @@ replaces `WITHIN` beside the line end, and a facing line end is measured with bo
 the extension, as the reference's check does; the router's costs do not read it, nor do the
 reference's), `OPPOSITEWIDTH` (the rule applies only when the wire beyond the line end spans
 less than the opposite width, as the LEF defines it, in the check only; the reference stores the
-clause and never reads it) and `SAMEMASK`, the latter held on every pair whatever its masks, as the reference
+clause and never reads it, upstream OpenROAD issue #12226) and `SAMEMASK`, the latter held on every pair whatever its masks, as the reference
 holds it), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and

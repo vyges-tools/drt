@@ -279,7 +279,8 @@ pub struct EolRule {
     pub extension: Option<i32>,
     /// OPPOSITEWIDTH: the rule applies only when the wire beyond the line end spans less than
     /// this perpendicular to the line end (`Worker::eol_opposite_wire_span`). ⛔ A DIVERGENCE by
-    /// decision (drt divergence register D13): the reference keeps the value and never reads it.
+    /// decision (drt divergence register D13, upstream OpenROAD issue #12226): the reference keeps
+    /// the value and never reads it.
     pub opposite_width: Option<i32>,
 }
 

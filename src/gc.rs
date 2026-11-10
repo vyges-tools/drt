@@ -1825,8 +1825,8 @@ impl<'a> Worker<'a> {
     /// largest extent, perpendicular to `ptr`, of a maximal rectangle of `ptr`'s polygon that has a
     /// side on `ptr`'s line overlapping `ptr` with positive length. The rule applies only when this
     /// is below OPPOSITEWIDTH (LEF definition). ⛔ DIVERGENCE by decision (drt divergence register
-    /// D13): the reference stores OPPOSITEWIDTH and never reads it; vyges-openroad-patches
-    /// upstream-fix 0015 adds the same test (`getOppositeWireSpan`) to the reference.
+    /// D13, upstream OpenROAD issue #12226): the reference stores OPPOSITEWIDTH and never reads it;
+    /// vyges-openroad-patches upstream-fix 0015 adds the same test (`getOppositeWireSpan`).
     fn eol_opposite_wire_span(&self, layer: usize, ptr: &Seg) -> i32 {
         let b = seg_box(ptr);
         let horizontal = ptr.from.1 == ptr.to.1;
