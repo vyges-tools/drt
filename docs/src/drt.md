@@ -194,6 +194,22 @@ not reach the routes still match the unpatched reference.
   as 0, so a line end just past a neighbour's corner is not held to the rule (upstream OpenROAD
   issue #12182). This router reads `WITHIN` as written. Like the reference, it holds the rule on
   every pair whatever its masks; the colour step checks it per mask.
+- **End-of-line `TOCONCAVECORNER` / `TONOTCHLENGTH`.** The reference reads either form as a plain
+  end-of-line rule with `WITHIN` 0 (upstream OpenROAD issue #12174). This router skips it with the
+  fixed reference's warning (DRT-357, DRT-358).
+- **`ADJACENTCUTS` with two `WITHIN` values.** The reference keeps only the first value (upstream
+  OpenROAD issue #12202). This router skips the rule with the fixed reference's warning (DRT-359).
+- **A cut spacing `LAYER` rule it never checks.** With no `CUTCLASS`, or a class but neither
+  corner, the reference keeps the rule, never checks it, and a `SAMENET` one makes every other
+  LEF58 cut spacing rule of the layer judge one net only (upstream OpenROAD issues #12187 and
+  #12188). This router skips it with the fixed reference's warning (DRT-353, DRT-354).
+- **Orthogonal spacing table victims.** The reference builds each victim box with its top taken
+  from the cut's right edge (upstream OpenROAD issue #12198). This router's victims are the cuts.
+- **Area patch owner.** See below (upstream OpenROAD issue #12191).
+- **Per-cut-class `MINIMUMCUT`.** The reference's database keeps such a rule with a cut count of 0
+  and drops it (upstream OpenROAD issue #12176). This router converts it as the fixed reference
+  does, taking the count of the first default via, below then above, whose cut class is named; a
+  default via with no cut class is refused.
 
 Area patches, owned where they are: when a net has several pieces in one worker, the unpatched
 reference looks up the piece a minimum-area or `LEF58_AREA` patch belongs to by comparing the
