@@ -834,6 +834,12 @@ impl<T> DynRTree<T> {
         &self.values[id]
     }
 
+    /// A value's payload replaced in place: its box, and so the tree's shape, unchanged (an entry
+    /// that names a list position, kept in step when the list shifts).
+    pub fn set_payload(&mut self, id: usize, v: T) {
+        self.values[id].1 = v;
+    }
+
     /// Insert a value; its id.
     pub fn insert(&mut self, r: Rect, v: T) -> usize {
         self.values.push((r, v));

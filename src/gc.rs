@@ -1208,6 +1208,30 @@ impl<'a> Worker<'a> {
         m
     }
 
+    /// The minimum-step markers of `checkMetalShape(true)`, as the surgical fix's patch pass reads
+    /// them (`patchMetalShape_minStep` walks `markers_` after that check): per routing layer
+    /// (bottom up), per owner checked from, per pin, in the order made.
+    pub fn min_step_markers(&mut self) -> Vec<Marker> {
+        self.markers.clear();
+        self.seen.clear();
+        for layer in 0..self.tech.layers.len() {
+            if self.tech.layers[layer].kind != LayerKind::Routing || self.tech.layers[layer].min_step.is_none() {
+                continue;
+            }
+            for net in 0..self.nets.len() {
+                if !self.checks_from(net) || self.nets[net].pins.len() <= layer {
+                    continue;
+                }
+                for k in 0..self.nets[net].pins[layer].len() {
+                    self.min_step(layer, net, k);
+                }
+            }
+        }
+        let m = std::mem::take(&mut self.markers);
+        self.seen.clear();
+        m
+    }
+
     /// Whether checks start from this owner's shapes.
     fn checks_from(&self, net: usize) -> bool {
         self.target.as_ref().is_none_or(|t| self.nets[net].owner.as_ref() == Some(t))

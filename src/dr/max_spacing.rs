@@ -6,13 +6,12 @@
 //! A rule `MAXSPACING max CUTCLASS c` asks that every via of class `c` have another cut within
 //! `max` of it. The reference finds the vias that have none (`getLonelyVias`), marks them, and
 //! re-routes a region around each with a via-swap worker that tries the layer's SECONDARY via
-//! defs (`initSecondaryVias`: the vias of another class). Ported so far: the sequencer, the
-//! secondary via defs, the lonely-via search, the pin-access avoid list, and per lonely via its
-//! marker, its region and the pin terminals it marks stubborn; the pin-access re-run for the
-//! stubborn terminals (`updateDirtyPAData`, [`crate::pa::dirty`]); the regions' merge. ⛔ Not
-//! ported: the region workers' via swap, minimum-step patching. A run that reaches one is REFUSED
-//! there, before anything is written; a run that finds no lonely via routes as the reference does
-//! (the pass changes nothing).
+//! defs (`initSecondaryVias`: the vias of another class). Ported: the sequencer, the secondary
+//! via defs, the lonely-via search, the pin-access avoid list, and per lonely via its marker, its
+//! region and the pin terminals it marks stubborn; the pin-access re-run for the stubborn
+//! terminals (`updateDirtyPAData`, [`crate::pa::dirty`]); the regions' merge; the via-swap
+//! workers (the router's, [`ViaSwapWorkers`]; the swap itself is `crate::dr::queue`'s, with
+//! upstream fix 0013 for OpenROAD issue #12203, register D11). ⛔ Not ported: minimum-step patching of a swapped via.
 //!
 //! Where the REFERENCE itself aborts on the input (an upstream defect, filed), this router
 //! refuses at the same point with a reason made by [`upstream_abort_reason`], which names the
@@ -44,7 +43,8 @@ pub struct UpstreamAbort {
 }
 
 /// The reference's aborts this pass refuses in its place: DRT-0073, a stubborn pin left with no
-/// access point by the pin-access re-run (OpenROAD issue #12199); DRT-1231, a worker that overlaps
+/// access point by the pin-access re-run (OpenROAD issue #12199; since upstream fix 0008's
+/// fallback is followed, only when every via def leaves it none); DRT-1231, a worker that overlaps
 /// a pin whose access points the re-run moved outside it (OpenROAD issue #12200).
 pub const UPSTREAM_ABORTS: [UpstreamAbort; 2] = [UpstreamAbort { code: "DRT-0073", issue: 12199 }, UpstreamAbort { code: "DRT-1231", issue: 12200 }];
 
@@ -91,6 +91,8 @@ pub struct MaxSpacingState {
     /// Pin access as the re-runs left it (`FlexPA`'s state, kept from call to call); `None` until
     /// the first re-run with a dirty instance (until then it is the first run's).
     pub pa: Option<PinAccess>,
+    /// How many re-runs changed pin access (the router rebuilds what its workers read of it).
+    pub pa_reruns: usize,
     /// ⛔ MEASUREMENT ONLY: log the pass's steps as the correlation instrument prints the
     /// reference's (`VYC MAXSPC MARK/STUB/MERGED`), as lines of this engine's own.
     pub trace: bool,
@@ -126,7 +128,7 @@ pub struct PaIn<'a> {
 
 /// `FlexDR::fixMaxSpacing`, as far as it is ported: the sequence only, each stage named after the
 /// reference's step. Err: a stage that is not ported was reached (nothing is written).
-pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut MaxSpacingState, log: Sink) -> Result<(), String> {
+pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut MaxSpacingState, log: Sink, swap: ViaSwapWorkers<'_>) -> Result<(), String> {
     log(Line::Info(227, "Checking For LEF58_MAXSPACING violations".into()));
     init_secondary_vias(p.tech, p.defaults, p.block_vias, state)?;
     let mut lonely_vias = Vec::new();
@@ -141,6 +143,7 @@ pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut Ma
     }
     let mut regions = Vec::with_capacity(lonely_vias.len());
     for &k in &lonely_vias {
+        mark_lonely(routes, k);
         let via = lonely_via(p, routes, k);
         add_lonely_via_marker(p, routes, &via);
         regions.push(lonely_via_region(p.grid, via.origin));
@@ -164,8 +167,13 @@ pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut Ma
             log(Line::OwnInfo(format!("VYC MAXSPC MERGED ({},{},{},{})", r.xl, r.yl, r.xh, r.yh)));
         }
     }
-    via_swap_workers(&merged, lonely_vias.len())
+    swap(routes, &merged, state, log)
 }
+
+/// The via-swap workers, one per merged region (`RipUpMode::VIASWAP`), run by the router (they are
+/// its workers): the routes, the merged regions, the pass's state (its secondary via defs, pin
+/// access as the re-run left it), the log.
+pub type ViaSwapWorkers<'a> = &'a mut dyn FnMut(&mut DesignRoutes, &[Rect], &MaxSpacingState, Sink) -> Result<(), String>;
 
 /// A lonely via as the pass reads it: its net, def, origin, the box over its three layers, and
 /// which of its ends lands on a pin's access point.
@@ -177,6 +185,14 @@ pub struct LonelyVia {
     pub bbox: Rect,
     pub bottom_connected: bool,
     pub top_connected: bool,
+}
+
+/// `via->setIsLonely(true)` (in `getLonelyVias`): the committed via at slot `k` is flagged lonely,
+/// for good (see [`DrFig::Via`]'s `lonely`).
+fn mark_lonely(routes: &mut DesignRoutes, k: usize) {
+    if let Some(DrFig::Via { lonely, .. }) = routes.shapes[k].as_mut().map(|s| &mut s.fig) {
+        *lonely = true;
+    }
 }
 
 fn lonely_via(p: &PassIn<'_>, routes: &DesignRoutes, k: usize) -> LonelyVia {
@@ -256,8 +272,9 @@ fn trace_mark(p: &PassIn<'_>, via: &LonelyVia, region: Rect, log: Sink) {
 /// last re-run left it; with no dirty instance it changes nothing. The re-run's write-back into
 /// the database (`io::Writer::updateDb`, pin access only) is not made: this router writes no
 /// access point into its output at all (the routed DEF has none). Err: the reference aborts
-/// (DRT-0073: a routed terminal of a re-run class with no access point, OpenROAD issue #12199 —
-/// refused with [`upstream_abort_reason`]), or a case not modelled.
+/// (DRT-0073: a routed terminal of a re-run class with no access point even after upstream fix
+/// 0008's fallback to every via def — refused with [`upstream_abort_reason`]), or a case not
+/// modelled.
 fn update_dirty_pa_data(p: &PassIn<'_>, state: &mut MaxSpacingState, log: Sink) -> Result<(), String> {
     if state.dirty_insts.is_empty() {
         return Ok(());
@@ -275,14 +292,20 @@ fn update_dirty_pa_data(p: &PassIn<'_>, state: &mut MaxSpacingState, log: Sink) 
     let pa = state.pa.get_or_insert_with(|| pin.first.clone());
     let mut sink = |l: String| log(Line::OwnInfo(l));
     let mut trace: crate::pa::dirty::TraceSink<'_> = if state.trace { Some(&mut sink) } else { None };
-    let done = update_dirty_insts(&inp, pa, &state.dirty_insts, &mut trace);
+    // DRT-355 (upstream fix 0008, OpenROAD issue #12199, register D1): a stubborn terminal the
+    // avoided via defs leave with no access point is made again with every via def. Collected and
+    // logged after the re-run (only trace lines come between).
+    let mut warned: Vec<String> = Vec::new();
+    let done = update_dirty_insts(&inp, pa, &state.dirty_insts, &mut trace, &mut |w| warned.push(w));
+    for w in warned {
+        log(Line::Warn(355, w));
+    }
     state.dirty_insts.clear();
+    state.pa_reruns += 1;
     done.map_err(|e| match e {
-        // ⚠️ INTERIM stage boundary. The clean reference aborts here (DRT-0073, OpenROAD issue
-        // #12199). Once the patched reference build exists (vyges-openroad-patches, the fix for
-        // #12199), this arm is the slot where its behaviour is transcribed and correlated against
-        // that build instead of refused.
-        DirtyError::NoAccessPoint { inst, term, master } => upstream_abort_reason(UPSTREAM_ABORTS[0], &format!("the pin-access re-run for the stubborn terminals finds no access point for {inst}/{term} ({master}) once the avoided via defs are dropped")),
+        // Even with every via def (after 0008's fallback) no access point: the patched reference
+        // stops here with DRT-0073 too.
+        DirtyError::NoAccessPoint { inst, term, master } => upstream_abort_reason(UPSTREAM_ABORTS[0], &format!("the pin-access re-run for the stubborn terminals finds no access point for {inst}/{term} ({master}) even with every via def")),
         DirtyError::NoRowPath(row) => format!("lef58_max_spacing: the pin-access re-run finds no access pattern combination for the row {row} (the reference aborts with DRT-0085)"),
         DirtyError::Unsupported(u) => u,
     })
@@ -303,18 +326,6 @@ pub fn merge_regions(mut regions: Vec<Rect>) -> Result<Vec<Rect>, String> {
         }
     }
     Ok(merged)
-}
-
-/// The via-swap workers, one per merged region (`RipUpMode::VIASWAP`). ⛔ Not ported: reached
-/// with any region, the run is refused here.
-fn via_swap_workers(merged: &[Rect], lonely: usize) -> Result<(), String> {
-    if merged.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "lef58_max_spacing: {lonely} via(s) have no other cut within the rule's MAXSPACING; the via-swap workers that repair them ({} region(s)) are not modelled",
-        merged.len()
-    ))
 }
 
 /// `io::Parser::initSecondaryVias`: on every cut layer with a default via and a LEF58_MAXSPACING
@@ -652,7 +663,7 @@ mod tests {
         e.name = "E".into();
         e.layer1_figs = vec![Rect { xl: -20, yl: -20, xh: 200, yh: 20 }];
         t.via_defs.push(e);
-        let via = |v: usize, x: i32| DrFig::Via { via: v, origin: (x, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false };
+        let via = |v: usize, x: i32| DrFig::Via { via: v, origin: (x, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false };
         // E at 0: box (-20..200), centre 90; A at 180: 90 apart (within 100), origins 180 apart.
         let routes = DesignRoutes::with_initial(&t, vec![(0, via(4, 0)), (0, via(0, 180))]);
         let mut st = MaxSpacingState::default();
@@ -667,7 +678,7 @@ mod tests {
     #[test]
     fn lonely_vias_are_routed_vias_of_the_class_with_no_cut_nearby() {
         let (t, defaults) = tech_with_rule();
-        let via = |v: usize, x: i32| DrFig::Via { via: v, origin: (x, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false };
+        let via = |v: usize, x: i32| DrFig::Via { via: v, origin: (x, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false };
         // 0: alone (class 0) — lonely; 1000/1080: a pair; 3000: class 1, alone — not of the class;
         // 5000: next to a fixed shape at 5090.
         let routes = DesignRoutes::with_initial(&t, vec![(0, via(0, 0)), (0, via(3, 1000)), (1, via(0, 1080)), (2, via(1, 3000)), (3, via(0, 5000))]);
@@ -759,14 +770,15 @@ mod tests {
     }
 
     /// Rule (`FlexDR::fixMaxSpacing`): the sequence marks every lonely via (box over its three
-    /// layers, on the cut layer, the net as owner, victim and aggressor), then stops where the
-    /// port stops — at the pin-access re-run when a terminal was marked stubborn, else at the
-    /// via-swap workers; a pass with no lonely via changes nothing.
+    /// layers, on the cut layer, the net as owner, victim and aggressor) and flags it lonely
+    /// (`setIsLonely(true)`), then hands the merged regions to the via-swap workers — or stops at
+    /// the pin-access re-run when a terminal was marked stubborn and pin access is not available;
+    /// a pass with no lonely via changes nothing and runs no worker.
     #[test]
-    fn the_pass_marks_lonely_vias_then_refuses_at_the_first_unported_stage() {
+    fn the_pass_marks_lonely_vias_then_runs_the_workers_on_the_merged_regions() {
         let (t, defaults) = tech_with_rule();
         let g = grid();
-        let via = |x: i32, bottom: bool| DrFig::Via { via: 0, origin: (x, 450), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: bottom, top_connected: false };
+        let via = |x: i32, bottom: bool| DrFig::Via { via: 0, origin: (x, 450), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: bottom, top_connected: false, lonely: false };
         let pin = (Rect { xl: 440, yl: 440, xh: 460, yh: 460 }, Fixed::InstTerm { net: Some(0), inst: 4, term: 0 });
         let fixed = vec![vec![pin], Vec::new(), Vec::new()];
         let trees: Vec<PackedRTree<Fixed>> = fixed.iter().map(|v| PackedRTree::new(v.clone())).collect();
@@ -774,8 +786,14 @@ mod tests {
         let mut lines = Vec::new();
         let mut routes = DesignRoutes::with_initial(&t, vec![(0, via(450, false))]);
         let mut st = MaxSpacingState::default();
-        let e = fix_max_spacing(&p, &mut routes, &mut st, &mut |l| lines.push(l)).expect_err("the workers are not ported");
-        assert!(e.contains("via-swap workers") && e.contains("1 region"), "{e}");
+        let mut seen: Vec<Vec<Rect>> = Vec::new();
+        fix_max_spacing(&p, &mut routes, &mut st, &mut |l| lines.push(l), &mut |_, merged, _, _| {
+            seen.push(merged.to_vec());
+            Ok(())
+        })
+        .expect("the workers run");
+        assert_eq!(seen, [vec![lonely_via_region(&g, (450, 450))]]);
+        assert!(matches!(routes.shapes[0].as_ref().map(|s| &s.fig), Some(DrFig::Via { lonely: true, .. })), "the lonely via is flagged");
         let m: Vec<&Marker> = routes.markers().collect();
         assert_eq!(m.len(), 1);
         assert_eq!((m[0].rule, m[0].layer, m[0].bbox), (Rule::Lef58MaxSpacing, 1, Rect { xl: 430, yl: 430, xh: 470, yh: 470 }));
@@ -785,13 +803,20 @@ mod tests {
         assert!(st.stubborn.is_empty());
         let mut routes = DesignRoutes::with_initial(&t, vec![(0, via(450, true))]);
         let mut st = MaxSpacingState::default();
-        let e = fix_max_spacing(&p, &mut routes, &mut st, &mut |_| {}).expect_err("pin access re-run not ported");
+        let e = fix_max_spacing(&p, &mut routes, &mut st, &mut |_| {}, &mut |_, _, _, _| panic!("no worker before the re-run")).expect_err("pin access re-run not available");
         assert!(e.contains("updateDirtyPAData"), "{e}");
         assert_eq!(st.stubborn, BTreeSet::from([(4, 0)]));
         assert_eq!(st.dirty_insts, BTreeSet::from([4]));
         // A neighbour within 100: nothing lonely, nothing marked.
         let mut routes = DesignRoutes::with_initial(&t, vec![(0, via(450, true)), (1, via(540, false))]);
-        fix_max_spacing(&p, &mut routes, &mut MaxSpacingState::default(), &mut |_| {}).expect("no lonely via");
+        let mut regions = 0;
+        fix_max_spacing(&p, &mut routes, &mut MaxSpacingState::default(), &mut |_| {}, &mut |_, merged, _, _| {
+            regions += merged.len();
+            Ok(())
+        })
+        .expect("no lonely via");
         assert_eq!(routes.markers().count(), 0);
+        assert_eq!(regions, 0);
+        assert!(routes.shapes.iter().flatten().all(|s| !matches!(s.fig, DrFig::Via { lonely: true, .. })), "nothing flagged");
     }
 }

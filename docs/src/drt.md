@@ -120,7 +120,7 @@ else above, as the reference fixed for upstream OpenROAD issue #12176 does, wher
 reference drops it unread, and a run whose default via there has no cut class is refused), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
 (its common clauses, with `MINLENGTH` / `MAXLENGTH` and `SAMEMASK`, the latter held on every pair
-whatever its masks, as the reference holds it), corner spacing (convex corners, patched by the router), cut classes, the
+whatever its masks, as the reference holds it), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and
 costed by the router around the other layer's vias, except where the other layer's vias fall
@@ -150,12 +150,22 @@ reference's warning (DRT-350). Then, per such via, its marker, the three-by-thre
 around it and the pin terminals it lands on, and the regions' merge, as the reference does them.
 The pin-access re-run for those terminals follows: the instances they belong to are reclassified
 with the terminals in their class key, their access points regenerated without the rule's vias,
-and their rows' patterns chosen again. The via-swap workers that come next are not modelled yet: a
-run that reaches them is refused there (exit 3; `reason` names `lef58_max_spacing`, the stage and
-its counts), and nothing is written. Where the re-run leaves a terminal with no access point, the
-reference itself aborts (DRT-0073, upstream OpenROAD issue #12199); the run is refused at the same
-point with exit 4, `reason` and the report's `reference_aborts` name the error and the issue, and
-nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not
+and their rows' patterns chosen again. Then the via-swap workers, one per merged region: each
+walks every lonely via in its region, gives it the layer's next secondary via def, checks the net,
+and keeps the swap only when the check is clean; a worker that ends with more markers than it began
+with is not written back. Three points differ from the reference on purpose, each the reference's own
+upstream fix: a stubborn terminal that the avoided via defs leave with no access point has its
+access made again with every via def, with warning DRT-355 (the reference stops with DRT-0073,
+upstream OpenROAD issue #12199); when a via has tried every secondary def it goes back to the def it had and the
+worker's check is told (the reference takes the layer's default via and checks the last one it
+tried, which leaves markers for a via that is in neither the route nor the design: upstream OpenROAD
+issue #12203); and a worker
+that holds none of a re-run terminal's new access points leaves that terminal out with warning
+DRT-356 (the reference stops with DRT-1231, upstream OpenROAD issue #12200). A swapped via
+whose pad leaves a minimum-step violation on a `MINSTEP` layer beside the cut layer has its pad end
+patched out to the `MINSTEP` length in the worker's check, as the reference patches it. Where a re-run terminal has no access point even with every via def, the
+reference itself aborts (DRT-0073); the run is refused at the same point with exit 4, `reason` and
+the report's `reference_aborts` name the error and the issue, and nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not
 model, is refused with exit 3. A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.

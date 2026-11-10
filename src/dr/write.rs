@@ -122,7 +122,7 @@ pub fn write_path(w: &CostWorker<'_, '_>, cx: &WriteCtx<'_>, points: &[Idx]) -> 
                 let (bot, top) = ((start.0, start.1, z), (start.0, start.1, z + 1));
                 let bottom_connected = pin_connected(cx, bot, origin, l);
                 let top_connected = pin_connected(cx, top, origin, w.g.zs[z as usize + 1]);
-                out.push(DrFig::Via { via, origin, bi: (start.0 as usize, start.1 as usize, z as usize), ei: (start.0 as usize, start.1 as usize, z as usize + 1), tapered, bottom_connected, top_connected });
+                out.push(DrFig::Via { via, origin, bi: (start.0 as usize, start.1 as usize, z as usize), ei: (start.0 as usize, start.1 as usize, z as usize + 1), tapered, bottom_connected, top_connected, lonely: false });
             }
         }
     }

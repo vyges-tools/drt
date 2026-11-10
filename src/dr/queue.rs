@@ -66,6 +66,17 @@ pub enum Event {
     /// A check patch written to a worker net (`writeGCPatchesToDRWorker`): the net, the patch as
     /// written, and how many path points it could move to (0: not moved).
     Patch { net: usize, fig: DrFig, valid: usize },
+    /// A via-swap entry queued at the start (`route_queue_init_queue`, VIASWAP): the worker net
+    /// and the lonely via's def.
+    SwapInit { net: usize, via: usize },
+    /// A lonely via visited by a via-swap entry: the worker net, the entry's re-route count, the
+    /// via's def and the def chosen for it, and whether the layer's secondaries ran out.
+    Swap { net: usize, reroute: i32, old: usize, new: usize, no_solution: bool },
+    /// A via-swap entry's figures after its swaps (the net's whole list, in order).
+    SwapFigs { net: usize, figs: Vec<DrFig> },
+    /// A via-swap entry's check: the worker net and the check's marker count; none: the net
+    /// is kept (`setModified`).
+    SwapCheck { net: usize, markers: usize },
 }
 
 /// What the queue reads beyond the costs.
@@ -220,6 +231,28 @@ impl RouteRq {
         }
     }
 
+    /// A via swap (`workerRegionQuery.remove(old)`, `net->removeShape(old)`, `net->addRoute(new)`,
+    /// `workerRegionQuery.add(new)`): the shape at `pos` of the net's list taken out of the query
+    /// (its rectangles in the order they went in), the list closing over it (later shapes move
+    /// down one), the new shape added at the list's end `last`, its rectangles inserted.
+    fn swap_fig(&mut self, tech: &crate::tech::Tech, net: usize, pos: usize, last: usize, new: &DrFig) {
+        let ids = self.ids.remove(&net).unwrap_or_default();
+        let mut kept = Vec::with_capacity(ids.len());
+        for (l, id) in ids {
+            let (n, ext, k) = self.trees[l].value(id).1;
+            if k == pos {
+                self.trees[l].remove(id);
+                continue;
+            }
+            if k > pos {
+                self.trees[l].set_payload(id, (n, ext, k - 1));
+            }
+            kept.push((l, id));
+        }
+        self.ids.insert(net, kept);
+        self.add_fig(tech, net, last, new);
+    }
+
     fn remove_net(&mut self, net: usize) {
         for (l, id) in self.ids.remove(&net).unwrap_or_default() {
             self.trees[l].remove(id);
@@ -256,6 +289,9 @@ pub fn initial_marker_cost(w: &mut CostWorker<'_, '_>, q: &QueueCtx<'_>, nets: &
 pub enum Start<'a> {
     Nets(&'a [usize]),
     Markers(&'a [Marker]),
+    /// `RipUpMode::VIASWAP` (the LEF58_MAXSPACING pass's workers): a check entry per lonely via
+    /// of each worker net; per cut layer, its secondary via defs in order.
+    ViaSwap(&'a [Vec<usize>]),
 }
 
 /// A worker whose check box holds a re-check marker: a check over everything it holds, before
@@ -287,7 +323,23 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 events.push(Event::Push { block: e.block.clone(), num_reroute: e.num_reroute, do_route: e.do_route, checking: e.checking.clone() });
             }
         }
+        Start::ViaSwap(_) => {
+            for e in via_swap_init_queue(q, nets, &state, &mut events) {
+                events.push(Event::Push { block: e.block.clone(), num_reroute: e.num_reroute, do_route: e.do_route, checking: e.checking.clone() });
+                queue.push_back(e);
+            }
+        }
     }
+    let secondary: Option<&[Vec<usize>]> = match start {
+        Start::ViaSwap(s) => Some(s),
+        _ => None,
+    };
+    // VIASWAP (upstream fix 0013, OpenROAD issue #12203, register D11): each swapped via's def before its first swap,
+    // by (worker net, origin, cut layer) — upstream keys it by the via object, which a swap
+    // replaces; and the worker nets whose check update is pending (`updateDRNet`, applied at the
+    // next check).
+    let mut swap_orig: HashMap<(usize, (i32, i32), usize), usize> = HashMap::new();
+    let mut pending: Vec<usize> = Vec::new();
     let gc_dump = std::env::var("VYGD_GC").is_ok();
     let mut gw = check_init(q, nets, &state, if gc_dump { Some(&mut events) } else { None });
     let mut gc_version = 1i64;
@@ -297,6 +349,31 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
     let mut last_markers = 0usize;
     let History { planar: mut planar_hist, via: mut via_hist, mut rq } = hist;
     while let Some(e) = queue.pop_front() {
+        if let (Some(sec), Block::Net(i), false) = (secondary, &e.block, e.do_route) {
+            let i = *i;
+            let no_solution = swap_lonely_vias(q, sec, &mut state, &mut rq, &mut swap_orig, i, e.num_reroute, &mut events);
+            events.push(Event::SwapFigs { net: i, figs: state[i].figs.clone() });
+            pending.push(i);
+            if no_solution {
+                continue;
+            }
+            flush_pending(&mut gw, q, nets, &state, &mut pending);
+            gw.target = Some(Owner::Net((q.name)(i)));
+            // `setTargetNet(frNet)`: no worker net is the target (`targetDRNet_` stays null).
+            let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None, true);
+            if dropped > 0 {
+                events.push(Event::AreaPatchesDropped(dropped));
+            }
+            events.push(Event::SwapCheck { net: i, markers: m.len() });
+            if m.is_empty() {
+                events.extend(write_gc_patches(q, &mut state, &mut rq, &pw, &[]));
+            } else {
+                let next = Entry { block: Block::Net(i), num_reroute: e.num_reroute + 1, do_route: false, checking: None };
+                events.push(Event::Push { block: next.block.clone(), num_reroute: next.num_reroute, do_route: false, checking: None });
+                queue.push_back(next);
+            }
+            continue;
+        }
         let mut did_route = false;
         let (markers, checking_obj): (Vec<Marker>, Owner) = match (&e.block, e.do_route) {
             (Block::Net(i), true) => {
@@ -333,7 +410,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                     events.push(Event::Gc(format!("gcupd|{}", owner_tag(&owner)) + &gw.dump(&owner)));
                 }
                 gw.target = Some(owner.clone());
-                let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, Some(i));
+                let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, Some(i), false);
                 if dropped > 0 {
                     events.push(Event::AreaPatchesDropped(dropped));
                 }
@@ -386,13 +463,112 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
         crate::dr::route::edge_watch(w, "after-marker-cost");
     }
     gw.target = None;
-    let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None);
+    flush_pending(&mut gw, q, nets, &state, &mut pending);
+    let (m, pw, dropped) = gc_main_surgical(&mut gw, q, nets, &state, &rq, None, secondary.is_some());
     if dropped > 0 {
         events.push(Event::AreaPatchesDropped(dropped));
     }
     events.push(Event::Final { markers: m, patches: pw.iter().map(|(_, p)| p.clone()).collect() });
     events.extend(write_gc_patches(q, &mut state, &mut rq, &pw, &[]));
     events
+}
+
+/// `route_queue_init_queue`, VIASWAP: per worker net in worker order, per lonely via of its route
+/// in list order, a check entry on the net (re-route 0, its checking object the net itself) —
+/// one entry PER lonely via, so a net with k of them is queued k times; then
+/// `mazeIterInit_sortRerouteQueue` and `route_queue_update_queue` sort them by the net's key
+/// (equal entries are alike, so the sort's stability does not show).
+fn via_swap_init_queue(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], events: &mut Vec<Event>) -> Vec<Entry> {
+    let mut checks = Vec::new();
+    for (i, s) in state.iter().enumerate() {
+        for f in &s.figs {
+            if let DrFig::Via { via, lonely: true, .. } = f {
+                events.push(Event::SwapInit { net: i, via: *via });
+                checks.push(Entry { block: Block::Net(i), num_reroute: 0, do_route: false, checking: None });
+            }
+        }
+    }
+    checks.sort_by_cached_key(|e| key(q, nets, &e.block));
+    checks
+}
+
+/// `route_queue_main`, VIASWAP, the swap: each lonely via of the net's route list is visited and
+/// given the layer's secondary via def at the entry's re-route count — or, when the layer has no
+/// more (`size() <= numReroute`), the def it had before its first swap (upstream fix 0013, OpenROAD issue #12203: the
+/// reference takes the layer's DEFAULT via def there and leaves the check on the last swap,
+/// register D11). A changed via is erased from its place and appended to the list's end while the
+/// list is being walked BY POSITION (a range-for over the `std::vector`, its end fixed): the
+/// shape after it moves into its place and is skipped, and the appended via is visited again at
+/// the end (its def unchanged then). Whether a layer's secondaries ran out.
+#[allow(clippy::too_many_arguments)]
+fn swap_lonely_vias(q: &QueueCtx<'_>, secondary: &[Vec<usize>], state: &mut [NetState], rq: &mut RouteRq, orig: &mut HashMap<(usize, (i32, i32), usize), usize>, i: usize, reroute: i32, events: &mut Vec<Event>) -> bool {
+    let tech = q.mcfg.tech;
+    let n = state[i].figs.len();
+    let mut visits = Vec::new();
+    let mut swaps = Vec::new();
+    let no_solution = swap_walk(&mut state[i].figs, &|v| tech.via_defs[v].cut, secondary, orig, i, reroute, &mut visits, &mut swaps);
+    for (old, new, ran_out) in visits {
+        events.push(Event::Swap { net: i, reroute, old, new, no_solution: ran_out });
+    }
+    for (pos, fig) in swaps {
+        rq.swap_fig(tech, i, pos, n - 1, &fig);
+    }
+    no_solution
+}
+
+/// The walk of [`swap_lonely_vias`] over one net's list: each visit (old def, new def, whether
+/// the layer ran out) and each swap (the place it left, the via appended), in order.
+#[allow(clippy::too_many_arguments)]
+fn swap_walk(figs: &mut Vec<DrFig>, cut_of: &dyn Fn(usize) -> usize, secondary: &[Vec<usize>], orig: &mut HashMap<(usize, (i32, i32), usize), usize>, i: usize, reroute: i32, visits: &mut Vec<(usize, usize, bool)>, swaps: &mut Vec<(usize, DrFig)>) -> bool {
+    let mut no_solution = false;
+    for pos in 0..figs.len() {
+        let DrFig::Via { via, origin, lonely: true, .. } = figs[pos] else { continue };
+        let cut = cut_of(via);
+        let sec = secondary.get(cut).map_or(&[][..], Vec::as_slice);
+        let key = (i, origin, cut);
+        let first = orig.get(&key).copied().unwrap_or(via);
+        let (new, ran_out) = match usize::try_from(reroute).ok().and_then(|r| sec.get(r)) {
+            Some(&v) => (v, false),
+            None => (first, true),
+        };
+        no_solution |= ran_out;
+        visits.push((via, new, ran_out));
+        if new == via {
+            continue;
+        }
+        orig.insert(key, first);
+        let mut fig = figs.remove(pos);
+        if let DrFig::Via { via, .. } = &mut fig {
+            *via = new;
+        }
+        figs.push(fig.clone());
+        swaps.push((pos, fig));
+    }
+    no_solution
+}
+
+/// The pending `updateDRNet`s applied, as the next check's `updateGCWorker` applies them: once
+/// per design net, by id.
+fn flush_pending(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], pending: &mut Vec<usize>) {
+    let mut ids: Vec<(usize, Owner)> = Vec::new();
+    for &i in pending.iter() {
+        let o = Owner::Net((q.name)(i));
+        if !ids.iter().any(|(_, x)| *x == o) {
+            ids.push((nets[i].net, o));
+        }
+    }
+    pending.clear();
+    ids.sort_by_key(|(id, _)| *id);
+    let batch: Vec<_> = ids
+        .into_iter()
+        .map(|(_, owner)| {
+            let (route, taper) = owner_route(q, nets, state, &owner);
+            (owner, route, taper)
+        })
+        .collect();
+    if !batch.is_empty() {
+        gw.replace_routes(&batch);
+    }
 }
 
 /// `FlexGCWorker::main` with the surgical fix (the worker's own checks): `checkMetalShape(true)`
@@ -402,11 +578,19 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
 /// `patchMetalShape_cornerSpacing` — on the check as it stood before any patch; and the patched
 /// nets updated with their patches (`updateGCWorker`); then the full check and `modifyMarkers`.
 /// `target`: the worker net checked (`setTargetNet(drNet)`), none after the queue. The check's
-/// markers and patches, and the count of area patches dropped for want of a worker net. (The min-step patching of the same branch is not modelled: it does not
-/// fire on any design of the corpora.)
-fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>) -> (Vec<Marker>, Vec<(usize, PatchWire)>, usize) {
+/// markers and patches, and the count of area patches dropped for want of a worker net.
+/// `patchMetalShape` starts with `patchMetalShape_minStep` ([`patch_min_step`]) on the
+/// minimum-step markers of `checkMetalShape(true)`, when the technology keeps a MINSTEP rule
+/// (`hasCornerSpacingConstraint()`, which only a MINSTEP rule sets, or `hasVia2ViaMinStep()`);
+/// it patches only in a via-swap worker (`via_swap`).
+#[allow(clippy::too_many_arguments)]
+fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>, via_swap: bool) -> (Vec<Marker>, Vec<(usize, PatchWire)>, usize) {
     let (mut pw, dropped) = own_area_patches(gw.area_patches(), &|p| area_patch_owner(q, nets, state, p), &q.route_box);
-    if q.mcfg.tech.layers.iter().any(|l| !l.corner_spacing.is_empty()) {
+    if q.mcfg.tech.layers.iter().any(|l| l.min_step.is_some()) {
+        let markers = gw.min_step_markers();
+        pw.extend(patch_min_step(q, state, rq, &markers, gw.target.as_ref(), via_swap));
+    }
+    if patches_corners(&q.mcfg.tech.layers) {
         let markers = gw.corner_markers();
         pw.extend(patch_corner_spacing(q, state, rq, &markers, target));
     }
@@ -502,6 +686,15 @@ fn fig_bbox(tech: &crate::tech::Tech, f: &DrFig) -> Rect {
     }
 }
 
+/// The corner-spacing patch gate: the technology has corner spacing. DIVERGES from the reference
+/// on purpose (register D12, upstream OpenROAD issue #12207, fix 0014): the reference's flag for this gate,
+/// `hasCornerSpacingConstraint_`, is set by MINSTEP rules, not by corner spacing, so it corner-patches
+/// only a technology that also has a MINSTEP rule. Every technology with both kinds of rule, the
+/// only kind the reference's gate admits, patches the same.
+fn patches_corners(layers: &[crate::tech::Layer]) -> bool {
+    layers.iter().any(|l| !l.corner_spacing.is_empty())
+}
+
 /// `patchMetalShape_cornerSpacing`: per corner-spacing marker, the first route shape of a source
 /// net in the worker's region query of the marker's layer (in query order; with a target, only
 /// the target worker net's) whose point lies in the route box — a via (its origin; its box on the
@@ -563,6 +756,129 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
         }
     }
     out
+}
+
+/// Per via origin (`std::map<odb::Point, std::vector<drVia*>>`), its vias: worker net, enclosure
+/// box on the layer, lonely.
+type ViasByOrigin = BTreeMap<(i32, i32), Vec<(usize, Rect, bool)>>;
+
+/// `patchMetalShape_minStep`: per minimum-step marker, in order, on a routing layer beside a cut
+/// layer that keeps a LEF58_MAXSPACING rule (the via-to-via half of its condition is refused
+/// before routing, `min_step_via`) and at least the layer's width long on one side: the vias of
+/// the marker's first source net (and the target's, with one) in the worker's region query of
+/// the layer, cut just below or above it, grouped by origin (`std::map<Point>`: x, then y; each
+/// group in query order). In a via-swap worker, a LONELY via whose enclosure box on the layer
+/// spans the marker across (a horizontal box, `Rect::getDir`, dx >= dy: the marker's y range
+/// equal to the box's; a vertical one: its x range) and shares one end of it along, takes the
+/// patch: the marker box grown at that end by the MINSTEP length less its own length (never
+/// less than nothing). ⚠️ Upstream rules kept as they are: `break` leaves the group only, so a
+/// later origin's lonely via may take the marker again, from the box already grown; a layer with
+/// no classic MINSTEP (`getMinStepConstraint()` null) skips the via (`continue`). The patch sits
+/// at the via's origin on its worker net, kept when valid (`isPatchValid`).
+fn patch_min_step(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, markers: &[Marker], target: Option<&Owner>, via_swap: bool) -> Vec<(usize, PatchWire)> {
+    let tech = q.mcfg.tech;
+    let max_spacing = |l: Option<usize>| l.and_then(|l| tech.layers.get(l)).is_some_and(|c| !c.lef58_max_spacing.is_empty());
+    let mut out = Vec::new();
+    for m in markers.iter().filter(|m| m.rule == Rule::MinStep) {
+        let l = m.layer;
+        let layer = &tech.layers[l];
+        if !max_spacing(l.checked_sub(1)) && !max_spacing(Some(l + 1)) {
+            continue;
+        }
+        let mut mb = m.bbox;
+        if mb.dx().max(mb.dy()) < layer.width {
+            continue;
+        }
+        let Some(Owner::Net(src)) = m.owners.first() else { continue };
+        // `std::map<odb::Point, std::vector<drVia*>>`: per via, its worker net, enclosure, lonely.
+        let mut vias: ViasByOrigin = BTreeMap::new();
+        for (ni, ext, k) in rq.query(l, &mb) {
+            let fig = if ext { &state[ni].ext[k] } else { &state[ni].figs[k] };
+            let DrFig::Via { via, origin, lonely, .. } = *fig else { continue };
+            let name = (q.name)(ni);
+            if name != *src || target.is_some_and(|t| *t != Owner::Net(name.clone())) {
+                continue;
+            }
+            let cut = tech.via_defs[via].cut;
+            if cut == l + 1 || cut + 1 == l {
+                vias.entry(origin).or_default().push((ni, via_enclosure(tech, via, l, origin), lonely));
+            }
+        }
+        let min_step_length = layer.min_step.map(|ms| ms.min_step_length);
+        let (grown, chosen) = min_step_take(mb, &vias, min_step_length, via_swap);
+        let Some((ni, origin)) = chosen else { continue };
+        mb = grown;
+        let p = PatchWire { layer: l, origin, offset: Rect::new(mb.xl - origin.0, mb.yl - origin.1, mb.xh - origin.0, mb.yh - origin.1), owner: Owner::Net((q.name)(ni)) };
+        if is_patch_valid(&p, &q.route_box) {
+            out.push((ni, p));
+        }
+    }
+    out
+}
+
+/// `patchMetalShape_minStep`'s walk over the vias of one marker, by origin (`std::map` order) and
+/// in each group in order: the first lonely via in a via-swap worker that the marker box grows
+/// against ([`min_step_bloat`]) ends its GROUP (`break`), not the walk; a later group's may take
+/// the marker again from the box already grown, and the last one taken wins. Without a classic
+/// MINSTEP length (`getMinStepConstraint()` null) no via takes it. The box as grown, and the
+/// (worker net, origin) that took it last.
+#[allow(clippy::type_complexity)]
+fn min_step_take(mut mb: Rect, vias: &ViasByOrigin, min_step_length: Option<i32>, via_swap: bool) -> (Rect, Option<(usize, (i32, i32))>) {
+    let mut chosen = None;
+    for (&origin, objs) in vias {
+        for &(ni, enc, lonely) in objs {
+            if !(lonely && via_swap) {
+                continue;
+            }
+            let Some(len) = min_step_length else { continue };
+            let Some(grown) = min_step_bloat(mb, enc, len) else { continue };
+            mb = grown;
+            chosen = Some((ni, origin));
+            break;
+        }
+    }
+    (mb, chosen)
+}
+
+/// A via's enclosure box on routing layer `l` (`getLayer1BBox` when its bottom layer is `l`, else
+/// `getLayer2BBox`), at its origin.
+fn via_enclosure(tech: &crate::tech::Tech, via: usize, l: usize, origin: (i32, i32)) -> Rect {
+    let vd = &tech.via_defs[via];
+    let figs = if vd.layer1 == l { &vd.layer1_figs } else { &vd.layer2_figs };
+    let b = figs.iter().skip(1).fold(figs[0], |a, f| Rect::new(a.xl.min(f.xl), a.yl.min(f.yl), a.xh.max(f.xh), a.yh.max(f.yh)));
+    Rect::new(b.xl + origin.0, b.yl + origin.1, b.xh + origin.0, b.yh + origin.1)
+}
+
+/// `patchMetalShape_minStep`'s growth of a marker box against a lonely via's enclosure `enc`: a
+/// horizontal enclosure (`getDir`: dx >= dy) whose y range the marker shares, grown to the right
+/// when the marker ends at the enclosure's right end (and starts inside it), else to the left
+/// when it starts at its left end (and ends inside it); a vertical one the same way in y. The
+/// growth is MINSTEP less the marker's length along, at least 0. `None`: the via does not take
+/// the marker.
+fn min_step_bloat(mb: Rect, enc: Rect, min_step_length: i32) -> Option<Rect> {
+    let mut r = mb;
+    if enc.dx() >= enc.dy() && mb.yl == enc.yl && mb.yh == enc.yh {
+        let grow = (min_step_length - mb.dx()).max(0);
+        if mb.xl >= enc.xl && mb.xh == enc.xh {
+            r.xh += grow;
+        } else if mb.xl == enc.xl && mb.xh <= enc.xh {
+            r.xl -= grow;
+        } else {
+            return None;
+        }
+    } else if enc.dx() < enc.dy() && mb.xl == enc.xl && mb.xh == enc.xh {
+        let grow = (min_step_length - mb.dy()).max(0);
+        if mb.yl >= enc.yl && mb.yh == enc.yh {
+            r.yh += grow;
+        } else if mb.yl == enc.yl && mb.yh <= enc.yh {
+            r.yl -= grow;
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+    Some(r)
 }
 
 /// The corner patch's box: the marker box across the layer's direction as the shape's box, and one
@@ -1089,6 +1405,21 @@ mod tests {
     // Rule (`patchMetalShape_cornerSpacing`): on a horizontal layer the patch spans the shape's y
     // and one grid past the marker in x — to the left when the shape starts at the marker's right
     // side, else to the right. Vertical: the same across.
+    // D12 (register; upstream OpenROAD issue #12207, fix 0014): we corner-patch whenever the technology has corner
+    // spacing. The reference's gate (`hasVia2ViaMinStep() || hasCornerSpacingConstraint()`, the
+    // flag set only by MINSTEP / LEF58 MINSTEP in `frTechObject::addUConstraint`) corner-patches
+    // only a technology that also has a MINSTEP rule; 0014 sets it from corner spacing.
+    #[test]
+    fn corner_patches_follow_corner_spacing_not_min_step() {
+        use crate::tech::{CornerSpacing, Layer, MinStep};
+        let corner = Layer { corner_spacing: vec![CornerSpacing::default()], ..Default::default() };
+        let step = Layer { min_step: Some(MinStep { min_step_length: 100, kind: None, max_length: -1, max_edges: 1 }), ..Default::default() };
+        assert!(patches_corners(std::slice::from_ref(&corner)), "corner spacing, no MINSTEP: patched (the reference does not; 0014 does)");
+        assert!(!patches_corners(std::slice::from_ref(&step)), "MINSTEP, no corner spacing: nothing to patch");
+        assert!(patches_corners(&[step, corner]), "both: patched, as the reference");
+        assert!(!patches_corners(&[Layer::default()]));
+    }
+
     #[test]
     fn a_corner_patch_takes_the_shape_across_and_one_grid_along() {
         let m = Rect::new(100, 10, 120, 30);
@@ -1150,11 +1481,123 @@ mod tests {
         assert!(marker_reaches_route_box(&Marker { second_victim: side(Rect::new(500, 500, 540, 540)), ..base.clone() }, &rb), "the second victim");
     }
 
+    fn lonely(via: usize, x: i32) -> DrFig {
+        DrFig::Via { via, origin: (x, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: true }
+    }
+
+    fn defs(figs: &[DrFig]) -> Vec<(usize, i32)> {
+        figs.iter()
+            .map(|f| match f {
+                DrFig::Via { via, origin, .. } => (*via, origin.0),
+                _ => (usize::MAX, 0),
+            })
+            .collect()
+    }
+
+    /// Rule (`route_queue_main`, VIASWAP): the net's route list is walked by position while a
+    /// swapped via is erased and appended (a range-for over the `std::vector`): the shape after
+    /// a swapped one is skipped, the appended via is visited again at the end (unchanged). The
+    /// reference's ispd18 trace shows it: of a net's two adjacent lonely VIA12 vias, one is
+    /// swapped per entry. Re-route r takes the layer's secondary r.
+    #[test]
+    fn a_via_swap_skips_the_shape_after_a_swapped_via_and_revisits_it_at_the_end() {
+        let mut figs = vec![lonely(0, 10), lonely(0, 20), lonely(1, 30)];
+        let sec = vec![Vec::new(), vec![5, 6], vec![7]];
+        let cut = |v: usize| if v == 0 || v == 5 || v == 6 { 1 } else { 2 };
+        let (mut orig, mut visits, mut swaps) = (HashMap::new(), Vec::new(), Vec::new());
+        let ran_out = swap_walk(&mut figs, &cut, &sec, &mut orig, 0, 0, &mut visits, &mut swaps);
+        assert!(!ran_out);
+        // Visited: the first (swapped to 5; the second moves into place 0, already passed), the
+        // third (now at place 1, swapped to 7: the appended 5 moves into place 1, passed too),
+        // then the appended 7 at place 2, unchanged.
+        assert_eq!(visits, [(0, 5, false), (1, 7, false), (7, 7, false)]);
+        assert_eq!(defs(&figs), [(0, 20), (5, 10), (7, 30)]);
+        assert_eq!(swaps.iter().map(|(p, _)| *p).collect::<Vec<_>>(), [0, 1]);
+    }
+
+    /// Rule (upstream fix 0013, OpenROAD issue #12203, register D11): when a layer has no secondary left
+    /// (`size() <= numReroute`) the via goes back to the def it had BEFORE ITS FIRST SWAP, and the
+    /// entry runs no check. The clean reference takes the layer's default def there.
+    #[test]
+    fn a_via_whose_layer_ran_out_goes_back_to_its_first_def() {
+        let mut figs = vec![lonely(0, 10)];
+        let sec = vec![Vec::new(), vec![5]];
+        let cut = |_: usize| 1;
+        let (mut orig, mut visits, mut swaps) = (HashMap::new(), Vec::new(), Vec::new());
+        assert!(!swap_walk(&mut figs, &cut, &sec, &mut orig, 0, 0, &mut visits, &mut swaps));
+        assert_eq!(defs(&figs), [(5, 10)]);
+        visits.clear();
+        assert!(swap_walk(&mut figs, &cut, &sec, &mut orig, 0, 1, &mut visits, &mut swaps));
+        assert_eq!(visits, [(5, 0, true)]);
+        assert_eq!(defs(&figs), [(0, 10)]);
+        // A via never swapped keeps its def when its layer has run out (nothing to restore).
+        let mut figs = vec![lonely(0, 10)];
+        visits.clear();
+        assert!(swap_walk(&mut figs, &cut, &sec, &mut HashMap::new(), 0, 1, &mut visits, &mut swaps));
+        assert_eq!(visits, [(0, 0, true)]);
+    }
+
+    /// Rule: only a via flagged lonely is swapped (a plain via, a wire are passed over).
+    #[test]
+    fn only_a_lonely_via_is_swapped() {
+        let plain = DrFig::Via { via: 0, origin: (0, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false };
+        let mut figs = vec![plain.clone()];
+        let (mut visits, mut swaps) = (Vec::new(), Vec::new());
+        swap_walk(&mut figs, &|_| 1, &[Vec::new(), vec![5]], &mut HashMap::new(), 0, 0, &mut visits, &mut swaps);
+        assert!(visits.is_empty() && figs == [plain]);
+    }
+
     // Rule: a marker adds 10, saturating at 255.
     #[test]
     fn marker_cost_saturates() {
         let mut v = 250u8;
         add10(&mut v);
         assert_eq!(v, 255);
+    }
+
+    /// Rule (`patchMetalShape_minStep`, the VIASWAP branch, seen in the reference's trace on the
+    /// tiny `steppad` case): a marker that spans a lonely via's enclosure across (a vertical box,
+    /// dx < dy: the same x range) and shares its top end grows up, its bottom end grows down, by
+    /// MINSTEP less its own height; a horizontal box (`Rect::getDir`: dx >= dy, a square too) the
+    /// same way in x (the high end tried first); never shrinks; a marker that touches neither end, or does not span the box
+    /// across, is not the via's.
+    #[test]
+    fn a_min_step_marker_grows_from_the_end_of_the_lonely_via_pad_it_spans() {
+        let r = Rect::new;
+        let enc = r(2465, 2035, 2535, 2165);
+        assert_eq!(min_step_bloat(r(2465, 2135, 2535, 2165), enc, 100), Some(r(2465, 2135, 2535, 2235)));
+        assert_eq!(min_step_bloat(r(2465, 2035, 2535, 2065), enc, 100), Some(r(2465, 1965, 2535, 2065)));
+        assert_eq!(min_step_bloat(r(2465, 2080, 2535, 2120), enc, 100), None, "neither end");
+        assert_eq!(min_step_bloat(r(2470, 2135, 2535, 2165), enc, 100), None, "not across");
+        let h = r(0, 0, 200, 70);
+        assert_eq!(min_step_bloat(r(135, 0, 200, 70), h, 100), Some(r(135, 0, 235, 70)));
+        assert_eq!(min_step_bloat(r(0, 0, 65, 70), h, 100), Some(r(-35, 0, 65, 70)));
+        assert_eq!(min_step_bloat(r(0, 0, 150, 70), h, 100), Some(r(0, 0, 150, 70)), "never shrinks");
+        assert_eq!(min_step_bloat(r(0, 0, 70, 70), r(0, 0, 70, 70), 100), Some(r(0, 0, 100, 70)), "a square is horizontal, and a marker over the whole box grows at the high end");
+    }
+
+    /// Rule (`patchMetalShape_minStep`): only a LONELY via in a via-swap worker on a layer with a
+    /// classic MINSTEP takes the marker; `break` ends the via's origin group only, so a later
+    /// origin (`std::map<Point>`: x, then y) takes it again from the box already grown, and the
+    /// last taken wins; inside a group the first wins.
+    #[test]
+    fn a_later_origin_retakes_a_min_step_marker_from_the_grown_box() {
+        let r = Rect::new;
+        let mb = r(135, 0, 200, 70);
+        let a = (0, r(0, 0, 200, 70), true);
+        let b = (1, r(100, 0, 235, 70), true);
+        type Via = (usize, Rect, bool);
+        let group = |v: Vec<((i32, i32), Via)>| {
+            let mut m: ViasByOrigin = BTreeMap::new();
+            for (o, x) in v {
+                m.entry(o).or_default().push(x);
+            }
+            m
+        };
+        assert_eq!(min_step_take(mb, &group(vec![((20, 0), b), ((5, 0), a)]), Some(100), true), (r(135, 0, 235, 70), Some((1, (20, 0)))));
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a), ((5, 0), b)]), Some(100), true), (r(135, 0, 235, 70), Some((0, (5, 0)))));
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a)]), Some(100), false).1, None, "not a via-swap worker");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), (0, a.1, false))]), Some(100), true).1, None, "not lonely");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a)]), None, true).1, None, "no classic MINSTEP");
     }
 }

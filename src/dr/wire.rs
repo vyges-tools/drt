@@ -177,7 +177,7 @@ pub fn parse_wire(tech: &Tech, ops: &[WireOp]) -> Result<InitialRouting, String>
             }
             let v = tech.via_defs.iter().position(|d| d.name == name).ok_or_else(|| format!("via {name} not read"))?;
             let origin = if has_end && !begin_in_via { end } else { begin };
-            out.vias.push(DrFig::Via { via: v, origin, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false });
+            out.vias.push(DrFig::Via { via: v, origin, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false });
         }
     }
     Ok(out)
@@ -211,7 +211,7 @@ mod tests {
     }
 
     fn via(origin: (i32, i32)) -> DrFig {
-        DrFig::Via { via: 0, origin, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false }
+        DrFig::Via { via: 0, origin, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false }
     }
 
     // Rule: an end with no extension extends by half the layer's width; an extension of 0
