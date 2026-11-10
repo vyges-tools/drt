@@ -180,6 +180,10 @@ pub const SKIPPED_MIN_CUT_UPSTREAM_ISSUE: &str = "OpenROAD issue #12176";
 /// rule with no CUTCLASS, or a CUTCLASS but no corner, and the check never acts on it.
 pub const SKIPPED_LAYER_UPSTREAM_ISSUE: &str = "OpenROAD issue #12187";
 
+/// The upstream issue for the LEF58 cut spacing ADJACENTCUTS rules with two WITHIN values
+/// [`skipped_rules`] lists: io reads only the first value, as the upper bound.
+pub const SKIPPED_ADJ_TWO_WITHIN_UPSTREAM_ISSUE: &str = "OpenROAD issue #12202";
+
 /// A rule the technology carries that routing neither checks nor refuses: it is SKIPPED, with a
 /// warning at tech load and an entry in the run's report.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +208,10 @@ impl SkippedRule {
             ("lef58_cut_spacing", clause) if crate::tech::read::LAYER_UNCHECKED.contains(&clause) => format!(
                 "layer {}: LEF58_SPACING cut spacing rule {} is a {clause} rule. The reference keeps it but checks a LAYER rule only for a cut class with CONCAVECORNER or NONEOLCONVEXCORNER, so it never checks this one, and does not warn. This router routes as the reference does: the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (see {}).",
                 self.layer, self.index, SKIPPED_LAYER_UPSTREAM_ISSUE
+            ),
+            ("lef58_cut_spacing", crate::tech::read::ADJ_TWO_WITHIN) => format!(
+                "layer {}: LEF58_SPACING cut spacing rule {} is an ADJACENTCUTS rule with two WITHIN values, which this router does not model; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (the unpatched reference checks it with the first value only; this router skips it as the reference fixed for {} does).",
+                self.layer, self.index, SKIPPED_ADJ_TWO_WITHIN_UPSTREAM_ISSUE
             ),
             ("lef58_cut_spacing", clause) => format!(
                 "layer {}: LEF58_SPACING cut spacing rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
@@ -230,6 +238,7 @@ impl SkippedRule {
             ("lef58_spacing_eol", _) => Some(SKIPPED_EOL_UPSTREAM_ISSUE),
             ("lef58_min_cut", "CUTCLASS") => Some(SKIPPED_MIN_CUT_UPSTREAM_ISSUE),
             ("lef58_cut_spacing", clause) if crate::tech::read::LAYER_UNCHECKED.contains(&clause) => Some(SKIPPED_LAYER_UPSTREAM_ISSUE),
+            ("lef58_cut_spacing", crate::tech::read::ADJ_TWO_WITHIN) => Some(SKIPPED_ADJ_TWO_WITHIN_UPSTREAM_ISSUE),
             _ => None,
         }
     }
@@ -1112,7 +1121,6 @@ mod skipped_rule_tests {
             ("SPACING 0.07 SAMENET ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS with SAMENET"),
             ("SPACING 0.07 SAMEMETAL ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS with SAMEMETAL or SAMEVIA"),
             ("SPACING 0.07 ADJACENTCUTS 3 TWOCUTS 1 SAMECUT WITHIN 0.1 CUTCLASS CA ;", "ADJACENTCUTS TWOCUTS SAMECUT"),
-            ("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 0.12 CUTCLASS CA ;", "ADJACENTCUTS with a second WITHIN value"),
             ("SPACING 0.07 PARALLELOVERLAP ;", "PARALLELOVERLAP"),
         ] {
             let rules = format!("{}{}", eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"), eol(rule));
@@ -1120,6 +1128,45 @@ mod skipped_rule_tests {
             let (_, refused, _) = census(&d);
             assert_eq!(refused, [format!("V1: lef58_cut_spacing (2, {clause})")], "{rule}");
         }
+    }
+
+    /// ⛔ Divergence D7 (register; upstream OpenROAD issue #12202). Upstream rule (io
+    /// `setCutLayerProperties`, ADJACENTCUTS branch): only the first WITHIN is read, and GC uses
+    /// it as the upper bound, so `WITHIN w1 w2` is checked as `WITHIN w1`. Our rule, the reference
+    /// patched with vyges-openroad-patches upstream-fix 0012: after the reference's own skips the
+    /// rule is SKIPPED with DRT-359 — not in the layer's list, not refused, not in the same-net
+    /// list even with SAMENET — and a checked rule beside it is unaffected.
+    #[test]
+    fn an_adjacent_cuts_rule_with_two_within_values_is_skipped_with_drt_359() {
+        use crate::tech::read::ADJ_TWO_WITHIN;
+        let rules = format!(
+            "{}{}{}",
+            eol("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 0.12 CUTCLASS CA ;"),
+            eol("SPACING 0.07 LAYER M2 CUTCLASS CA CONCAVECORNER ;"),
+            eol("SPACING 0.07 SAMENET ADJACENTCUTS 2 WITHIN 0.05 0.12 CUTCLASS CA ;")
+        );
+        let d = db("adj2w", "", &rules);
+        let (skipped, refused, _) = census(&d);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(skipped.iter().map(|s| (s.family, s.index, s.clause)).collect::<Vec<_>>(), [("lef58_cut_spacing", 0, ADJ_TWO_WITHIN), ("lef58_cut_spacing", 2, ADJ_TWO_WITHIN)]);
+        for s in &skipped {
+            let w = s.warning();
+            assert!(w.contains("two WITHIN values") && w.contains("SKIPPED") && w.contains("#12202"), "{w}");
+            assert_eq!(s.upstream(), Some(super::SKIPPED_ADJ_TWO_WITHIN_UPSTREAM_ISSUE));
+        }
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let v1 = &tech.layers[tech.layer_num("V1").expect("V1")];
+        assert_eq!(v1.lef58_cut_spacing.len(), 1, "only the checked LAYER rule stays");
+        let msg = "Unsupported branch WITHIN with two values in LEF58_SPACING ADJACENTCUTS for layer V1, skipping rule.".to_string();
+        assert_eq!(crate::tech::read::lef58_cut_spacing_skip_warnings(&d, "V1", &v1.cut_classes), [(359, msg.clone()), (359, msg)]);
+        // One WITHIN value: kept and checked, no warning.
+        let d = db("adj1w", "", &eol("SPACING 0.07 ADJACENTCUTS 2 WITHIN 0.1 CUTCLASS CA ;"));
+        let (skipped, refused, _) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let v1 = &tech.layers[tech.layer_num("V1").expect("V1")];
+        assert_eq!(v1.lef58_cut_spacing.len(), 1);
+        assert!(crate::tech::read::lef58_cut_spacing_skip_warnings(&d, "V1", &v1.cut_classes).is_empty());
     }
 
     /// Rule (reference io `setCutLayerProperties`, LAYER branch, and GC

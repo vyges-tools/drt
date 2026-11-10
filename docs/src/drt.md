@@ -129,7 +129,9 @@ CONCAVECORNER`, its plain form, and `SPACING s LAYER l CUTCLASS c NONEOLCONVEXCO
 m]`), and LEF58 cut spacing with adjacent cuts (`SPACING s [CENTERTOCENTER] ADJACENTCUTS n
 [TWOCUTS t] WITHIN w [CUTCLASS c] [NOPRL]`; with `EXACTALIGNED`, `EXCEPTSAMEPGNET`, `TO ALL`,
 `SIDEPARALLELOVERLAP` or `SAMEMASK` the rule is skipped with a warning, as the reference skips
-it; a `SAMENET` rule beside one of these is refused, since the reference then judges only cuts of one
+it; with two `WITHIN` values (`WITHIN w1 w2`) it is skipped with the warning the reference's own
+fix prints, DRT-359, where the unpatched reference keeps only `w1`, upstream OpenROAD issue
+#12202; a `SAMENET` rule beside one of these is refused, since the reference then judges only cuts of one
 net in them, upstream OpenROAD issue #12188; every other LEF58 cut spacing form is refused), and
 `LEF58_AREA` on a routing layer (`AREA a` with `RECTWIDTH w` or `EXCEPTRECTANGLE`: checked, and
 patched on the routed net as the reference patches it; a rule with `EXCEPTMINWIDTH`,

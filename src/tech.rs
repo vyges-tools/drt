@@ -1155,30 +1155,51 @@ pub mod read {
         (same_net && checked).then_some("a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule: OpenROAD issue #12188)")
     }
 
+    /// The clause of an ADJACENTCUTS rule with two WITHIN values, which this engine skips.
+    ///
+    /// ⛔ A DIVERGENCE from the reference by decision (drt divergence register D7). Upstream rule
+    /// (io `setCutLayerProperties`): only the first WITHIN is read, and GC uses it as the upper
+    /// bound, so `WITHIN w1 w2` is checked as `WITHIN w1` (upstream OpenROAD issue #12202). Our
+    /// rule, the reference patched with vyges-openroad-patches upstream-fix 0012: warn (DRT-359,
+    /// [`lef58_cut_spacing_skip_warnings`]) and skip the rule, after the reference's own skips.
+    pub const ADJ_TWO_WITHIN: &str = "ADJACENTCUTS WITHIN with two values";
+
+    /// The patched reference's io warnings (upstream-fix 0012) for the LEF58 cut spacing rules of
+    /// cut layer `layer` it skips for a second WITHIN value ([`ADJ_TWO_WITHIN`]), in rule order.
+    /// ⛔ Divergence D7 (upstream OpenROAD issue #12202): the unpatched reference says nothing and
+    /// checks the rule with the first value only.
+    pub fn lef58_cut_spacing_skip_warnings(db: &Db, layer: &str, classes: &[CutClass]) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_cut_spacing_rules(layer))
+            .filter(|&k| matches!(cut_layer_rule(db, layer, k, classes), Ok(Lef58CutRule::Skipped(c)) if c == ADJ_TWO_WITHIN))
+            .map(|_| (359, format!("Unsupported branch WITHIN with two values in LEF58_SPACING ADJACENTCUTS for layer {layer}, skipping rule.")))
+            .collect()
+    }
+
     /// io's ADJACENTCUTS branch for LEF58 cut spacing rule `k` of cut layer `layer`: EXACTALIGNED,
     /// EXCEPTSAMEPGNET, CUTCLASS … TO ALL, SIDEPARALLELOVERLAP and SAMEMASK, tested in that order,
-    /// skip the rule (io warns and drops it); otherwise io keeps the spacing, CENTERTOCENTER,
-    /// the adjacent-cut count, TWOCUTS, the (first) WITHIN value, the class (none when the rule
-    /// names none) and NOPRL. `Err` names a clause io keeps but this engine does not model:
-    /// SAMENET (the rule would join the same-net list, which changes how the different-net rules
-    /// judge one net), SAMEMETAL or SAMEVIA and TWOCUTS SAMECUT (kept by io, read by no check),
-    /// and a second WITHIN value (io keeps only the first).
+    /// skip the rule (io warns and drops it), then a second WITHIN value ([`ADJ_TWO_WITHIN`]:
+    /// skipped as the reference patched with upstream-fix 0012 skips it, divergence D7);
+    /// otherwise io keeps the spacing, CENTERTOCENTER, the adjacent-cut count, TWOCUTS, the WITHIN
+    /// value, the class (none when the rule names none) and NOPRL. `Err` names a clause io keeps
+    /// but this engine does not model: SAMENET (the rule would join the same-net list, which
+    /// changes how the different-net rules judge one net), SAMEMETAL or SAMEVIA and TWOCUTS
+    /// SAMECUT (kept by io, read by no check).
     pub fn adjacent_cuts_rule(db: &Db, layer: &str, k: usize, classes: &[CutClass]) -> Result<Lef58CutRule, &'static str> {
-        let skipped: [(bool, &'static str); 5] = [
+        let skipped: [(bool, &'static str); 6] = [
             (db.cutspacingrule_is_exact_aligned(layer, k), "ADJACENTCUTS EXACTALIGNED"),
             (db.cutspacingrule_is_except_same_pgnet(layer, k), "ADJACENTCUTS EXCEPTSAMEPGNET"),
             (db.cutspacingrule_is_cut_class_to_all(layer, k), "ADJACENTCUTS CUTCLASS TO ALL"),
             (db.cutspacingrule_is_side_parallel_overlap(layer, k), "ADJACENTCUTS SIDEPARALLELOVERLAP"),
             (db.cutspacingrule_is_same_mask(layer, k), "ADJACENTCUTS SAMEMASK"),
+            (db.cutspacingrule_get_second_within(layer, k) > 0, ADJ_TWO_WITHIN),
         ];
         if let Some((_, clause)) = skipped.iter().find(|(set, _)| *set) {
             return Ok(Lef58CutRule::Skipped(clause));
         }
-        let unmodelled: [(bool, &'static str); 4] = [
+        let unmodelled: [(bool, &'static str); 3] = [
             (db.cutspacingrule_is_same_net(layer, k), "ADJACENTCUTS with SAMENET"),
             (db.cutspacingrule_is_same_metal(layer, k) || db.cutspacingrule_is_same_via(layer, k), "ADJACENTCUTS with SAMEMETAL or SAMEVIA"),
             (db.cutspacingrule_is_same_cut(layer, k), "ADJACENTCUTS TWOCUTS SAMECUT"),
-            (db.cutspacingrule_get_second_within(layer, k) > 0, "ADJACENTCUTS with a second WITHIN value"),
         ];
         if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
             return Err(clause);
