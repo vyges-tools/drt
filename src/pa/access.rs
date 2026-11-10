@@ -31,10 +31,14 @@
 //!   counting one per cluster of same-layer points within half a width, reach the minimum;
 //! - a point's vias are ordered by the most they stick out of the pin, least first (stable).
 //!
-//! Not transcribed (a caller gets [`Unsupported`]): a nearby-track point (it carries path
-//! segments). A nearby-track round that makes no point runs as any other round: a pin with no
-//! shape the earlier rounds can use (one only on a cut layer, or, for an instance's pin, only
-//! above the top routing layer) reaches it and ends with no access point. Taken as absent because the technologies here do not have them: the metal-width via
+//! Not transcribed (a caller gets [`Unsupported`]): a nearby-track point that keeps an access (it
+//! carries path segments, which the router would have to add to the route). The nearby-track
+//! rounds themselves run as any other round, without the path segments: in the reference those
+//! segments are only extra objects in the point's design-rule checks (`isPlanarViolationFree`,
+//! `isViaViolationFree` add them with `addPAObj`), so they can only add markers and take accesses
+//! away; a point that has no access without them has none with them, which is exact. A pin with
+//! no shape the earlier rounds can use, or a stubborn terminal whose avoided via defs leave it no
+//! via, reaches them and ends with no access point there. Taken as absent because the technologies here do not have them: the metal-width via
 //! map, multi-mask layers (refused before this runs), right-way-on-grid-only layers, stubborn
 //! terminals. A rect-only layer is unidirectional: no wrong-way planar access on it and no
 //! wrong-way segment leaving a via onto it.
@@ -204,13 +208,10 @@ pub fn sort_via_defs(pin: &Pin<'_>, ap: &mut AccessPoint, pin_rects: &[Rect]) ->
 }
 
 /// One round: candidates, their filters, the points kept; whether enough are kept now.
-/// Errors on a nearby-track point (not transcribed).
+/// Errors on a nearby-track point that keeps an access (its path segments are not transcribed).
 #[allow(clippy::too_many_arguments)]
 fn gen_pin_access_cost_bounded(pin: &Pin<'_>, sh: &mut Shapes, aps: &mut Vec<AccessPoint>, apset: &mut BTreeSet<((i32, i32), usize)>, lower: ApType, upper: ApType, trace: &mut Trace) -> Result<bool, Unsupported> {
     let cands = round_candidates(pin.cx, &mut sh.sets, pin.kind, pin.cfg.top_routing_layer, lower, upper, apset);
-    if !cands.is_empty() && (lower == ApType::NearbyGrid || upper == ApType::NearbyGrid) {
-        return Err(Unsupported("a nearby-track point"));
-    }
     push(trace, || Event::Round { lower, upper });
     for c in &cands {
         push(trace, || Event::Cand { point: (c.x, c.y), layer: c.layer, lower: c.lower, upper: c.upper });
@@ -222,6 +223,9 @@ fn gen_pin_access_cost_bounded(pin: &Pin<'_>, sh: &mut Shapes, aps: &mut Vec<Acc
     filter_multiple_ap_accesses(pin, sh, &mut new_aps, trace);
     for ap in &new_aps {
         push(trace, || Event::State(ap.clone()));
+    }
+    if nearby_round_keeps_access(lower, upper, &new_aps) {
+        return Err(Unsupported("a nearby-track point with an access"));
     }
     let std_cell = pin.kind == TermKind::StdCell;
     for ap in new_aps {
@@ -236,6 +240,13 @@ fn gen_pin_access_cost_bounded(pin: &Pin<'_>, sh: &mut Shapes, aps: &mut Vec<Acc
     let enough = enough_access_points(pin, aps);
     push(trace, || Event::Enough { enough, kept: aps.len() });
     Ok(enough)
+}
+
+/// A nearby-track round's point with any access after the filters: the only case the missing path
+/// segments could change (they only add design-rule objects, so they can only take an access away),
+/// and the case whose point the router would extend with them (`addApPathSegs`): not modelled.
+fn nearby_round_keeps_access(lower: ApType, upper: ApType, aps: &[AccessPoint]) -> bool {
+    (lower == ApType::NearbyGrid || upper == ApType::NearbyGrid) && aps.iter().any(|a| a.has_any())
 }
 
 fn in_via_in_pin(cfg: &Config, layer: usize) -> bool {
@@ -603,6 +614,25 @@ mod tests {
         let low = Config { top_routing_layer: 2, ..cfg(true) };
         let pin2 = Pin { cfg: &low, ..pin };
         assert_eq!(gen_pin_access(&pin2, &[(4, Rect::new(-2000, -2000, 2000, 2000))], &mut None), Ok(vec![]));
+    }
+
+    /// Rule (nearby-track rounds, `FlexPA::createSingleAccessPoint` / `isPlanarViolationFree` /
+    /// `isViaViolationFree`): a nearby-track point carries path segments that the reference adds
+    /// to its design-rule checks as extra objects (they can only add markers), and that the router
+    /// adds to the route when the point is used. So a nearby round whose points end with no access
+    /// is exact without them, and only a nearby point that keeps an access is refused. Seen on the
+    /// max-spacing re-runs: every nearby point of the stubborn terminals ends with no access (no via
+    /// def left, no planar access), and those terminals then fall back (DRT-355).
+    #[test]
+    fn only_a_nearby_point_that_keeps_an_access_is_refused() {
+        let mut a = ap((0, 0), 2);
+        a.upper = ApType::NearbyGrid;
+        assert!(!nearby_round_keeps_access(ApType::OnGrid, ApType::NearbyGrid, std::slice::from_ref(&a)));
+        a.access[Access::U as usize] = true;
+        assert!(nearby_round_keeps_access(ApType::OnGrid, ApType::NearbyGrid, std::slice::from_ref(&a)));
+        assert!(nearby_round_keeps_access(ApType::NearbyGrid, ApType::OnGrid, std::slice::from_ref(&a)));
+        assert!(!nearby_round_keeps_access(ApType::OnGrid, ApType::EncOpt, std::slice::from_ref(&a)), "not a nearby round");
+        assert!(!nearby_round_keeps_access(ApType::OnGrid, ApType::NearbyGrid, &[]));
     }
 
     /// Rule (`FlexPA::getPriorityViaDefs`, LEF58_MAXSPACING): for a STUBBORN terminal a via def

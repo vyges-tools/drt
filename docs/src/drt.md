@@ -72,9 +72,11 @@ The report is JSON on stdout (`-o FILE` to write it elsewhere):
 
 ### Limits
 
-Refused: a nearby-track round (a pin no other round reaches), and every rule family or layer
+Refused: a nearby-track access point that keeps an access (a pin no other round reaches, whose
+nearby point would need its path to the pin added to the route), and every rule family or layer
 property detailed routing refuses, since the access points are judged by the same design-rule
-check.
+check. The nearby-track rounds themselves run; a point they make that has no access is dropped, as
+the reference drops it.
 Rect-only layers are modelled: unidirectional in access, track assignment and routing, and checked
 with the rect-only and minimum-width rules; so are right-way-on-grid-only layers, which take on-track
 access points only. A multi-patterned routing layer (LEF `MASK` above 1) is routed both ways at
@@ -159,8 +161,9 @@ DRT-356 (the reference stops with DRT-1231, upstream OpenROAD issue #12200). A s
 whose pad leaves a minimum-step violation on a `MINSTEP` layer beside the cut layer has its pad end
 patched out to the `MINSTEP` length in the worker's check, as the reference patches it. Where a re-run terminal has no access point even with every via def, the
 reference itself aborts (DRT-0073); the run is refused at the same point with exit 4, `reason` and
-the report's `reference_aborts` name the error and the issue, and nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not
-model, is refused with exit 3. A cell obstruction with its own `DESIGNRULEWIDTH`
+the report's `reference_aborts` name the error and the issue, and nothing is written. A re-run terminal whose nearby-track access rounds keep a point, which this engine does not
+model, is refused with exit 3; when they keep none, the terminal falls back to every via def as
+above. A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
