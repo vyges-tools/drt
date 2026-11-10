@@ -277,6 +277,10 @@ pub struct EolRule {
     pub end_to_end: Option<i32>,
     pub length: Option<EolLength>,
     pub extension: Option<i32>,
+    /// OPPOSITEWIDTH: the rule applies only when the wire beyond the line end spans less than
+    /// this perpendicular to the line end (`Worker::eol_opposite_wire_span`). ⛔ A DIVERGENCE by
+    /// decision (drt divergence register D13): the reference keeps the value and never reads it.
+    pub opposite_width: Option<i32>,
 }
 
 /// A LEF58 end-of-line rule's `MINLENGTH l [TWOSIDES]` or `MAXLENGTH l [TWOSIDES]`
@@ -1299,9 +1303,9 @@ pub mod read {
     /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH — tested first, as it does) and for a rule
     /// this engine SKIPS with a warning of its own ([`lef58_eol_skipped_clause`]: TOCONCAVECORNER,
     /// TONOTCHLENGTH), `Err(clause)` for a clause outside the modelled subset (SPACING / ENDOFLINE /
-    /// WITHIN, ENDTOEND with its EXTENSION but without OTHERENDWIDTH or cut spaces, PARALLELEDGE
-    /// with only its space, within and TWOEDGES, MINLENGTH / MAXLENGTH with TWOSIDES read as
-    /// written: [`lef58_eol_length`]; SAMEMASK with its WITHIN as written).
+    /// OPPOSITEWIDTH (register D13), WITHIN, ENDTOEND with its EXTENSION but without OTHERENDWIDTH
+    /// or cut spaces, PARALLELEDGE with only its space, within and TWOEDGES, MINLENGTH / MAXLENGTH
+    /// with TWOSIDES read as written: [`lef58_eol_length`]; SAMEMASK with its WITHIN as written).
     ///
     /// ⛔ SAMEMASK is a DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue
     /// #12182, vyges-openroad-patches upstream-fix 0002). Upstream rule:
@@ -1316,10 +1320,9 @@ pub mod read {
         if lef58_eol_dropped_by_reference(db, layer, k) || lef58_eol_skipped_clause(db, layer, k).is_some() {
             return Ok(None);
         }
-        let unmodelled: [(bool, &'static str); 17] = [
+        let unmodelled: [(bool, &'static str); 16] = [
             (db.spacingeolrule_is_exact_width_valid(layer, k), "EXACTWIDTH"),
             (db.spacingeolrule_is_wrong_dir_spacing_valid(layer, k), "WRONGDIRSPACING"),
-            (db.spacingeolrule_is_opposite_width_valid(layer, k), "OPPOSITEWIDTH"),
             (db.spacingeolrule_is_end_prl_spacing_valid(layer, k), "ENDPRLSPACING"),
             (db.spacingeolrule_is_wrong_dir_within_valid(layer, k), "WRONGDIRWITHIN"),
             (db.spacingeolrule_is_other_end_width_valid(layer, k), "ENDTOEND OTHERENDWIDTH"),
@@ -1356,6 +1359,10 @@ pub mod read {
             extension: (db.spacingeolrule_is_end_to_end_valid(layer, k)
                 && db.spacingeolrule_is_extension_valid(layer, k))
             .then(|| db.spacingeolrule_get_extension(layer, k)),
+            // Read as the LEF defines it, where the reference reads nothing (register D13).
+            opposite_width: db
+                .spacingeolrule_is_opposite_width_valid(layer, k)
+                .then(|| db.spacingeolrule_get_opposite_width(layer, k)),
         }))
     }
 
@@ -1429,7 +1436,7 @@ pub mod read {
                     let eol = db
                         .layer_v54_eol_rules(&name)?
                         .into_iter()
-                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None, length: None, extension: None })
+                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None, length: None, extension: None, opposite_width: None })
                         .collect();
                     let corner_spacing: Vec<CornerSpacing> = (0..db.num_layer_get_tech_layer_corner_spacing_rules(&name)).filter_map(|k| corner_spacing_rule(db, &name, k).ok()).collect();
                     let lef58_eol: Vec<EolRule> = (0..db.num_layer_get_tech_layer_spacing_eol_rules(&name)).filter_map(|k| lef58_eol_rule(db, &name, k).ok().flatten()).collect();

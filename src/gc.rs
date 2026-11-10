@@ -1800,6 +1800,9 @@ impl<'a> Worker<'a> {
         if !opposite {
             return;
         }
+        if r.opposite_width.is_some_and(|w| self.eol_opposite_wire_span(layer, &ptr) >= w) {
+            return;
+        }
         let trig = parallel_edge_rect(&ptr);
         if overlap(q, &trig).is_none() {
             return;
@@ -1816,6 +1819,38 @@ impl<'a> Worker<'a> {
             return;
         }
         self.eol_has_eol_helper(layer, &e, &ptr, rule);
+    }
+
+    /// OPPOSITEWIDTH's span of the wire beyond a line end, seen from its facing edge `ptr`: the
+    /// largest extent, perpendicular to `ptr`, of a maximal rectangle of `ptr`'s polygon that has a
+    /// side on `ptr`'s line overlapping `ptr` with positive length. The rule applies only when this
+    /// is below OPPOSITEWIDTH (LEF definition). ⛔ DIVERGENCE by decision (drt divergence register
+    /// D13): the reference stores OPPOSITEWIDTH and never reads it; vyges-openroad-patches
+    /// upstream-fix 0015 adds the same test (`getOppositeWireSpan`) to the reference.
+    fn eol_opposite_wire_span(&self, layer: usize, ptr: &Seg) -> i32 {
+        let b = seg_box(ptr);
+        let horizontal = ptr.from.1 == ptr.to.1;
+        let mut span = 0;
+        for s in self.query(layer, &b) {
+            let sh = &self.shapes[layer][s];
+            if sh.net != ptr.net || sh.pin as usize != ptr.pin {
+                continue;
+            }
+            let r = sh.rect;
+            let (at, (lo, hi), (alo, ahi), (elo, ehi)) = if horizontal {
+                (b.yl, (r.yl, r.yh), (r.xl, r.xh), (b.xl, b.xh))
+            } else {
+                (b.xl, (r.xl, r.xh), (r.yl, r.yh), (b.yl, b.yh))
+            };
+            if lo != at && hi != at {
+                continue;
+            }
+            if ahi.min(ehi) - alo.max(elo) <= 0 {
+                continue;
+            }
+            span = span.max(hi - lo);
+        }
+        span
     }
 
     /// `checkMetalEndOfLine_eol_hasEol_endToEndHelper` (LEF58 rules only): the two edges as
@@ -4220,7 +4255,7 @@ mod eol_tests {
     }
 
     fn rule() -> EolRule {
-        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None, length: None, extension: None }
+        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None, length: None, extension: None, opposite_width: None }
     }
 
     fn net(n: &str) -> Owner {
@@ -4326,6 +4361,31 @@ mod eol_tests {
         let mut v: Vec<Rect> = w.run().iter().filter(|m| m.rule == Rule::Lef58SpacingEndOfLine).map(|m| m.bbox).collect();
         v.dedup();
         v
+    }
+
+    // Rule (LEF/DEF reference, LEF58_SPACING ENDOFLINE ... OPPOSITEWIDTH ow): the rule applies only
+    // if the wire beyond the line end spans LESS than ow perpendicular to the line end. Span: the
+    // largest extent, perpendicular to the facing edge, of a maximal rectangle of the facing
+    // polygon with a side on the facing edge's line overlapping it. ⛔ DIVERGENCE (register D13):
+    // the reference (pin 4155ac31) never reads OPPOSITEWIDTH; upstream-fix 0015 applies this test.
+    #[test]
+    fn an_opposite_width_exempts_a_line_end_facing_a_wire_at_least_that_wide() {
+        let ow = |w| EolRule { opposite_width: Some(w), ..rule() };
+        // BLOCK faces a's line end 150 away (inside 200) and spans 350.
+        assert_eq!(lef58(rule(), &[("a", WIRE, false), ("b", BLOCK, true)]), vec![GAP], "no clause");
+        assert_eq!(lef58(ow(400), &[("a", WIRE, false), ("b", BLOCK, true)]), vec![GAP], "350 < 400");
+        assert!(lef58(ow(350), &[("a", WIRE, false), ("b", BLOCK, true)]).is_empty(), "350 = 350: exempt");
+        assert!(lef58(ow(300), &[("a", WIRE, false), ("b", BLOCK, true)]).is_empty(), "350 > 300: exempt");
+        // A bar 100 wide with an arm along its top: the arm's maximal rectangle reaches the facing
+        // edge's line, so the wire spans 1850.
+        let bar = Rect::new(1150, -500, 1250, 500);
+        let arm = Rect::new(1250, 400, 3000, 500);
+        let ell = [("a", WIRE, false), ("b", bar, true), ("b", arm, true)];
+        assert!(lef58(ow(400), &ell).is_empty(), "the arm's rectangle spans 1850");
+        assert_eq!(lef58(ow(2000), &ell), vec![GAP], "1850 < 2000");
+        // Another polygon behind the bar does not widen it: the bar alone spans 100.
+        let behind = [("a", WIRE, false), ("b", bar, true), ("b", Rect::new(1300, -500, 3000, 500), true)];
+        assert_eq!(lef58(ow(400), &behind), vec![GAP], "100 < 400, the other polygon not counted");
     }
 
     // Rule (`checkMetalEndOfLine_eol_hasEol_getQueryBox` / `_endToEndHelper`, asap7's

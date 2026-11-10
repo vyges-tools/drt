@@ -852,6 +852,20 @@ mod skipped_rule_tests {
         assert_eq!((r.end_to_end, r.extension), (Some(80), Some(10)));
     }
 
+    /// Rule (LEF/DEF reference, LEF58_SPACING ENDOFLINE ... OPPOSITEWIDTH ow WITHIN ...): the rule
+    /// applies only when the wire beyond the line end spans less than ow. ⛔ DIVERGENCE (register
+    /// D13): the reference's io stores ow (`setOppositeWidth`) and nothing reads it; we keep it and
+    /// check it (upstream-fix 0015), so the rule is checked, neither refused nor skipped.
+    #[test]
+    fn an_opposite_width_is_modelled() {
+        let d = db("ow", &eol("SPACING 0.09 ENDOFLINE 0.07 OPPOSITEWIDTH 0.03 WITHIN 0.025 ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty(), "{skipped:?} {refused:?}");
+        assert_eq!(enforced, 1);
+        let r = crate::tech::read::lef58_eol_rule(&d, "M1", 0).expect("modelled").expect("kept");
+        assert_eq!((r.opposite_width, r.within), (Some(30), 25));
+    }
+
     /// The control: the same rule written as a plain end-of-line rule is checked, not skipped.
     #[test]
     fn a_plain_end_of_line_rule_is_checked_not_skipped() {
