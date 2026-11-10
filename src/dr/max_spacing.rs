@@ -546,6 +546,23 @@ fn add_avoid_via_defs_pa(tech: &Tech, l: usize, rule: &MaxSpacingRule, block_via
     }
 }
 
+/// The routing layers where the via-swap workers' check would patch a lonely via for minimum step,
+/// which this router does not model: a layer with a MINSTEP rule next to a cut layer that keeps a
+/// LEF58_MAXSPACING rule. Reference: the GC runs `patchMetalShape` on every surgical check when the
+/// technology has any minimum-step rule (`addUConstraint` sets `hasCornerSpacingConstraint_` for
+/// MINSTEP and LEF58 MINSTEP); `patchMetalShape_minStep` then acts on a minimum-step marker of a
+/// layer with a via-to-via minimum-step violation (refused before routing on its own) or next to a
+/// cut layer with a LEF58_MAXSPACING constraint, and on the second only for a lonely via in a
+/// VIASWAP worker, bloating the marker to the layer's MINSTEP length. Whether a swapped secondary
+/// leaves such a marker depends on the routed geometry, so the layer is refused as a whole.
+pub fn min_step_swap_layers(tech: &Tech) -> Vec<usize> {
+    let max_spacing_at = |l: Option<usize>| l.and_then(|l| tech.layers.get(l)).is_some_and(|c| c.kind == LayerKind::Cut && !c.lef58_max_spacing.is_empty());
+    (0..tech.layers.len())
+        .filter(|&l| tech.layers[l].kind == LayerKind::Routing && tech.layers[l].min_step.is_some())
+        .filter(|&l| max_spacing_at(l.checked_sub(1)) || max_spacing_at(Some(l + 1)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,6 +607,23 @@ mod tests {
         // "c": lower width 8 (its box is 8 x 10) beats 10; "z" is the default.
         assert_eq!(names, ["z", "c", "a", "b"]);
         assert_eq!(union_area(&[Rect { xl: 0, yl: 0, xh: 10, yh: 10 }, Rect { xl: 5, yl: 0, xh: 15, yh: 10 }]), 150);
+    }
+
+    /// Rule (`FlexGCWorker::Impl::patchMetalShape_minStep`, its VIASWAP branch): a lonely via is
+    /// patched for minimum step only on a layer with a MINSTEP rule beside a cut layer that keeps a
+    /// LEF58_MAXSPACING rule. Not modelled, so such a layer is named for refusal; a MINSTEP layer
+    /// with no max-spacing cut beside it, or a max-spacing cut with no MINSTEP beside it, is not.
+    #[test]
+    fn a_min_step_layer_beside_a_max_spacing_cut_is_named_for_refusal() {
+        let (mut t, _) = tech_with_rule();
+        assert!(min_step_swap_layers(&t).is_empty(), "no MINSTEP anywhere");
+        let ms = crate::tech::MinStep { min_step_length: 50, kind: None, max_length: -1, max_edges: -1 };
+        t.layers[2].min_step = Some(ms);
+        assert_eq!(min_step_swap_layers(&t), [2], "m2 has MINSTEP and v1 below it keeps the rule");
+        t.layers[0].min_step = Some(ms);
+        assert_eq!(min_step_swap_layers(&t), [0, 2], "m1, below v1, too");
+        t.layers[1].lef58_max_spacing.clear();
+        assert!(min_step_swap_layers(&t).is_empty(), "MINSTEP but no max-spacing cut beside it");
     }
 
     fn tech_with_rule() -> (Tech, Vec<Option<usize>>) {

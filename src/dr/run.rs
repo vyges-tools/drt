@@ -105,6 +105,12 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
         if !flagged.is_empty() {
             return Err(format!("rule families not modelled: {}: via-to-via min step patching (patchMetalShape_minStep)", flagged.join(", ")));
         }
+        // The via-swap workers' check would patch a swapped lonely via for minimum step on these
+        // layers (not modelled; `max_spacing::min_step_swap_layers`).
+        let swap: Vec<&str> = crate::dr::max_spacing::min_step_swap_layers(&p.tech).into_iter().map(|l| p.tech.layers[l].name.as_str()).collect();
+        if !swap.is_empty() {
+            return Err(format!("rule families not modelled: {}: min step patching of a lonely via in the LEF58_MAXSPACING via-swap workers (patchMetalShape_minStep)", swap.join(", ")));
+        }
     }
     let t = ta(&d, &g, &p, log);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);

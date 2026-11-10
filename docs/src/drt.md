@@ -154,7 +154,8 @@ tried, which leaves markers for a via that is in neither the route nor the desig
 issue #12203); and a worker
 that holds none of a re-run terminal's new access points leaves that terminal out with warning
 DRT-356 (the reference stops with DRT-1231, upstream OpenROAD issue #12200). Minimum-step patching
-of a swapped via is not modelled yet. Where the re-run leaves a terminal with no access point, the
+of a swapped via is not modelled yet, so a routing layer with a `MINSTEP` rule beside a cut layer
+with such a rule is refused before routing. Where the re-run leaves a terminal with no access point, the
 reference itself aborts (DRT-0073, upstream OpenROAD issue #12199); the run is refused at the same
 point with exit 4, `reason` and the report's `reference_aborts` name the error and the issue, and
 nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not
@@ -164,7 +165,7 @@ kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
 report's `reason`), among them LEF58 minimum step, `SPACINGTABLE INFLUENCE` and a
 metal-width via map; corner spacing in a design with a block master; a layer whose via pads break
-its minimum step; a non-default rule with hard spacing, via
+its minimum step; a `MINSTEP` layer beside a cut layer with a `LEF58_MAXSPACING` rule; a non-default rule with hard spacing, via
 generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
 the database; and congested input guides. Past iteration 7 the router widens the clip of
 congested workers, and from iteration 23 rips up the nets near each marker (NEARDRC); both follow
