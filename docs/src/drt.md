@@ -140,9 +140,11 @@ boxes the reference gives them (each box's top taken from the cut's right edge, 
 issue #12198), which the router reads when it picks the nets to rip up). LEF58 max spacing (`LEF58_MAXSPACING max CUTCLASS c`) runs the router's repair pass as the reference
 runs it, after an iteration that ends with no marker: its secondary via defs and its search for
 vias of the class with no other cut within `max`; a rule with no `CUTCLASS` is skipped with the
-reference's warning (DRT-350). The pass's repair (markers, the pin-access re-run for the terminals
-of such vias, the via-swap workers) is not modelled: a run in which the search finds such a via is
-refused at that point (`reason` names `lef58_max_spacing` and the count), and nothing is written. A cell obstruction with its own `DESIGNRULEWIDTH`
+reference's warning (DRT-350). Then, per such via, its marker, the three-by-three-gcell region
+around it and the pin terminals it lands on, and the regions' merge, as the reference does them.
+The rest of the repair (the pin-access re-run for those terminals, the via-swap workers) is not
+modelled: a run that reaches it is refused there (`reason` names `lef58_max_spacing`, the stage and
+its counts), and nothing is written. A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the

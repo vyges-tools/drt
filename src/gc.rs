@@ -137,6 +137,10 @@ pub enum Rule {
     /// the polygon holds the owner's route shapes (`checkMetalShape_offGrid`; every routing layer
     /// carries the rule, `frOffGridConstraint`).
     OffGrid,
+    /// A via with no other cut within its class's LEF58_MAXSPACING (`FlexDR::fixMaxSpacing`, not
+    /// the check: the pass marks each lonely via over its three-layer box, on the cut layer, the
+    /// via's net as source, victim and aggressor).
+    Lef58MaxSpacing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

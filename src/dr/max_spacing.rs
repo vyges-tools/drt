@@ -7,19 +7,24 @@
 //! `max` of it. The reference finds the vias that have none (`getLonelyVias`), marks them, and
 //! re-routes a region around each with a via-swap worker that tries the layer's SECONDARY via
 //! defs (`initSecondaryVias`: the vias of another class). Ported so far: the sequencer, the
-//! secondary via defs, the lonely-via search, and the pin-access avoid list. ⛔ Not ported: the
-//! stages after the lonely-via search (markers, stubborn terminals and the pin-access re-run, the
-//! region workers' via swap, minimum-step patching). A run that reaches them — a lonely via found
-//! — is REFUSED there, before anything is written; a run that finds no lonely via routes as the
-//! reference does (the pass changes nothing).
+//! secondary via defs, the lonely-via search, the pin-access avoid list, and per lonely via its
+//! marker, its region and the pin terminals it marks stubborn; the regions' merge. ⛔ Not ported:
+//! the pin-access re-run for stubborn terminals (`updateDirtyPAData`), the region workers' via
+//! swap, minimum-step patching. A run that reaches one is REFUSED there, before anything is
+//! written; a run that finds no lonely via routes as the reference does (the pass changes
+//! nothing).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dr::cost::DrFig;
 use crate::dr::design::{stored_box, DesignRoutes};
 use crate::dr::log::{Line, Sink};
+use crate::dr::guides::GCellGrid;
 use crate::dr::ta::Fixed;
+use crate::gc::{Marker, Owner, Rule};
+use crate::order::libcxx_sort_by;
 use crate::polygon90::Rect;
+use crate::rtree::PackedRTree;
 use crate::tech::{Dir, LayerKind, MaxSpacingRule, Tech, ViaDef};
 
 /// A via the design defines (DEF VIAS): io adds it to its cut layer's via defs as it does a
@@ -46,44 +51,198 @@ pub struct MaxSpacingState {
     pub generated: Vec<ViaDef>,
     /// The via defs pin access avoids for a stubborn terminal (`addAvoidViaDefPA`), by name.
     pub avoid_via_defs_pa: BTreeSet<String>,
+    /// The instance terminals marked stubborn (`frInstTerm::setStubborn`), as (instance, terminal).
+    pub stubborn: BTreeSet<(usize, usize)>,
+    /// The instances whose pin access is to be re-run (`FlexPA::dirty_insts_`, ordered by id).
+    pub dirty_insts: BTreeSet<usize>,
+    /// ⛔ MEASUREMENT ONLY: log the pass's steps as the correlation instrument prints the
+    /// reference's (`VYC MAXSPC MARK/STUB/MERGED`), as lines of this engine's own.
+    pub trace: bool,
 }
 
-/// `FlexDR::fixMaxSpacing`, as far as it is ported: the sequence only. `defaults` is each cut
-/// layer's default via (`frLayer::getDefaultViaDef`). Err: a stage that is not ported was reached.
-#[allow(clippy::too_many_arguments)]
-pub fn fix_max_spacing(tech: &Tech, defaults: &[Option<usize>], block_vias: &[BlockVia], fixed: &[Vec<(Rect, Fixed)>], routes: &DesignRoutes, state: &mut MaxSpacingState, log: Sink) -> Result<(), String> {
+/// What the pass reads of the design besides its routes.
+pub struct PassIn<'a> {
+    pub tech: &'a Tech,
+    /// Each cut layer's default via (`frLayer::getDefaultViaDef`).
+    pub defaults: &'a [Option<usize>],
+    pub block_vias: &'a [BlockVia],
+    /// The design's shapes per layer, in the region query's order, and their packed trees.
+    pub fixed: &'a [Vec<(Rect, Fixed)>],
+    pub fixed_trees: &'a [PackedRTree<Fixed>],
+    pub grid: &'a GCellGrid,
+    /// A net's name; an instance terminal's instance and terminal names.
+    pub net_name: &'a dyn Fn(usize) -> String,
+    pub inst_term_name: &'a dyn Fn(usize, usize) -> (String, String),
+}
+
+/// `FlexDR::fixMaxSpacing`, as far as it is ported: the sequence only, each stage named after the
+/// reference's step. Err: a stage that is not ported was reached (nothing is written).
+pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut MaxSpacingState, log: Sink) -> Result<(), String> {
     log(Line::Info(227, "Checking For LEF58_MAXSPACING violations".into()));
-    init_secondary_vias(tech, defaults, block_vias, state)?;
+    init_secondary_vias(p.tech, p.defaults, p.block_vias, state)?;
     let mut lonely_vias = Vec::new();
-    for (l, layer) in tech.layers.iter().enumerate() {
+    for (l, layer) in p.tech.layers.iter().enumerate() {
         if layer.kind != LayerKind::Cut || layer.lef58_max_spacing.is_empty() {
             continue;
         }
         for rule in &layer.lef58_max_spacing {
-            lonely_vias.extend(get_lonely_vias(tech, l, rule, state, fixed, routes));
-            add_avoid_via_defs_pa(tech, l, rule, block_vias, state);
+            lonely_vias.extend(get_lonely_vias(p.tech, l, rule, state, p.fixed, routes));
+            add_avoid_via_defs_pa(p.tech, l, rule, p.block_vias, state);
         }
     }
-    if !lonely_vias.is_empty() {
-        return Err(lonely_vias_refusal(tech, routes, &lonely_vias));
+    let mut regions = Vec::with_capacity(lonely_vias.len());
+    for &k in &lonely_vias {
+        let via = lonely_via(p, routes, k);
+        add_lonely_via_marker(p, routes, &via);
+        regions.push(lonely_via_region(p.grid, via.origin));
+        let stubborn = if via.bottom_connected || via.top_connected { connected_inst_terms(p, &via) } else { Vec::new() };
+        if state.trace {
+            trace_mark(p, &via, regions[regions.len() - 1], log);
+        }
+        for &(inst, term) in &stubborn {
+            if state.trace {
+                let (i, t) = (p.inst_term_name)(inst, term);
+                log(Line::OwnInfo(format!("VYC MAXSPC STUB inst={i} term={t}")));
+            }
+            state.stubborn.insert((inst, term));
+            state.dirty_insts.insert(inst);
+        }
     }
-    Ok(())
+    update_dirty_pa_data(state)?;
+    let merged = merge_regions(regions)?;
+    if state.trace {
+        for r in &merged {
+            log(Line::OwnInfo(format!("VYC MAXSPC MERGED ({},{},{},{})", r.xl, r.yl, r.xh, r.yh)));
+        }
+    }
+    via_swap_workers(&merged, lonely_vias.len())
 }
 
-/// The refusal for a run whose pass found lonely vias: the repair stages are not ported.
-fn lonely_vias_refusal(tech: &Tech, routes: &DesignRoutes, lonely: &[usize]) -> String {
-    let mut per_layer: BTreeMap<usize, usize> = BTreeMap::new();
-    for &k in lonely {
-        if let Some(s) = &routes.shapes[k] {
-            *per_layer.entry(stored_box(tech, &s.fig).0).or_default() += 1;
+/// A lonely via as the pass reads it: its net, def, origin, the box over its three layers, and
+/// which of its ends lands on a pin's access point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LonelyVia {
+    pub net: usize,
+    pub via: usize,
+    pub origin: (i32, i32),
+    pub bbox: Rect,
+    pub bottom_connected: bool,
+    pub top_connected: bool,
+}
+
+fn lonely_via(p: &PassIn<'_>, routes: &DesignRoutes, k: usize) -> LonelyVia {
+    let s = routes.shapes[k].as_ref().expect("a lonely via is a live shape");
+    let DrFig::Via { via, origin, bottom_connected, top_connected, .. } = s.fig else { unreachable!("a lonely via is a via") };
+    LonelyVia { net: s.net, via, origin, bbox: stored_box(p.tech, &s.fig).1, bottom_connected, top_connected }
+}
+
+/// The marker for a lonely via (`frMarker`): over the via's box (`frVia::getBBox`, its three
+/// layers), on its cut layer, under the layer's FIRST max-spacing rule (`.at(0)`, whatever rule
+/// found it), the via's net as source, victim and aggressor (layer, box, not fixed); added to the
+/// region query and the design's list.
+pub fn add_lonely_via_marker(p: &PassIn<'_>, routes: &mut DesignRoutes, via: &LonelyVia) {
+    let layer = p.tech.via_defs[via.via].cut;
+    let owner = Owner::Net((p.net_name)(via.net));
+    let side = Some((owner.clone(), layer, via.bbox, false));
+    routes.add_marker(Marker { rule: Rule::Lef58MaxSpacing, layer, bbox: via.bbox, owners: vec![owner], victim: side.clone(), aggressor: side, second_victim: None });
+}
+
+/// The region a worker re-routes around a lonely via: three by three gcells centred on the gcell
+/// of the via's ORIGIN (`getGCellIdx`, not its box's centre), from the low corner of the gcell
+/// below-left to the high corner of the one above-right, each clamped into the grid as
+/// `getGCellBox` clamps it (an edge gcell reaches the die).
+pub fn lonely_via_region(grid: &GCellGrid, origin: (i32, i32)) -> Rect {
+    let (x, y) = grid.idx(origin);
+    let (lo, hi) = (grid.gcell_box((x - 1, y - 1)), grid.gcell_box((x + 1, y + 1)));
+    Rect { xl: lo.xl, yl: lo.yl, xh: hi.xh, yh: hi.yh }
+}
+
+/// The instance terminals a connected lonely via lands on: the design's shapes on the layer of
+/// the connected end (the TOP one when both are, as the reference's `isTopConnected() ? … : …`
+/// picks), touching that end's box (`getLayer2BBox` / `getLayer1BBox`, inclusive), that are an
+/// instance terminal of the via's net — once PER PIN SHAPE, in the query's order (a terminal
+/// with two shapes under the via is marked twice, as the reference marks it).
+pub fn connected_inst_terms(p: &PassIn<'_>, via: &LonelyVia) -> Vec<(usize, usize)> {
+    let vd = &p.tech.via_defs[via.via];
+    let (layer, figs) = if via.top_connected { (vd.layer2, &vd.layer2_figs) } else { (vd.layer1, &vd.layer1_figs) };
+    let b = bbox(figs);
+    let q = Rect { xl: b.xl + via.origin.0, yl: b.yl + via.origin.1, xh: b.xh + via.origin.0, yh: b.yh + via.origin.1 };
+    p.fixed_trees.get(layer).map_or(Vec::new(), |tr| {
+        tr.query(&q)
+            .into_iter()
+            .filter_map(|(_, f)| match *f {
+                Fixed::InstTerm { net: Some(n), inst, term } if n == via.net => Some((inst, term)),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+fn trace_mark(p: &PassIn<'_>, via: &LonelyVia, region: Rect, log: Sink) {
+    let (b, o) = (via.bbox, via.origin);
+    let g = p.grid.idx(o);
+    log(Line::OwnInfo(format!(
+        "VYC MAXSPC MARK net={} def={} box=({},{},{},{}) origin=({},{}) gcell=({},{}) region=({},{},{},{}) top={} bot={}",
+        (p.net_name)(via.net),
+        p.tech.via_defs[via.via].name,
+        b.xl,
+        b.yl,
+        b.xh,
+        b.yh,
+        o.0,
+        o.1,
+        g.0,
+        g.1,
+        region.xl,
+        region.yl,
+        region.xh,
+        region.yh,
+        u8::from(via.top_connected),
+        u8::from(via.bottom_connected)
+    )));
+}
+
+/// `TritonRoute::updateDirtyPAData`: pin access re-run for the instances whose terminals the pass
+/// marked stubborn. With none it does nothing (`FlexPA::updateDirtyInsts` over an empty set).
+/// ⛔ Not ported: with any, the run is refused here.
+fn update_dirty_pa_data(state: &MaxSpacingState) -> Result<(), String> {
+    if state.dirty_insts.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "lef58_max_spacing: lonely vias land on {} pin(s) of {} instance(s); re-running pin access for them (TritonRoute::updateDirtyPAData, after the lonely-via markers) is not modelled",
+        state.stubborn.len(),
+        state.dirty_insts.len()
+    ))
+}
+
+/// The regions merged: sorted by left edge with libc++'s `std::sort` (not stable: past 24 regions
+/// two with the same left edge can swap), then each in turn absorbed by the FIRST merged region it
+/// meets (`odb::Rect::intersects`: touching counts) or kept as a new one. A single pass: a region
+/// grown by a merge is not re-merged with the ones before it. Err: the sort reached its heap
+/// fallback (not transcribed).
+pub fn merge_regions(mut regions: Vec<Rect>) -> Result<Vec<Rect>, String> {
+    libcxx_sort_by(&mut regions, |a, b| a.xl < b.xl).map_err(|_| "lef58_max_spacing: the region sort reached libc++'s heap-sort fallback, which is not transcribed".to_string())?;
+    let mut merged: Vec<Rect> = Vec::new();
+    for r in regions {
+        match merged.iter_mut().find(|m| r.xl <= m.xh && m.xl <= r.xh && r.yl <= m.yh && m.yl <= r.yh) {
+            Some(m) => *m = Rect { xl: m.xl.min(r.xl), yl: m.yl.min(r.yl), xh: m.xh.max(r.xh), yh: m.yh.max(r.yh) },
+            None => merged.push(r),
         }
     }
-    let layers: Vec<String> = per_layer.iter().map(|(&l, n)| format!("{} {n}", tech.layers[l].name)).collect();
-    format!(
-        "lef58_max_spacing: {} via(s) have no other cut within the rule's MAXSPACING ({}); repairing them (the via swap after the lonely-via search) is not modelled",
-        lonely.len(),
-        layers.join(", ")
-    )
+    Ok(merged)
+}
+
+/// The via-swap workers, one per merged region (`RipUpMode::VIASWAP`). ⛔ Not ported: reached
+/// with any region, the run is refused here.
+fn via_swap_workers(merged: &[Rect], lonely: usize) -> Result<(), String> {
+    if merged.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "lef58_max_spacing: {lonely} via(s) have no other cut within the rule's MAXSPACING; the via-swap workers that repair them ({} region(s)) are not modelled",
+        merged.len()
+    ))
 }
 
 /// `io::Parser::initSecondaryVias`: on every cut layer with a default via and a LEF58_MAXSPACING
@@ -437,5 +596,117 @@ mod tests {
         let mut got = get_lonely_vias(&t, 1, &rule, &st, &no_fixed, &routes);
         got.sort_unstable();
         assert_eq!(got, [0, 4]);
+    }
+
+    fn grid() -> GCellGrid {
+        // 10 x 10 gcells of 100 from 0; the die a little wider than the grid.
+        GCellGrid { x: (0, 10, 100), y: (0, 10, 100), die: Rect { xl: -5, yl: -5, xh: 1010, yh: 1010 } }
+    }
+
+    /// Rule (`FlexDR::fixMaxSpacing`, the region): three by three gcells around the gcell of the
+    /// via's ORIGIN (`getGCellIdx`), corners from `getGCellBox` of the gcells below-left and
+    /// above-right, each clamped into the grid — an edge gcell reaches the die.
+    #[test]
+    fn a_region_is_three_by_three_gcells_around_the_origin_clamped_to_the_die() {
+        let g = grid();
+        assert_eq!(lonely_via_region(&g, (450, 450)), Rect { xl: 300, yl: 300, xh: 600, yh: 600 });
+        // On a gcell line the origin belongs to the gcell above it.
+        assert_eq!(lonely_via_region(&g, (500, 500)), Rect { xl: 400, yl: 400, xh: 700, yh: 700 });
+        // At the edges: gcell (0, 9); the one below-left clamps to (0, 8), whose low x is the die's.
+        assert_eq!(lonely_via_region(&g, (10, 990)), Rect { xl: -5, yl: 800, xh: 200, yh: 1010 });
+    }
+
+    /// Rule (`FlexDR::fixMaxSpacing`, the merge): sorted by left edge, each region joins the FIRST
+    /// merged region it meets (touching counts, `odb::Rect::intersects`), else starts one; one pass
+    /// only, so a region grown by a later merge is not re-merged with an earlier one.
+    #[test]
+    fn regions_merge_into_the_first_they_touch_in_one_pass() {
+        let r = |xl, yl, xh, yh| Rect { xl, yl, xh, yh };
+        // Sorted by left edge: (0..200), (100..150), (300..500), (500..600). The second touches
+        // the first along y 100; the fourth touches the third along x 500 and y 50.
+        let got = merge_regions(vec![r(300, 0, 500, 50), r(0, 0, 200, 100), r(500, 50, 600, 60), r(100, 100, 150, 200)]).expect("small");
+        assert_eq!(got, [r(0, 0, 200, 200), r(300, 0, 600, 60)]);
+        // First match, one pass: a and b (same left edge, input order) stay apart; c joins a; d
+        // meets both a and b and joins a, the first; a grown over b is not merged with it.
+        let got = merge_regions(vec![r(0, 0, 10, 10), r(0, 100, 10, 110), r(5, 5, 20, 8), r(8, 9, 30, 105)]).expect("small");
+        assert_eq!(got, [r(0, 0, 30, 105), r(0, 100, 10, 110)]);
+    }
+
+    /// Rule (libc++ `std::sort` in `fixMaxSpacing`): past 24 regions, regions with the same left
+    /// edge come out in libc++'s order, not their input order; it is the order the merged list
+    /// keeps. The permutation is the reference's libc++'s (see `order`).
+    #[test]
+    fn the_region_sort_is_libcxx_not_stable() {
+        let regions: Vec<Rect> = (0..30).map(|i: i32| Rect { xl: (i * 7 % 4) * 1000, yl: i * 100, xh: (i * 7 % 4) * 1000 + 10, yh: i * 100 + 10 }).collect();
+        let got = merge_regions(regions).expect("no heap fallback");
+        let order: Vec<i32> = got.iter().map(|r| r.yl / 100).collect();
+        assert_eq!(order, [8, 28, 24, 20, 4, 16, 0, 12, 15, 11, 7, 19, 3, 23, 27, 10, 14, 6, 18, 22, 2, 26, 9, 13, 5, 17, 21, 25, 1, 29]);
+    }
+
+    fn pass_in<'a>(t: &'a Tech, defaults: &'a [Option<usize>], fixed: &'a [Vec<(Rect, Fixed)>], trees: &'a [PackedRTree<Fixed>], g: &'a GCellGrid) -> PassIn<'a> {
+        PassIn { tech: t, defaults, block_vias: &[], fixed, fixed_trees: trees, grid: g, net_name: &|n| format!("n{n}"), inst_term_name: &|i, t| (format!("i{i}"), format!("t{t}")) }
+    }
+
+    /// Rule (`FlexDR::fixMaxSpacing`, stubborn terminals): the design's shapes on the layer of the
+    /// connected end — the TOP when the via says top-connected — touching that end's box, that are
+    /// an instance terminal of the via's own net, once per pin shape in the query's order.
+    #[test]
+    fn a_connected_via_marks_its_own_nets_terminals_once_per_pin_shape() {
+        let (t, defaults) = tech_with_rule();
+        let g = grid();
+        let pin = |xl, xh| Rect { xl, yl: -10, xh, yh: 10 };
+        let fixed = vec![
+            vec![(pin(-30, -15), Fixed::InstTerm { net: Some(0), inst: 1, term: 2 }), (pin(15, 30), Fixed::InstTerm { net: Some(0), inst: 1, term: 2 }), (pin(0, 5), Fixed::InstTerm { net: Some(9), inst: 3, term: 0 }), (pin(0, 5), Fixed::BTerm { net: Some(0), port: 0 })],
+            Vec::new(),
+            vec![(pin(0, 5), Fixed::InstTerm { net: Some(0), inst: 7, term: 1 })],
+        ];
+        let trees: Vec<PackedRTree<Fixed>> = fixed.iter().map(|v| PackedRTree::new(v.clone())).collect();
+        let p = pass_in(&t, &defaults, &fixed, &trees, &g);
+        let v = LonelyVia { net: 0, via: 0, origin: (0, 0), bbox: Rect { xl: -20, yl: -20, xh: 20, yh: 20 }, bottom_connected: true, top_connected: false };
+        let mut got = connected_inst_terms(&p, &v);
+        got.sort_unstable();
+        // Both shapes of (1, 2) touch the enclosure (-20..20); the other net's and the block pin's do not count.
+        assert_eq!(got, [(1, 2), (1, 2)]);
+        let top = LonelyVia { top_connected: true, ..v };
+        assert_eq!(connected_inst_terms(&p, &top), [(7, 1)]);
+        let both = LonelyVia { top_connected: true, bottom_connected: true, ..v };
+        assert_eq!(connected_inst_terms(&p, &both), [(7, 1)]);
+    }
+
+    /// Rule (`FlexDR::fixMaxSpacing`): the sequence marks every lonely via (box over its three
+    /// layers, on the cut layer, the net as owner, victim and aggressor), then stops where the
+    /// port stops — at the pin-access re-run when a terminal was marked stubborn, else at the
+    /// via-swap workers; a pass with no lonely via changes nothing.
+    #[test]
+    fn the_pass_marks_lonely_vias_then_refuses_at_the_first_unported_stage() {
+        let (t, defaults) = tech_with_rule();
+        let g = grid();
+        let via = |x: i32, bottom: bool| DrFig::Via { via: 0, origin: (x, 450), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: bottom, top_connected: false };
+        let pin = (Rect { xl: 440, yl: 440, xh: 460, yh: 460 }, Fixed::InstTerm { net: Some(0), inst: 4, term: 0 });
+        let fixed = vec![vec![pin], Vec::new(), Vec::new()];
+        let trees: Vec<PackedRTree<Fixed>> = fixed.iter().map(|v| PackedRTree::new(v.clone())).collect();
+        let p = pass_in(&t, &defaults, &fixed, &trees, &g);
+        let mut lines = Vec::new();
+        let mut routes = DesignRoutes::with_initial(&t, vec![(0, via(450, false))]);
+        let mut st = MaxSpacingState::default();
+        let e = fix_max_spacing(&p, &mut routes, &mut st, &mut |l| lines.push(l)).expect_err("the workers are not ported");
+        assert!(e.contains("via-swap workers") && e.contains("1 region"), "{e}");
+        let m: Vec<&Marker> = routes.markers().collect();
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].rule, m[0].layer, m[0].bbox), (Rule::Lef58MaxSpacing, 1, Rect { xl: 430, yl: 430, xh: 470, yh: 470 }));
+        assert_eq!(m[0].owners, [Owner::Net("n0".into())]);
+        assert_eq!(m[0].victim, Some((Owner::Net("n0".into()), 1, m[0].bbox, false)));
+        assert_eq!(m[0].victim, m[0].aggressor);
+        assert!(st.stubborn.is_empty());
+        let mut routes = DesignRoutes::with_initial(&t, vec![(0, via(450, true))]);
+        let mut st = MaxSpacingState::default();
+        let e = fix_max_spacing(&p, &mut routes, &mut st, &mut |_| {}).expect_err("pin access re-run not ported");
+        assert!(e.contains("updateDirtyPAData"), "{e}");
+        assert_eq!(st.stubborn, BTreeSet::from([(4, 0)]));
+        assert_eq!(st.dirty_insts, BTreeSet::from([4]));
+        // A neighbour within 100: nothing lonely, nothing marked.
+        let mut routes = DesignRoutes::with_initial(&t, vec![(0, via(450, true)), (1, via(540, false))]);
+        fix_max_spacing(&p, &mut routes, &mut MaxSpacingState::default(), &mut |_| {}).expect("no lonely via");
+        assert_eq!(routes.markers().count(), 0);
     }
 }

@@ -20,7 +20,7 @@ use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig
 use crate::dr::maze::{MazeCfg, MazeState};
 use crate::dr::queue::{initial_marker_cost, recheck_markers, route_queue, Event, QueueCtx, Start};
 use crate::dr::route::{abs_priority, init_queue, NetCtx};
-use crate::dr::max_spacing::{fix_max_spacing, BlockVia, MaxSpacingState};
+use crate::dr::max_spacing::{fix_max_spacing, BlockVia, MaxSpacingState, PassIn};
 use crate::dr::rules::{default_vias, rule_tables, EolTable, NdrRule, NdrTables, RuleConfig, RuleTables};
 use crate::dr::ta::{track_assignment, Fixed, TaConfig, TaGuide, TaInput, TaState, TaTerm};
 use crate::gc::{Marker, Owner};
@@ -50,6 +50,9 @@ pub struct Options {
     /// The last iteration to run (the reference's `-droute_end_iter`; default `END_ITERATION`).
     /// Routing stops after it with whatever markers stand.
     pub end_iteration: Option<usize>,
+    /// ⛔ MEASUREMENT ONLY — log the max-spacing pass's steps in the correlation instrument's
+    /// format (`VYC MAXSPC …`, lines of this engine's own). The CLI never sets it.
+    pub max_spacing_trace: bool,
 }
 
 /// What routing did.
@@ -105,7 +108,7 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     }
     let t = ta(&d, &g, &p, log);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
-    let (routes, markers_by_iteration, flow_by_iteration, area_patches_dropped_no_owner) = dr(&d, &g, &p, &t, end, log)?;
+    let (routes, markers_by_iteration, flow_by_iteration, area_patches_dropped_no_owner) = dr(&d, &g, &p, &t, end, opts.max_spacing_trace, log)?;
     if area_patches_dropped_no_owner > 0 {
         log(Line::OwnWarnCode("DRT-PATCH-DROPPED", area_patches_dropped_warning(area_patches_dropped_no_owner)));
     }
@@ -625,7 +628,7 @@ struct DrCtx<'a> {
 /// The main loop: the strategy's rows in order until no marker stands, each row one
 /// search-and-repair iteration and the connectivity check after it, none past `end_iteration`.
 /// The routes, the markers standing after each iteration run, and each iteration's flow.
-pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>, usize)> {
+pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, max_spacing_trace: bool, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>, usize)> {
     log(Line::Info(187, "Start routing data preparation.".into()));
     let cx = dr_init(d, g, p, t);
     log(Line::Info(194, "Start detail routing.".into()));
@@ -637,7 +640,7 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
     let mut markers_by_iteration = Vec::new();
     let mut flow_by_iteration = Vec::new();
     // What the LEF58_MAXSPACING pass keeps between its calls (its secondary via lists grow).
-    let mut max_spacing = MaxSpacingState::default();
+    let mut max_spacing = MaxSpacingState { trace: max_spacing_trace, ..Default::default() };
     // Markers read from the database stand as the design's (and in its region query) from the
     // start, and make the run resume past the first, rip-up-everything rows.
     for m in &d.db_markers {
@@ -826,7 +829,13 @@ fn check_then_fix_max_spacing(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_st
     flow_state.fixing_max_spacing = false;
     let has_max_spacing = cx.p.tech.layers.iter().any(|l| !l.lef58_max_spacing.is_empty());
     if routes.markers().next().is_none() && has_max_spacing {
-        fix_max_spacing(&cx.p.tech, &cx.p.defaults, &cx.d.block_vias, &cx.d.design.fixed, routes, max_spacing, log)?;
+        let net_name = |n: usize| cx.d.design.nets[n].name.clone();
+        let inst_term_name = |i: usize, t: usize| {
+            let inst = &cx.d.insts[i];
+            (inst.name.clone(), cx.d.masters[&inst.unique.master].terms[t].name.clone())
+        };
+        let pass = PassIn { tech: &cx.p.tech, defaults: &cx.p.defaults, block_vias: &cx.d.block_vias, fixed: &cx.d.design.fixed, fixed_trees: &cx.fixed_trees, grid: &cx.g.grid, net_name: &net_name, inst_term_name: &inst_term_name };
+        fix_max_spacing(&pass, routes, max_spacing, log)?;
         flow_state.fixing_max_spacing = true;
     }
     Ok(())

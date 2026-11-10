@@ -16,6 +16,7 @@ extern crate self as vyges_drt;
 
 pub mod dr;
 pub mod gc;
+pub mod order;
 pub mod pa;
 pub mod polygon90;
 pub mod polygon_formation;
