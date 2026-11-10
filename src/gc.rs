@@ -1650,7 +1650,26 @@ impl<'a> Worker<'a> {
                 }
             }
         };
-        triggered.then_some(has_route)
+        (triggered && self.eol_has_min_max_length(layer, k, r)).then_some(has_route)
+    }
+
+    /// `checkMetalEndOfLine_eol_hasMinMaxLength`, last in `qualifiesAsEol`: with MINLENGTH (or
+    /// MAXLENGTH) the line end counts only when the edges before and after it are at least (at
+    /// most) that long — both with TWOSIDES, either without. ⛔ TWOSIDES is the rule's own flag
+    /// here, a divergence by decision (drt divergence register D8): the reference's io hands it
+    /// PARALLELEDGE's TWOEDGES instead (upstream OpenROAD issue #12181); we follow the patched
+    /// reference (vyges-openroad-patches upstream-fix 0001).
+    fn eol_has_min_max_length(&self, layer: usize, k: usize, r: &EolRule) -> bool {
+        let Some(m) = r.length else { return true };
+        let segs = &self.segs[layer];
+        let e = &segs[k];
+        let ok = |len: i32| if m.max { len <= m.length } else { len >= m.length };
+        let (prev, next) = (ok(segs[e.prev].len()), ok(segs[e.next].len()));
+        if m.two_sides {
+            prev && next
+        } else {
+            prev || next
+        }
     }
 
     /// Every polygon edge on `layer` touching `q`.
@@ -4150,7 +4169,7 @@ mod eol_tests {
     }
 
     fn rule() -> EolRule {
-        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None }
+        EolRule { space: 200, width: 150, within: 30, parallel: None, end_to_end: None, length: None }
     }
 
     fn net(n: &str) -> Owner {
@@ -4271,6 +4290,27 @@ mod eol_tests {
         assert_eq!(lef58(r, &[("a", WIRE, false), ("b", end_220, false)]), vec![Rect::new(1000, 0, 1220, 140)], "a line end inside end-to-end");
         assert!(lef58(rule(), &[("a", WIRE, false), ("b", end_220, false)]).is_empty(), "no end-to-end clause: the space alone");
         assert!(lef58(r, &[("a", WIRE, false), ("b", Rect::new(1270, 0, 2200, 140), false)]).is_empty(), "a line end past end-to-end");
+    }
+
+    // Rule (`checkMetalEndOfLine_eol_hasMinMaxLength`, last in `qualifiesAsEol`): with MINLENGTH
+    // (MAXLENGTH) a line end counts only when the edges before and after it are at least (at most)
+    // the length: both with TWOSIDES, either without. ⛔ DIVERGENCE by decision (drt divergence
+    // register D8, upstream OpenROAD issue #12181, vyges-openroad-patches upstream-fix 0001): the
+    // upstream rule takes TWOSIDES from PARALLELEDGE's TWOEDGES; ours (the patched reference's)
+    // takes the rule's own TWOSIDES, which this check then reads unchanged.
+    // Here `a`'s end at x 1000 has a 400-long edge below it (a step at x 600) and 1000 above.
+    #[test]
+    fn min_and_max_length_test_the_edges_beside_the_end_on_one_or_both_sides() {
+        use crate::tech::EolLength;
+        let step = [("a", WIRE, false), ("a", Rect::new(0, -200, 600, 0), false), ("b", BLOCK, true)];
+        let len = |max, length, two_sides| EolRule { length: Some(EolLength { max, length, two_sides }), ..rule() };
+        assert_eq!(lef58(rule(), &step), vec![GAP], "no length clause");
+        assert_eq!(lef58(len(false, 500, false), &step), vec![GAP], "MINLENGTH 500: the 1000 side is enough");
+        assert!(lef58(len(false, 500, true), &step).is_empty(), "MINLENGTH 500 TWOSIDES: the 400 side fails");
+        assert_eq!(lef58(len(false, 400, true), &step), vec![GAP], "MINLENGTH 400 TWOSIDES: 400 is at least 400");
+        assert_eq!(lef58(len(true, 500, false), &step), vec![GAP], "MAXLENGTH 500: the 400 side is enough");
+        assert!(lef58(len(true, 500, true), &step).is_empty(), "MAXLENGTH 500 TWOSIDES: the 1000 side fails");
+        assert!(lef58(len(true, 300, false), &step).is_empty(), "MAXLENGTH 300: neither side");
     }
 
     const WIRE: Rect = Rect { xl: 0, yl: 0, xh: 1000, yh: 140 };

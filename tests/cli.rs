@@ -184,15 +184,15 @@ fn the_report_lists_no_skipped_rule_when_none_is_skipped() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// Every other refusal stands: a LEF58 end-of-line SAMEMASK rule still refuses the run.
+/// Every other refusal stands: a LEF58 end-of-line rule with ENDTOEND EXTENSION still refuses the run.
 #[test]
 fn another_end_of_line_clause_is_still_refused() {
-    let lef = tiny_lef_with("eolsm.lef", "M1", "  PROPERTY LEF58_SPACING \"SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 SAMEMASK ;\" ;\n");
+    let lef = tiny_lef_with("eolsm.lef", "M1", "  PROPERTY LEF58_SPACING \"SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ENDTOEND 0.08 EXTENSION 0.01 ;\" ;\n");
     let out = tmp("eolsm.odb");
     let o = bin().args(["pin_access", "--lef", lef.to_str().unwrap(), "--def", &data("tiny.def"), "--out", out.to_str().unwrap()]).output().unwrap();
     assert_eq!(o.status.code(), Some(3));
     let r: serde_json::Value = serde_json::from_slice(&o.stdout).expect("stdout is the JSON report");
-    assert_eq!(r["reason"], "not modelled: M1: lef58_spacing_eol (1, SAMEMASK)");
+    assert_eq!(r["reason"], "not modelled: M1: lef58_spacing_eol (1, ENDTOEND EXTENSION)");
     assert!(!out.exists());
 }
 

@@ -264,6 +264,7 @@ impl MinCut {
 /// within `within` beyond its sides; with a parallel edge, only when a parallel edge lies within
 /// `par_space` of a side (on both sides with `two_edges`), up to `par_within` behind the end.
 /// `end_to_end` (LEF58 only): the spacing when the facing edge is itself a line end.
+/// `length` (LEF58 only): MINLENGTH / MAXLENGTH on the edges beside the line end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EolRule {
     pub space: i32,
@@ -271,6 +272,24 @@ pub struct EolRule {
     pub within: i32,
     pub parallel: Option<ParallelEdge>,
     pub end_to_end: Option<i32>,
+    pub length: Option<EolLength>,
+}
+
+/// A LEF58 end-of-line rule's `MINLENGTH l [TWOSIDES]` or `MAXLENGTH l [TWOSIDES]`
+/// (`frLef58SpacingEndOfLineWithinMaxMinLengthConstraint`): the line end counts only when the
+/// edges beside it are at least (`max` false) or at most (`max` true) `length` long, on BOTH sides
+/// with `two_sides`, else on either.
+///
+/// ⛔ **A DIVERGENCE from the reference, by decision (drt divergence register D8).** The reference's
+/// io passes PARALLELEDGE's TWOEDGES flag as TWOSIDES (`isTwoEdgesValid()`), so `MINLENGTH l
+/// TWOSIDES` is judged one-sided unless the rule also says TWOEDGES (upstream OpenROAD issue
+/// #12181). This router reads TWOSIDES as written, as the patched reference does
+/// (vyges-openroad-patches upstream-fix 0001).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EolLength {
+    pub max: bool,
+    pub length: i32,
+    pub two_sides: bool,
 }
 
 
@@ -1240,18 +1259,28 @@ pub mod read {
     /// this engine SKIPS with a warning of its own ([`lef58_eol_skipped_clause`]: TOCONCAVECORNER,
     /// TONOTCHLENGTH), `Err(clause)` for a clause outside the modelled subset (SPACING / ENDOFLINE /
     /// WITHIN, ENDTOEND without its extension or cut spaces, PARALLELEDGE with only its space, within
-    /// and TWOEDGES).
+    /// and TWOEDGES, MINLENGTH / MAXLENGTH with TWOSIDES read as written: [`lef58_eol_length`];
+    /// SAMEMASK with its WITHIN as written).
+    ///
+    /// ⛔ SAMEMASK is a DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue
+    /// #12182, vyges-openroad-patches upstream-fix 0002). Upstream rule:
+    /// `frLef58SpacingEndOfLineWithinConstraint::getEolWithin` returns 0 for a SAMEMASK rule,
+    /// whatever WITHIN says, so the check and the via-to-via prep lose the lateral window. Our rule
+    /// (the patched reference's): WITHIN as written (the foundry kit's SAMEMASK end-of-line rules
+    /// state it on purpose). As in the reference, the check and the router read the rule
+    /// MASK-BLIND (drt never reads `hasSameMask()`): every pair is held to it, whatever its masks;
+    /// the colour step (`vyges-opendb color-masks`) checks it per mask. That is not part of the
+    /// divergence.
     pub fn lef58_eol_rule(db: &Db, layer: &str, k: usize) -> Result<Option<EolRule>, &'static str> {
         if lef58_eol_dropped_by_reference(db, layer, k) || lef58_eol_skipped_clause(db, layer, k).is_some() {
             return Ok(None);
         }
-        let unmodelled: [(bool, &'static str); 20] = [
+        let unmodelled: [(bool, &'static str); 18] = [
             (db.spacingeolrule_is_exact_width_valid(layer, k), "EXACTWIDTH"),
             (db.spacingeolrule_is_wrong_dir_spacing_valid(layer, k), "WRONGDIRSPACING"),
             (db.spacingeolrule_is_opposite_width_valid(layer, k), "OPPOSITEWIDTH"),
             (db.spacingeolrule_is_end_prl_spacing_valid(layer, k), "ENDPRLSPACING"),
             (db.spacingeolrule_is_wrong_dir_within_valid(layer, k), "WRONGDIRWITHIN"),
-            (db.spacingeolrule_is_same_mask_valid(layer, k), "SAMEMASK"),
             (db.spacingeolrule_is_extension_valid(layer, k), "ENDTOEND EXTENSION"),
             (db.spacingeolrule_is_other_end_width_valid(layer, k), "ENDTOEND OTHERENDWIDTH"),
             (db.spacingeolrule_is_cut_spaces_valid(layer, k), "ENDTOEND cut spaces"),
@@ -1261,7 +1290,6 @@ pub mod read {
             (db.spacingeolrule_is_same_metal_valid(layer, k), "PARALLELEDGE SAMEMETAL"),
             (db.spacingeolrule_is_non_eol_corner_only_valid(layer, k), "PARALLELEDGE NONEOLCORNERONLY"),
             (db.spacingeolrule_is_parallel_same_mask_valid(layer, k), "PARALLELEDGE PARALLELSAMEMASK"),
-            (db.spacingeolrule_is_min_length_valid(layer, k) || db.spacingeolrule_is_max_length_valid(layer, k), "MINLENGTH/MAXLENGTH"),
             (db.spacingeolrule_is_enclose_cut_valid(layer, k), "ENCLOSECUT"),
             (db.spacingeolrule_is_min_adjacent_length_valid(layer, k), "MINADJACENTLENGTH"),
             (db.spacingeolrule_is_cut_class_valid(layer, k) || db.spacingeolrule_is_withcut_valid(layer, k), "CUTCLASS/WITHCUT"),
@@ -1281,7 +1309,24 @@ pub mod read {
             within: db.spacingeolrule_get_eol_within(layer, k),
             parallel,
             end_to_end: db.spacingeolrule_is_end_to_end_valid(layer, k).then(|| db.spacingeolrule_get_end_to_end_space(layer, k)),
+            length: lef58_eol_length(db, layer, k),
         }))
+    }
+
+    /// io's MINLENGTH / MAXLENGTH of LEF58 end-of-line rule `k` (MINLENGTH when the database
+    /// holds both), with TWOSIDES AS WRITTEN (`isTwoSidesValid()`). ⛔ Diverges from the
+    /// reference by decision (register D8): its io passes PARALLELEDGE's TWOEDGES flag
+    /// (`isTwoEdgesValid()`) here, upstream OpenROAD issue #12181; we follow the patched reference
+    /// (vyges-openroad-patches upstream-fix 0001).
+    pub fn lef58_eol_length(db: &Db, layer: &str, k: usize) -> Option<EolLength> {
+        let two_sides = db.spacingeolrule_is_two_sides_valid(layer, k);
+        if db.spacingeolrule_is_min_length_valid(layer, k) {
+            Some(EolLength { max: false, length: db.spacingeolrule_get_min_length(layer, k), two_sides })
+        } else if db.spacingeolrule_is_max_length_valid(layer, k) {
+            Some(EolLength { max: true, length: db.spacingeolrule_get_max_length(layer, k), two_sides })
+        } else {
+            None
+        }
     }
 
     pub fn tech(db: &Db) -> Res<Tech> {
@@ -1338,7 +1383,7 @@ pub mod read {
                     let eol = db
                         .layer_v54_eol_rules(&name)?
                         .into_iter()
-                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None })
+                        .map(|(space, width, within, par)| EolRule { space: space as i32, width, within, parallel: par.map(|(space, within, two_edges)| ParallelEdge { space, within, two_edges }), end_to_end: None, length: None })
                         .collect();
                     let corner_spacing: Vec<CornerSpacing> = (0..db.num_layer_get_tech_layer_corner_spacing_rules(&name)).filter_map(|k| corner_spacing_rule(db, &name, k).ok()).collect();
                     let lef58_eol: Vec<EolRule> = (0..db.num_layer_get_tech_layer_spacing_eol_rules(&name)).filter_map(|k| lef58_eol_rule(db, &name, k).ok().flatten()).collect();

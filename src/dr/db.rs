@@ -781,6 +781,41 @@ mod skipped_rule_tests {
         assert_eq!(skipped.iter().map(|s| s.clause).collect::<Vec<_>>(), ["TONOTCHLENGTH"]);
     }
 
+    /// ⛔ DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue #12181,
+    /// vyges-openroad-patches upstream-fix 0001). Upstream rule (io `setRoutingLayerProperties`):
+    /// MINLENGTH / MAXLENGTH is kept with `isTwoEdgesValid()` (PARALLELEDGE's TWOEDGES) as its
+    /// TWOSIDES. Our rule (the patched reference's): TWOSIDES as written (`isTwoSidesValid()`).
+    /// The rule is checked, not refused; MINLENGTH wins when the database holds both.
+    #[test]
+    fn min_and_max_length_are_checked_with_twosides_as_written() {
+        use crate::tech::EolLength;
+        let read = |name: &str, rule: &str| {
+            let d = db(name, &eol(rule), "");
+            let (skipped, refused, enforced) = census(&d);
+            assert!(skipped.is_empty() && refused.is_empty() && enforced == 1, "{rule}: {skipped:?} {refused:?} {enforced}");
+            crate::tech::read::tech(&d).expect("tech").layers.iter().find(|l| l.name == "M1").expect("M1").lef58_eol[0].length
+        };
+        assert_eq!(read("min2", "SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 MINLENGTH 0.1 TWOSIDES ;"), Some(EolLength { max: false, length: 100, two_sides: true }));
+        assert_eq!(read("min1", "SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 MINLENGTH 0.1 ;"), Some(EolLength { max: false, length: 100, two_sides: false }));
+        assert_eq!(read("max1", "SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 MAXLENGTH 0.2 ;"), Some(EolLength { max: true, length: 200, two_sides: false }));
+        // TWOEDGES alone (the reference's TWOSIDES source) does not make MINLENGTH two-sided.
+        assert_eq!(read("par2", "SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 MINLENGTH 0.1 PARALLELEDGE 0.1 WITHIN 0.1 TWOEDGES ;"), Some(EolLength { max: false, length: 100, two_sides: false }));
+        assert_eq!(read("none", "SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ;"), None);
+    }
+
+    /// ⛔ DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue #12182,
+    /// vyges-openroad-patches upstream-fix 0002). Upstream rule (`getEolWithin`): a SAMEMASK
+    /// end-of-line rule's WITHIN reads 0. Our rule (the patched reference's): WITHIN as written.
+    /// The rule is checked (mask-blind, as the reference checks it), not refused.
+    #[test]
+    fn a_same_mask_end_of_line_rule_is_checked_with_its_within_as_written() {
+        let d = db("samemask", &eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 SAMEMASK ;"), "");
+        let (skipped, refused, enforced) = census(&d);
+        assert!(skipped.is_empty() && refused.is_empty() && enforced == 1, "{skipped:?} {refused:?}");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        assert_eq!(tech.layers.iter().find(|l| l.name == "M1").expect("M1").lef58_eol[0].within, 25);
+    }
+
     /// The control: the same rule written as a plain end-of-line rule is checked, not skipped.
     #[test]
     fn a_plain_end_of_line_rule_is_checked_not_skipped() {
@@ -790,14 +825,14 @@ mod skipped_rule_tests {
         assert_eq!(enforced, 1);
     }
 
-    /// The skip covers only its own rule: another rule on the layer keeps its own verdict (here a
-    /// SAMEMASK end-of-line rule, refused), and only the skipped rule's index is listed.
+    /// The skip covers only its own rule: another rule on the layer keeps its own verdict (here an
+    /// end-of-line rule with ENDTOEND EXTENSION, refused), and only the skipped rule's index is listed.
     #[test]
     fn another_refused_rule_on_the_layer_is_still_refused() {
-        let rules = format!("{}{}", eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 SAMEMASK ;"), eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER ;"));
+        let rules = format!("{}{}", eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0.025 ENDTOEND 0.08 EXTENSION 0.01 ;"), eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER ;"));
         let d = db("mixed", &rules, "");
         let (skipped, refused, _) = census(&d);
-        assert_eq!(refused, ["M1: lef58_spacing_eol (2, SAMEMASK)"]);
+        assert_eq!(refused, ["M1: lef58_spacing_eol (2, ENDTOEND EXTENSION)"]);
         assert_eq!(skipped.iter().map(|s| (s.index, s.clause)).collect::<Vec<_>>(), [(1, "TOCONCAVECORNER")]);
     }
 

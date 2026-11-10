@@ -116,7 +116,8 @@ width, minimum area (patched, or reported where a patch cannot fix it), minimum 
 (`MINENCLOSEDAREA` without a width), minimum step, minimum cut (`MINIMUMCUT`, and
 `LEF58_MINIMUMCUT` converted into the same rule as the reference converts it), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
-(its common clauses), corner spacing (convex corners, patched by the router), cut classes, the
+(its common clauses, with `MINLENGTH` / `MAXLENGTH` and `SAMEMASK`, the latter held on every pair
+whatever its masks, as the reference holds it), corner spacing (convex corners, patched by the router), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and
 costed by the router around the other layer's vias, except where the other layer's vias fall
@@ -170,6 +171,21 @@ OpenROAD issue #12176). Skipped the same way: a LEF58 cut spacing `LAYER` rule w
 nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`). The reference keeps it, but its check
 acts only on a cut class with one of those corners, so it never checks it and routes as if it were
 absent, without a warning (upstream OpenROAD issue #12187).
+
+### Where this router differs from the reference, by decision
+
+Everywhere else the router is a reading of the reference and matches it byte for byte. Where the
+reference misreads a rule, this router follows the rule as written instead. Each such divergence
+is correlated against the reference patched with the fix (a named build), and on every case it does
+not reach the routes still match the unpatched reference.
+
+- **End-of-line `MINLENGTH` / `MAXLENGTH` `TWOSIDES`.** The reference takes TWOSIDES from
+  PARALLELEDGE's `TWOEDGES`, so `MINLENGTH l TWOSIDES` is judged on one side unless the rule also
+  says `TWOEDGES` (upstream OpenROAD issue #12181). This router reads TWOSIDES as written.
+- **End-of-line `SAMEMASK` `WITHIN`.** The reference reads a `SAMEMASK` end-of-line rule's `WITHIN`
+  as 0, so a line end just past a neighbour's corner is not held to the rule (upstream OpenROAD
+  issue #12182). This router reads `WITHIN` as written. Like the reference, it holds the rule on
+  every pair whatever its masks; the colour step checks it per mask.
 
 Area patches dropped, counted: when a net has several pieces in one worker, the reference looks
 up the piece a minimum-area or `LEF58_AREA` patch belongs to by comparing the patch box relative
