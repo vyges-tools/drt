@@ -1230,13 +1230,17 @@ pub mod read {
         db.spacingeolrule_is_except_exact_width_valid(layer, k) || db.spacingeolrule_is_fill_concave_corner_valid(layer, k) || db.spacingeolrule_is_equal_rect_width_valid(layer, k)
     }
 
-    /// The clause that makes THIS engine skip LEF58 end-of-line rule `k` of `layer` with a warning
-    /// of its own: `TOCONCAVECORNER` or `TONOTCHLENGTH`. ⛔ Skipped, not enforced and not emulated.
-    /// The reference's io never tests either branch: it keeps the rule as a plain end-of-line rule
-    /// whose WITHIN is the database default 0 and drops MINADJACENTLENGTH, so it flags line ends
-    /// that face straight edges (upstream OpenROAD issue #12174). We do not copy that reading;
-    /// the rule is not checked during routing and sign-off DRC must cover it. A rule the
-    /// reference drops itself ([`lef58_eol_dropped_by_reference`]) is not one of these.
+    /// The clause that makes this engine skip LEF58 end-of-line rule `k` of `layer` with a
+    /// warning: `TOCONCAVECORNER` or `TONOTCHLENGTH`. Skipped, not enforced and not emulated.
+    ///
+    /// ⛔ A DIVERGENCE from the reference by decision (drt divergence register D10). Upstream rule
+    /// (io `setRoutingLayerProperties`): neither branch is tested, so the rule is kept as a plain
+    /// end-of-line rule whose WITHIN is the database default 0, MINADJACENTLENGTH dropped, and line
+    /// ends that face straight edges are flagged (upstream OpenROAD issue #12174). Our rule (the
+    /// reference patched with vyges-openroad-patches upstream-fix 0010): warn (DRT-357 / DRT-358,
+    /// [`lef58_eol_skip_warnings`]) and skip the rule; it is not checked during routing and
+    /// sign-off DRC must cover it. A rule the reference drops itself
+    /// ([`lef58_eol_dropped_by_reference`]) is not one of these.
     pub fn lef58_eol_skipped_clause(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
         // ⚠️ Unreachable through odb's LEF grammar (the dropped clauses belong to the WITHIN
         // branch, exclusive with TOCONCAVECORNER and TONOTCHLENGTH), so no test can fail on it
@@ -1251,6 +1255,19 @@ pub mod read {
         } else {
             None
         }
+    }
+
+    /// The patched reference's io warnings (upstream-fix 0010) for the LEF58 end-of-line rules of
+    /// routing layer `layer` that it skips ([`lef58_eol_skipped_clause`]), in the rules' order:
+    /// DRT-357 for TOCONCAVECORNER, DRT-358 for TONOTCHLENGTH. ⛔ Divergence D10 (upstream OpenROAD
+    /// issue #12174): the unpatched reference says nothing and checks the rule as WITHIN 0.
+    pub fn lef58_eol_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_spacing_eol_rules(layer))
+            .filter_map(|k| match lef58_eol_skipped_clause(db, layer, k)? {
+                "TOCONCAVECORNER" => Some((357, format!("Unsupported LEF58_SPACING rule with option TOCONCAVECORNER for layer {layer}."))),
+                _ => Some((358, format!("Unsupported LEF58_SPACING rule with option TONOTCHLENGTH for layer {layer}."))),
+            })
+            .collect()
     }
 
     /// LEF58 end-of-line spacing rule `k` of `layer`, as `io::Parser` translates it

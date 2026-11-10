@@ -160,9 +160,11 @@ the reference, though no correlated design exercises them yet.
 Skipped with a warning, neither checked nor refused: a LEF58 end-of-line spacing rule with
 `TOCONCAVECORNER` or `TONOTCHLENGTH`. The router does not model these forms, so it warns at tech
 load and lists each rule in the report's `skipped_rules` (layer, rule index, clause, `checked`
-false), in both commands; the status does not change. Sign-off DRC must cover these rules. The
-reference router reads both forms as a plain end-of-line rule with `WITHIN 0` (upstream OpenROAD
-issue #12174), a reading this router does not copy. Skipped the same way: a `LEF58_MINIMUMCUT`
+false), in both commands, and the log carries the warning the reference's own fix for these
+forms prints (DRT-357 for `TOCONCAVECORNER`, DRT-358 for `TONOTCHLENGTH`); the status does not
+change. Sign-off DRC must cover these rules. The unpatched reference router reads both forms as a
+plain end-of-line rule with `WITHIN 0` (upstream OpenROAD issue #12174); this router follows the
+fixed reading instead, by decision. Skipped the same way: a `LEF58_MINIMUMCUT`
 rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
 reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS c n`: the
 database reader keeps it with a cut count of 0, so the reference drops it unread; upstream

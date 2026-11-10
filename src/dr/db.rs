@@ -218,7 +218,7 @@ impl SkippedRule {
                 self.layer, self.index
             ),
             _ => format!(
-                "layer {}: LEF58_SPACING end-of-line rule {} uses {}, which this router does not model; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (the reference reads this form as a plain end-of-line rule with WITHIN 0, which is not followed here; see {}).",
+                "layer {}: LEF58_SPACING end-of-line rule {} uses {}, which this router does not model; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it (the unpatched reference reads this form as a plain end-of-line rule with WITHIN 0; this router skips it as the reference fixed for {} does).",
                 self.layer, self.index, self.clause, SKIPPED_EOL_UPSTREAM_ISSUE
             ),
         }
@@ -705,12 +705,14 @@ pub fn write_gcell_grid(db: &mut Db, grid: &crate::dr::guides::GCellGrid) -> Res
 
 #[cfg(test)]
 mod skipped_rule_tests {
-    //! Rule (ours, not the reference's): a LEF58 end-of-line rule with TOCONCAVECORNER or
-    //! TONOTCHLENGTH is SKIPPED with a warning — not enforced, not emulated, not refused. The
-    //! reference's io never tests either branch and checks the rule as a plain end-of-line rule
+    //! ⛔ A DIVERGENCE from the reference by decision (drt divergence register D10). Upstream rule
+    //! (io `setRoutingLayerProperties`): a LEF58 end-of-line rule with TOCONCAVECORNER or
+    //! TONOTCHLENGTH is never tested for either branch and is checked as a plain end-of-line rule
     //! with WITHIN 0 (MINADJACENTLENGTH dropped), flagging line ends that face straight edges
-    //! (upstream OpenROAD issue #12174). Copying that would transcribe a misreading, and the rule
-    //! as written has no oracle, so it is left to sign-off DRC. Every other refusal stands.
+    //! (upstream OpenROAD issue #12174). Our rule, the reference patched with
+    //! vyges-openroad-patches upstream-fix 0010: the rule is SKIPPED with a warning (DRT-357 /
+    //! DRT-358 in the log, an entry in skipped_rules) — not enforced, not emulated, not refused;
+    //! the rule as written has no oracle, so it is left to sign-off DRC. Every other refusal stands.
     use super::{skipped_rules, unmodelled_rules};
     use vyges_opendb::Db;
 
@@ -770,6 +772,29 @@ mod skipped_rule_tests {
         for part in ["layer M1", "TOCONCAVECORNER", "NOT checked during routing", "sign-off DRC must cover it", "OpenROAD issue #12174"] {
             assert!(w.contains(part), "{part}: {w}");
         }
+    }
+
+    /// Rule (the reference patched with upstream-fix 0010, io `setRoutingLayerProperties`, after
+    /// the DRT-400/401/403 skips): one warning per skipped rule, in the layer's rule order —
+    /// DRT-357 for TOCONCAVECORNER, DRT-358 for TONOTCHLENGTH; a plain rule warns nothing. The
+    /// unpatched reference warns nothing and checks both as WITHIN 0 (upstream OpenROAD #12174).
+    #[test]
+    fn the_skipped_end_of_line_forms_are_warned_as_the_patched_reference_warns() {
+        let rules = format!(
+            "{}{}{}",
+            eol("SPACING 0.09 ENDOFLINE 0.07 TONOTCHLENGTH 0.1 ;"),
+            eol("SPACING 0.09 ENDOFLINE 0.07 WITHIN 0 ;"),
+            eol("SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER MINADJACENTLENGTH 0.1 0.12 ;")
+        );
+        let d = db("w357", &rules, "");
+        assert_eq!(
+            crate::tech::read::lef58_eol_skip_warnings(&d, "M1"),
+            [
+                (358, "Unsupported LEF58_SPACING rule with option TONOTCHLENGTH for layer M1.".to_string()),
+                (357, "Unsupported LEF58_SPACING rule with option TOCONCAVECORNER for layer M1.".to_string()),
+            ]
+        );
+        assert!(crate::tech::read::lef58_eol_skip_warnings(&d, "M2").is_empty());
     }
 
     #[test]
