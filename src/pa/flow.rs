@@ -17,7 +17,7 @@
 //! - a class pin's points are stored relative to the representative's placement location (they
 //!   hold for every member); a port's are absolute.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::gc::Owner;
 use crate::pa::access::{gen_pin_access, AccessPoint, Config, Pin as ApPin, Unsupported};
@@ -76,10 +76,23 @@ pub struct DesignPort {
     pub no_taper: bool,
 }
 
+#[derive(Debug, Clone)]
 pub struct PinAccess {
     pub classes: Vec<UniqueClass>,
+    /// Per class, the instance its access points were made on (`reps[c]`: the class's first
+    /// instance when they were made). The class's members can change afterwards (the max-spacing
+    /// pass moves an instance to a class of its own); the points stay relative to it.
+    pub reps: Vec<usize>,
+    /// Per instance, its class.
+    pub class_of: Vec<usize>,
+    /// Per class, its pin-access index on its master (`UniqueClass::pin_access_idx_`): how many
+    /// classes of the same master were initialised before it.
+    pub pa_idx: Vec<u32>,
+    /// The routed standard cells in placement order (`FlexPA::insts_set_`, `frInstLocationComp`);
+    /// the max-spacing pass's re-run takes its instance clusters from it.
+    pub insts_set: Vec<usize>,
     /// Per class, per master terminal, per pin: its access points (design coordinates of the
-    /// representative); empty for a terminal the class does not route.
+    /// representative `reps[c]`); empty for a terminal the class does not route.
     pub class_aps: Vec<Vec<Vec<Vec<AccessPoint>>>>,
     /// Per class: its patterns (standard-cell classes).
     pub patterns: Vec<Vec<Pattern>>,
@@ -100,8 +113,45 @@ pub enum FlowError {
     NoRowPath(String),
 }
 
+/// `FlexPA::genInstAccessPoints` on a class's representative `rep`: per terminal the class routes
+/// (`routes`), per pin, its access points ([`gen_pin_access`], design coordinates of `rep`); a
+/// terminal for which `stubborn` holds avoids the via defs in `avoid` (`getPriorityViaDefs`). Err
+/// [`FlowError::NoAccessPoint`]: a routed terminal with no access point on any pin (DRT-0073).
+/// `counted(t, n)` hears each routed terminal's count before that check, as the reference's
+/// instrument prints it.
+#[allow(clippy::too_many_arguments)]
+pub fn gen_inst_access_points(cx: &Context<'_>, cfg: &Config, master: &Master, rep: &DesignInst, routes: &[bool], design: Option<&[TargetShape]>, stubborn: &dyn Fn(usize) -> bool, avoid: Option<&BTreeSet<usize>>, counted: &mut dyn FnMut(usize, usize)) -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
+    let mut per_term: Vec<Vec<Vec<AccessPoint>>> = master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect();
+    let kind = if rep.class == MasterClass::StdCell { TermKind::StdCell } else { TermKind::Macro };
+    for (t, term) in master.terms.iter().enumerate() {
+        if !routes[t] {
+            continue;
+        }
+        let owner = rep.pin_owner(master, t);
+        let via_target = if rep.no_taper[t] { design } else { None };
+        let avoid = if stubborn(t) { avoid } else { None };
+        let pin = ApPin { cx, cfg, kind, is_block: rep.is_block, boundary: Some(rep.unique.bbox), target: &rep.target, owner: &owner, via_target, avoid };
+        for (p, mp) in term.pins.iter().enumerate() {
+            let shapes: Vec<(usize, Rect)> = mp.shapes.iter().map(|&(l, r)| (l, rep.transform.apply(r))).collect();
+            per_term[t][p] = gen_pin_access(&pin, &shapes, &mut None).map_err(FlowError::Unsupported)?;
+        }
+        counted(t, per_term[t].iter().map(Vec::len).sum());
+        if per_term[t].iter().all(|a| a.is_empty()) {
+            return Err(FlowError::NoAccessPoint(format!("{}/{}", rep.name, term.name)));
+        }
+    }
+    Ok(per_term)
+}
+
+/// A row instance as the row search reads it: instance `i` of class `c`, its class's pattern view.
+pub fn row_inst<'a>(insts: &'a [DesignInst], masters: &HashMap<String, Master>, classes: &[UniqueClass], class_inst: &'a Instance<'a>, patterns: &'a [Pattern], c: usize, i: usize) -> RowInst<'a> {
+    let master = &masters[&classes[c].key.master];
+    let owners = class_inst.pins.iter().map(|p| insts[i].pin_owner(master, p.term)).collect();
+    RowInst { class: class_inst, patterns, location: insts[i].unique.location, owners, target: insts[i].target.clone() }
+}
+
 /// The pattern search's view of a class: its routed terminals' pins, in terminal order.
-fn pattern_instance<'a>(tech: &'a Tech, rep: &'a DesignInst, master: &Master, class: &UniqueClass, aps: &[Vec<Vec<AccessPoint>>]) -> Instance<'a> {
+pub fn pattern_instance<'a>(tech: &'a Tech, rep: &'a DesignInst, master: &Master, class: &UniqueClass, aps: &[Vec<Vec<AccessPoint>>]) -> Instance<'a> {
     let mut pins = Vec::new();
     for (t, term) in master.terms.iter().enumerate() {
         if !class.routes[t] {
@@ -136,29 +186,14 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
     // Each class representative's access points — one task per class, as the reference's
     // `omp parallel for` over the unique classes; results kept in class order, the first error in
     // that order returned.
+    let none = |_: usize| false;
     let class_aps: Vec<Vec<Vec<Vec<AccessPoint>>>> = par_map(&classes, |class| -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
         let rep = &insts[class.insts[0]];
         let master = &masters[&class.key.master];
-        let mut per_term: Vec<Vec<Vec<AccessPoint>>> = master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect();
-        if rep.class != MasterClass::Other {
-            let kind = if rep.class == MasterClass::StdCell { TermKind::StdCell } else { TermKind::Macro };
-            for (t, term) in master.terms.iter().enumerate() {
-                if !class.routes[t] {
-                    continue;
-                }
-                let owner = rep.pin_owner(master, t);
-                let via_target = if rep.no_taper[t] { design } else { None };
-                let pin = ApPin { cx: &cx, cfg, kind, is_block: rep.is_block, boundary: Some(rep.unique.bbox), target: &rep.target, owner: &owner, via_target };
-                for (p, mp) in term.pins.iter().enumerate() {
-                    let shapes: Vec<(usize, Rect)> = mp.shapes.iter().map(|&(l, r)| (l, rep.transform.apply(r))).collect();
-                    per_term[t][p] = gen_pin_access(&pin, &shapes, &mut None).map_err(FlowError::Unsupported)?;
-                }
-                if per_term[t].iter().all(|a| a.is_empty()) {
-                    return Err(FlowError::NoAccessPoint(format!("{}/{}", rep.name, term.name)));
-                }
-            }
+        if rep.class == MasterClass::Other {
+            return Ok(master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect());
         }
-        Ok(per_term)
+        gen_inst_access_points(&cx, cfg, master, rep, &class.routes, design, &none, None, &mut |_, _| {})
     })
     .into_iter()
     .collect::<Result<_, _>>()?;
@@ -169,7 +204,7 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
         let mut per_pin = Vec::new();
         if port.routed {
             let via_target = if port.no_taper { design } else { None };
-            let pin = ApPin { cx: &cx, cfg, kind: TermKind::Io, is_block: false, boundary: None, target: &port.target, owner: &port.owner, via_target };
+            let pin = ApPin { cx: &cx, cfg, kind: TermKind::Io, is_block: false, boundary: None, target: &port.target, owner: &port.owner, via_target, avoid: None };
             for shapes in &port.pins {
                 per_pin.push(gen_pin_access(&pin, shapes, &mut None).map_err(FlowError::Unsupported)?);
             }
@@ -222,9 +257,7 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
             .map(|&k| {
                 let i = members[k];
                 let c = class_of[i];
-                let master = &masters[&classes[c].key.master];
-                let owners = class_insts[c].pins.iter().map(|p| insts[i].pin_owner(master, p.term)).collect();
-                RowInst { class: &class_insts[c], patterns: &patterns[c], location: insts[i].unique.location, owners, target: insts[i].target.clone() }
+                row_inst(insts, masters, &classes, &class_insts[c], &patterns[c], c, i)
             })
             .collect();
         gen_inst_row_pattern(tech, &row_insts, &mut None).ok_or_else(|| FlowError::NoRowPath(row.iter().map(|&k| insts[members[k]].name.clone()).collect::<Vec<_>>().join(" ")))
@@ -234,7 +267,24 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
             picks[members[k]] = Some(p);
         }
     }
-    Ok(PinAccess { classes, class_aps, patterns, picks, port_aps, rows: rows.len() })
+    let reps = classes.iter().map(|c| c.insts[0]).collect();
+    let insts_set = order.iter().map(|&k| members[k]).collect();
+    let pa_idx = master_indices(&classes);
+    Ok(PinAccess { classes, reps, class_of, pa_idx, insts_set, class_aps, patterns, picks, port_aps, rows: rows.len() })
+}
+
+/// Per class, its pin-access index on its master: the number of EARLIER classes of the same
+/// master (`initUniqueInstPinAccess` takes the pin's current number of pin accesses).
+pub fn master_indices(classes: &[UniqueClass]) -> Vec<u32> {
+    let mut per_master: HashMap<&str, u32> = HashMap::new();
+    classes
+        .iter()
+        .map(|c| {
+            let n = per_master.entry(c.key.master.as_str()).or_insert(0);
+            *n += 1;
+            *n - 1
+        })
+        .collect()
 }
 
 /// `f` over `items` — on the rayon pool when it has more than one thread — the results in `items`'
@@ -276,21 +326,12 @@ pub enum WriteOp {
 /// - per routed port with exactly ONE pin: every point of that pin.
 pub fn write_plan(masters: &HashMap<String, Master>, insts: &[DesignInst], ports: &[DesignPort], pa: &PinAccess) -> Vec<WriteOp> {
     let mut ops = Vec::new();
-    let mut per_master: HashMap<&str, u32> = HashMap::new();
-    let idx: Vec<u32> = pa
-        .classes
-        .iter()
-        .map(|c| {
-            let n = per_master.entry(c.key.master.as_str()).or_insert(0);
-            *n += 1;
-            *n - 1
-        })
-        .collect();
+    let idx = &pa.pa_idx;
     for (c, class) in pa.classes.iter().enumerate() {
         ops.push(WriteOp::ClearMaster { master: class.key.master.clone(), idx: idx[c] });
     }
     for (c, class) in pa.classes.iter().enumerate() {
-        let rep = &insts[class.insts[0]];
+        let rep = &insts[pa.reps[c]];
         let master = &masters[&class.key.master];
         for (t, term) in master.terms.iter().enumerate() {
             for p in 0..term.pins.len() {
@@ -301,15 +342,9 @@ pub fn write_plan(masters: &HashMap<String, Master>, insts: &[DesignInst], ports
             }
         }
     }
-    let mut class_of = vec![0usize; insts.len()];
-    for (c, class) in pa.classes.iter().enumerate() {
-        for &i in &class.insts {
-            class_of[i] = c;
-        }
-    }
     for (i, inst) in insts.iter().enumerate() {
         let pick = pa.picks[i];
-        let c = class_of[i];
+        let c = pa.class_of[i];
         let class = &pa.classes[c];
         let master = &masters[&class.key.master];
         ops.push(WriteOp::SetInstIdx { inst: inst.name.clone(), idx: idx[c] });
@@ -351,12 +386,12 @@ impl PinAccess {
         if insts[inst].nets[t].is_none() {
             return Vec::new();
         }
-        let c = self.classes.iter().position(|c| c.insts.contains(&inst)).expect("a class");
+        let c = self.class_of[inst];
         let class = &self.classes[c];
         if !class.routes[t] {
             return Vec::new();
         }
-        let rep = &insts[class.insts[0]];
+        let rep = &insts[self.reps[c]];
         let master = &masters[&class.key.master];
         // The pattern's entries run over the routed terminals' pins in terminal order.
         let start: usize = (0..t).filter(|&u| class.routes[u]).map(|u| master.terms[u].pins.len()).sum();
@@ -413,9 +448,13 @@ mod tests {
         };
         let insts = vec![inst("u0", 5000, Some("n")), inst("u1", 9000, None)];
         let ap = AccessPoint { point: (5050, 40), layer: 2, lower: ApType::OnGrid, upper: ApType::OnGrid, access: [false, false, false, false, true, false], allow_via: true, vias: vec![0] };
-        let class = UniqueClass { key: ClassKey { master: "m".into(), orient: "R0".into(), offsets: vec![], ndr_inst: None }, insts: vec![0, 1], routes: vec![false, true] };
+        let class = UniqueClass { key: ClassKey { master: "m".into(), orient: "R0".into(), offsets: vec![], ndr_inst: None, stubborn: vec![] }, insts: vec![0, 1], routes: vec![false, true] };
         let pa = PinAccess {
             classes: vec![class],
+            reps: vec![0],
+            class_of: vec![0, 0],
+            pa_idx: vec![0],
+            insts_set: vec![0, 1],
             class_aps: vec![vec![vec![vec![]], vec![vec![ap]]]],
             patterns: vec![vec![Pattern { aps: vec![Some((0, 0))], left: Some((0, 0)), right: Some((0, 0)), cost: 0 }]],
             picks: vec![Some(0), Some(0)],

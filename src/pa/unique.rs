@@ -49,6 +49,9 @@ pub struct ClassKey {
     pub offsets: Vec<i32>,
     /// The instance, when it is in a class of its own.
     pub ndr_inst: Option<usize>,
+    /// The terminals (master indices, ascending) the LEF58_MAXSPACING pass marked stubborn on the
+    /// instance (`UniqueClassKey::stubborn_terms`); empty until that pass marks one.
+    pub stubborn: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,7 +132,7 @@ pub fn compute_unique_class_key(pref: &[TrackPattern], range: (i32, i32), inst: 
             }
         })
         .collect();
-    ClassKey { master: inst.master.clone(), orient: inst.orient.clone(), offsets, ndr_inst: inst.ndr_no_taper.then_some(idx) }
+    ClassKey { master: inst.master.clone(), orient: inst.orient.clone(), offsets, ndr_inst: inst.ndr_no_taper.then_some(idx), stubborn: Vec::new() }
 }
 
 /// The classes of `insts` (database order).
