@@ -1052,7 +1052,11 @@ mod skipped_rule_tests {
         let m1 = format!("  MINIMUMCUT 4 WIDTH 0.6 LENGTH 0.7 WITHIN 3.5 ;\n  PROPERTY LEF58_MINIMUMCUT \"{}\" ;\n", rules.join(" "));
         let d = db("mc", &m1, "");
         assert_eq!(d.num_layer_get_tech_layer_min_cut_rules("M1"), rules.len());
-        assert!(!d.mincutrule_is_per_cut_class("M1", 1) && d.mincutrule_get_num_cuts("M1", 1) == 0);
+        // The database marks a per-cut-class rule as one (opendb-lib's LEF reader sets
+        // isPerCutClass, as the reference patched with upstream-fix 0003 does; the unpatched
+        // odb parser never calls setPerCutClass, OpenROAD issue #12176), and keeps its single
+        // cut count at 0: the count is per class, read at conversion (D9).
+        assert!(d.mincutrule_is_per_cut_class("M1", 1) && d.mincutrule_get_num_cuts("M1", 1) == 0);
         let (skipped, refused, _) = census(&d);
         assert!(refused.is_empty(), "{refused:?}");
         // Skipped with a warning: the rules the reference skips or drops unread (a one-cut rule
