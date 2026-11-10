@@ -20,7 +20,7 @@ use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig
 use crate::dr::maze::{MazeCfg, MazeState};
 use crate::dr::queue::{initial_marker_cost, recheck_markers, route_queue, Event, QueueCtx, Start};
 use crate::dr::route::{abs_priority, init_queue, NetCtx};
-use crate::dr::max_spacing::{fix_max_spacing, BlockVia, MaxSpacingState, PassIn};
+use crate::dr::max_spacing::{fix_max_spacing, BlockVia, MaxSpacingState, PaIn, PassIn};
 use crate::dr::rules::{default_vias, rule_tables, EolTable, NdrRule, NdrTables, RuleConfig, RuleTables};
 use crate::dr::ta::{track_assignment, Fixed, TaConfig, TaGuide, TaInput, TaState, TaTerm};
 use crate::gc::{Marker, Owner};
@@ -238,7 +238,7 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     log(Line::Info(165, "Start pin access.".into()));
     let pa = pin_access_with(tech, &tracks, &cfg, &masters, &insts, &ports, Some(&shapes)).map_err(|e| format!("pin access: {e:?}"))?;
     {
-        let reps = pa.classes.iter().map(|c| (&insts[c.insts[0]], &masters[&c.key.master]));
+        let reps = pa.classes.iter().enumerate().map(|(c, cl)| (&insts[pa.reps[c]], &masters[&cl.key.master]));
         let (mut pins, mut patterns) = (0, 0);
         for (rep, m) in reps {
             pins += if rep.class == MasterClass::Other { 0 } else { m.terms.len() };
@@ -406,7 +406,7 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
             let c = class_of[i];
             let m = &d.masters[&d.insts[i].unique.master];
             let t = m.terms.iter().position(|x| x.name == tname).ok_or_else(|| format!("terminal {it}"))?;
-            let rep = &d.insts[d.pa.classes[c].insts[0]];
+            let rep = &d.insts[d.pa.reps[c]];
             let loc = d.insts[i].unique.location;
             let aps = d.pa.class_aps[c][t].iter().flatten().map(|a| ((a.point.0 - rep.unique.location.0 + loc.0, a.point.1 - rep.unique.location.1 + loc.1), a.layer)).collect();
             pins.push(GuidePin { name: it.clone(), is_port: false, id: i, shapes: Vec::new(), aps });
@@ -437,15 +437,9 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
     Ok(GuidesIn { grid, raw, by_net })
 }
 
-/// Per instance, its unique class (`usize::MAX` for none).
+/// Per instance, its unique class.
 fn classes_of(d: &DesignIn) -> Vec<usize> {
-    let mut class_of = vec![usize::MAX; d.insts.len()];
-    for (c, cl) in d.pa.classes.iter().enumerate() {
-        for &i in &cl.insts {
-            class_of[i] = c;
-        }
-    }
-    class_of
+    d.pa.class_of.clone()
 }
 
 /// The rule tables, on the technology with its default and generated vias.
@@ -546,12 +540,12 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
                     let m = &masters[&insts[i].unique.master];
                     let t = m.terms.iter().position(|x| x.name == tname).expect("term");
                     let prefs = pa.pref_access_points(insts, masters, i, t);
-                    let same_master: Vec<usize> = (0..pa.classes.len()).filter(|&c| insts[pa.classes[c].insts[0]].unique.master == insts[i].unique.master).collect();
+                    let same_master: Vec<usize> = (0..pa.classes.len()).filter(|&c| pa.classes[c].key.master == insts[i].unique.master).collect();
                     let c0 = same_master[0];
-                    let rep0 = &insts[pa.classes[c0].insts[0]];
+                    let rep0 = &insts[pa.reps[c0]];
                     let loc = insts[i].unique.location;
-                    let c = (0..pa.classes.len()).find(|&c| pa.classes[c].insts.contains(&i)).expect("a class");
-                    let rep = &insts[pa.classes[c].insts[0]];
+                    let c = pa.class_of[i];
+                    let rep = &insts[pa.reps[c]];
                     let shift = (loc.0 - rep.unique.location.0, loc.1 - rep.unique.location.1);
                     let mut ta_pins = Vec::new();
                     let mut dr_pins = Vec::new();
@@ -702,7 +696,7 @@ fn dr_init<'a>(d: &'a DesignIn, g: &'a GuidesIn, p: &'a Prep, t: &'a TaOut) -> D
         if c == usize::MAX {
             continue;
         }
-        let rep = &d.insts[d.pa.classes[c].insts[0]];
+        let rep = &d.insts[d.pa.reps[c]];
         let shift = (inst.unique.location.0 - rep.unique.location.0, inst.unique.location.1 - rep.unique.location.1);
         for (k, net) in inst.nets.iter().enumerate() {
             let Some(n) = net.as_ref().and_then(|n| d.design.net_index.get(n)).copied() else { continue };
@@ -834,7 +828,9 @@ fn check_then_fix_max_spacing(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_st
             let inst = &cx.d.insts[i];
             (inst.name.clone(), cx.d.masters[&inst.unique.master].terms[t].name.clone())
         };
-        let pass = PassIn { tech: &cx.p.tech, defaults: &cx.p.defaults, block_vias: &cx.d.block_vias, fixed: &cx.d.design.fixed, fixed_trees: &cx.fixed_trees, grid: &cx.g.grid, net_name: &net_name, inst_term_name: &inst_term_name };
+        let d = cx.d;
+        let pa = PaIn { tech: &d.tech, tracks: &d.tracks, cfg: &d.cfg, masters: &d.masters, insts: &d.insts, first: &d.pa };
+        let pass = PassIn { tech: &cx.p.tech, defaults: &cx.p.defaults, block_vias: &d.block_vias, fixed: &d.design.fixed, fixed_trees: &cx.fixed_trees, grid: &cx.g.grid, net_name: &net_name, inst_term_name: &inst_term_name, pa: Some(pa) };
         fix_max_spacing(&pass, routes, max_spacing, log)?;
         flow_state.fixing_max_spacing = true;
     }
@@ -960,7 +956,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
         if c == usize::MAX {
             return Vec::new();
         }
-        let (inst, rep) = (&d.insts[i], &d.insts[d.pa.classes[c].insts[0]]);
+        let (inst, rep) = (&d.insts[i], &d.insts[d.pa.reps[c]]);
         let shift = (inst.unique.location.0 - rep.unique.location.0, inst.unique.location.1 - rep.unique.location.1);
         d.pa.class_aps[c].get(k).map_or(Vec::new(), |pins| {
             pins.iter().map(|aps| aps.iter().map(|a| DrAp { point: (a.point.0 + shift.0, a.point.1 + shift.1), layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect()).collect()

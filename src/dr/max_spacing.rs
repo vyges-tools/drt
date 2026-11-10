@@ -8,13 +8,19 @@
 //! re-routes a region around each with a via-swap worker that tries the layer's SECONDARY via
 //! defs (`initSecondaryVias`: the vias of another class). Ported so far: the sequencer, the
 //! secondary via defs, the lonely-via search, the pin-access avoid list, and per lonely via its
-//! marker, its region and the pin terminals it marks stubborn; the regions' merge. ⛔ Not ported:
-//! the pin-access re-run for stubborn terminals (`updateDirtyPAData`), the region workers' via
-//! swap, minimum-step patching. A run that reaches one is REFUSED there, before anything is
-//! written; a run that finds no lonely via routes as the reference does (the pass changes
-//! nothing).
+//! marker, its region and the pin terminals it marks stubborn; the pin-access re-run for the
+//! stubborn terminals (`updateDirtyPAData`, [`crate::pa::dirty`]); the regions' merge. ⛔ Not
+//! ported: the region workers' via swap, minimum-step patching. A run that reaches one is REFUSED
+//! there, before anything is written; a run that finds no lonely via routes as the reference does
+//! (the pass changes nothing).
+//!
+//! Where the REFERENCE itself aborts on the input (an upstream defect, filed), this router
+//! refuses at the same point with a reason made by [`upstream_abort_reason`], which names the
+//! reference's error and the issue; [`upstream_abort`] reads it back (the CLI's own exit code).
 
 use std::collections::{BTreeMap, BTreeSet};
+
+use std::collections::HashMap;
 
 use crate::dr::cost::DrFig;
 use crate::dr::design::{stored_box, DesignRoutes};
@@ -22,10 +28,36 @@ use crate::dr::log::{Line, Sink};
 use crate::dr::guides::GCellGrid;
 use crate::dr::ta::Fixed;
 use crate::gc::{Marker, Owner, Rule};
+use crate::pa::access::Config;
+use crate::pa::dirty::{update_dirty_insts, DirtyError, DirtyIn};
+use crate::pa::flow::{DesignInst, PinAccess};
 use crate::order::libcxx_sort_by;
 use crate::polygon90::Rect;
 use crate::rtree::PackedRTree;
-use crate::tech::{Dir, LayerKind, MaxSpacingRule, Tech, ViaDef};
+use crate::tech::{Dir, LayerKind, Master, MaxSpacingRule, Tech, TrackPattern, ViaDef};
+
+/// A point where the reference aborts on its input: its error and the upstream issue filed for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamAbort {
+    pub code: &'static str,
+    pub issue: u32,
+}
+
+/// The reference's aborts this pass refuses in its place: DRT-0073, a stubborn pin left with no
+/// access point by the pin-access re-run (OpenROAD issue #12199); DRT-1231, a worker that overlaps
+/// a pin whose access points the re-run moved outside it (OpenROAD issue #12200).
+pub const UPSTREAM_ABORTS: [UpstreamAbort; 2] = [UpstreamAbort { code: "DRT-0073", issue: 12199 }, UpstreamAbort { code: "DRT-1231", issue: 12200 }];
+
+/// The refusal's reason where the reference aborts: `lef58_max_spacing: the reference aborts here
+/// with CODE (OpenROAD issue #N): DETAIL`.
+pub fn upstream_abort_reason(abort: UpstreamAbort, detail: &str) -> String {
+    format!("lef58_max_spacing: the reference aborts here with {} (OpenROAD issue #{}): {detail}", abort.code, abort.issue)
+}
+
+/// The abort a refusal's reason names, when [`upstream_abort_reason`] made it.
+pub fn upstream_abort(reason: &str) -> Option<UpstreamAbort> {
+    UPSTREAM_ABORTS.into_iter().find(|a| reason.starts_with(&format!("lef58_max_spacing: the reference aborts here with {} (OpenROAD issue #{}): ", a.code, a.issue)))
+}
 
 /// A via the design defines (DEF VIAS): io adds it to its cut layer's via defs as it does a
 /// technology via. Only its cut class is read here.
@@ -53,8 +85,12 @@ pub struct MaxSpacingState {
     pub avoid_via_defs_pa: BTreeSet<String>,
     /// The instance terminals marked stubborn (`frInstTerm::setStubborn`), as (instance, terminal).
     pub stubborn: BTreeSet<(usize, usize)>,
-    /// The instances whose pin access is to be re-run (`FlexPA::dirty_insts_`, ordered by id).
+    /// The instances whose pin access is to be re-run (`FlexPA::dirty_insts_`, ordered by id;
+    /// cleared by the re-run).
     pub dirty_insts: BTreeSet<usize>,
+    /// Pin access as the re-runs left it (`FlexPA`'s state, kept from call to call); `None` until
+    /// the first re-run with a dirty instance (until then it is the first run's).
+    pub pa: Option<PinAccess>,
     /// ⛔ MEASUREMENT ONLY: log the pass's steps as the correlation instrument prints the
     /// reference's (`VYC MAXSPC MARK/STUB/MERGED`), as lines of this engine's own.
     pub trace: bool,
@@ -73,6 +109,19 @@ pub struct PassIn<'a> {
     /// A net's name; an instance terminal's instance and terminal names.
     pub net_name: &'a dyn Fn(usize) -> String,
     pub inst_term_name: &'a dyn Fn(usize, usize) -> (String, String),
+    /// What the pin-access re-run reads; `None`: not available (the re-run is refused).
+    pub pa: Option<PaIn<'a>>,
+}
+
+/// Pin access's inputs as its first run read them, and its result.
+#[derive(Clone, Copy)]
+pub struct PaIn<'a> {
+    pub tech: &'a Tech,
+    pub tracks: &'a [TrackPattern],
+    pub cfg: &'a Config,
+    pub masters: &'a HashMap<String, Master>,
+    pub insts: &'a [DesignInst],
+    pub first: &'a PinAccess,
 }
 
 /// `FlexDR::fixMaxSpacing`, as far as it is ported: the sequence only, each stage named after the
@@ -108,7 +157,7 @@ pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut Ma
             state.dirty_insts.insert(inst);
         }
     }
-    update_dirty_pa_data(state)?;
+    update_dirty_pa_data(p, state, log)?;
     let merged = merge_regions(regions)?;
     if state.trace {
         for r in &merged {
@@ -203,17 +252,40 @@ fn trace_mark(p: &PassIn<'_>, via: &LonelyVia, region: Rect, log: Sink) {
 }
 
 /// `TritonRoute::updateDirtyPAData`: pin access re-run for the instances whose terminals the pass
-/// marked stubborn. With none it does nothing (`FlexPA::updateDirtyInsts` over an empty set).
-/// ⛔ Not ported: with any, the run is refused here.
-fn update_dirty_pa_data(state: &MaxSpacingState) -> Result<(), String> {
+/// marked stubborn (`FlexPA::updateDirtyInsts`, [`update_dirty_insts`]), on pin access as the
+/// last re-run left it; with no dirty instance it changes nothing. The re-run's write-back into
+/// the database (`io::Writer::updateDb`, pin access only) is not made: this router writes no
+/// access point into its output at all (the routed DEF has none). Err: the reference aborts
+/// (DRT-0073: a routed terminal of a re-run class with no access point, OpenROAD issue #12199 —
+/// refused with [`upstream_abort_reason`]), or a case not modelled.
+fn update_dirty_pa_data(p: &PassIn<'_>, state: &mut MaxSpacingState, log: Sink) -> Result<(), String> {
     if state.dirty_insts.is_empty() {
         return Ok(());
     }
-    Err(format!(
-        "lef58_max_spacing: lonely vias land on {} pin(s) of {} instance(s); re-running pin access for them (TritonRoute::updateDirtyPAData, after the lonely-via markers) is not modelled",
-        state.stubborn.len(),
-        state.dirty_insts.len()
-    ))
+    let Some(pin) = p.pa else {
+        return Err(format!(
+            "lef58_max_spacing: lonely vias land on {} pin(s) of {} instance(s); re-running pin access for them (TritonRoute::updateDirtyPAData, after the lonely-via markers) is not modelled",
+            state.stubborn.len(),
+            state.dirty_insts.len()
+        ));
+    };
+    // `addAvoidViaDefPA` keeps via defs; pin access's own list is the technology's, by name.
+    let avoid: BTreeSet<usize> = pin.tech.via_defs.iter().enumerate().filter(|(_, v)| state.avoid_via_defs_pa.contains(&v.name)).map(|(k, _)| k).collect();
+    let inp = DirtyIn { tech: pin.tech, tracks: pin.tracks, cfg: pin.cfg, masters: pin.masters, insts: pin.insts, avoid: &avoid, stubborn: &state.stubborn };
+    let pa = state.pa.get_or_insert_with(|| pin.first.clone());
+    let mut sink = |l: String| log(Line::OwnInfo(l));
+    let mut trace: crate::pa::dirty::TraceSink<'_> = if state.trace { Some(&mut sink) } else { None };
+    let done = update_dirty_insts(&inp, pa, &state.dirty_insts, &mut trace);
+    state.dirty_insts.clear();
+    done.map_err(|e| match e {
+        // ⚠️ INTERIM stage boundary. The clean reference aborts here (DRT-0073, OpenROAD issue
+        // #12199). Once the patched reference build exists (vyges-openroad-patches, the fix for
+        // #12199), this arm is the slot where its behaviour is transcribed and correlated against
+        // that build instead of refused.
+        DirtyError::NoAccessPoint { inst, term, master } => upstream_abort_reason(UPSTREAM_ABORTS[0], &format!("the pin-access re-run for the stubborn terminals finds no access point for {inst}/{term} ({master}) once the avoided via defs are dropped")),
+        DirtyError::NoRowPath(row) => format!("lef58_max_spacing: the pin-access re-run finds no access pattern combination for the row {row} (the reference aborts with DRT-0085)"),
+        DirtyError::Unsupported(u) => u,
+    })
 }
 
 /// The regions merged: sorted by left edge with libc++'s `std::sort` (not stable: past 24 regions
@@ -474,6 +546,19 @@ fn add_avoid_via_defs_pa(tech: &Tech, l: usize, rule: &MaxSpacingRule, block_via
 mod tests {
     use super::*;
 
+    /// The refusal where the reference aborts names its error and the upstream issue, and is read
+    /// back as that abort (the CLI's exit 4); any other refusal is not one.
+    #[test]
+    fn an_upstream_abort_reason_reads_back_as_its_abort() {
+        for a in UPSTREAM_ABORTS {
+            let r = upstream_abort_reason(a, "detail");
+            assert!(r.contains(a.code) && r.contains(&format!("#{}", a.issue)), "{r}");
+            assert_eq!(upstream_abort(&r), Some(a));
+        }
+        assert_eq!(upstream_abort("lef58_max_spacing: 4 via(s) have no other cut"), None);
+        assert_eq!(UPSTREAM_ABORTS[0], UpstreamAbort { code: "DRT-0073", issue: 12199 });
+    }
+
     /// Rule (`FlexDR::getLonelyVias`, KDTree::radiusSearch): a point is isolated when no OTHER
     /// point lies within the radius, the boundary included (`d² <= r²`); two points at the same
     /// place are each other's neighbour.
@@ -644,7 +729,7 @@ mod tests {
     }
 
     fn pass_in<'a>(t: &'a Tech, defaults: &'a [Option<usize>], fixed: &'a [Vec<(Rect, Fixed)>], trees: &'a [PackedRTree<Fixed>], g: &'a GCellGrid) -> PassIn<'a> {
-        PassIn { tech: t, defaults, block_vias: &[], fixed, fixed_trees: trees, grid: g, net_name: &|n| format!("n{n}"), inst_term_name: &|i, t| (format!("i{i}"), format!("t{t}")) }
+        PassIn { tech: t, defaults, block_vias: &[], fixed, fixed_trees: trees, grid: g, net_name: &|n| format!("n{n}"), inst_term_name: &|i, t| (format!("i{i}"), format!("t{t}")), pa: None }
     }
 
     /// Rule (`FlexDR::fixMaxSpacing`, stubborn terminals): the design's shapes on the layer of the

@@ -126,6 +126,9 @@ pub struct Pin<'a> {
     /// net without auto-taper is checked against every design shape (no target object), not
     /// only its own instance's or port's.
     pub via_target: Option<&'a [TargetShape]>,
+    /// The via defs (indices into `Tech::via_defs`) a STUBBORN terminal's pin must not use — the
+    /// LEF58_MAXSPACING pass's avoid list (`FlexPA::avoid_via_defs_`); `None` for any other pin.
+    pub avoid: Option<&'a BTreeSet<usize>>,
 }
 
 /// What the search did, in order.
@@ -366,11 +369,16 @@ fn filter_multiple_ap_accesses(pin: &Pin<'_>, sh: &Shapes, aps: &mut [AccessPoin
 }
 
 /// The first `max` vias of the cut layer in priority order — at least one, even when `max` is not
-/// positive (the reference checks the count only after adding).
+/// positive (the reference checks the count only after adding) — skipping, for a stubborn
+/// terminal, the via defs on its avoid list BEFORE they count (`getPriorityViaDefs`: `continue`
+/// ahead of the push and the limit test).
 fn get_priority_via_defs(pin: &Pin<'_>, cut: usize, max: i64) -> Vec<usize> {
     let mut out = Vec::new();
     if let Some(vias) = pin.cx.via_priority.get(&cut) {
         for &v in vias {
+            if pin.avoid.is_some_and(|a| a.contains(&v)) {
+                continue;
+            }
             out.push(v);
             if out.len() as i64 >= max {
                 break;
@@ -586,7 +594,7 @@ mod tests {
         let t = tech();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let mut trace = Some(Vec::new());
         let got = gen_pin_access(&pin, &[(3, Rect::new(-85, -85, 85, 85))], &mut trace);
         assert_eq!(got, Ok(vec![]));
@@ -597,13 +605,32 @@ mod tests {
         assert_eq!(gen_pin_access(&pin2, &[(4, Rect::new(-2000, -2000, 2000, 2000))], &mut None), Ok(vec![]));
     }
 
+    /// Rule (`FlexPA::getPriorityViaDefs`, LEF58_MAXSPACING): for a STUBBORN terminal a via def
+    /// on the avoid list is skipped before it counts towards the limit — the two vias tried are
+    /// the first two NOT avoided; a terminal that is not stubborn (no list) tries the first two.
+    #[test]
+    fn a_stubborn_pin_skips_avoided_vias_before_the_limit() {
+        let t = tech3();
+        let cx = Context::new(&t, &[]);
+        let (c, owner) = (cfg(true), Owner::Net("n".into()));
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
+        // Priority on cut 3: the default `v` (0) and `w` (1), then `x` (2).
+        assert_eq!(get_priority_via_defs(&pin, 3, 2), [0, 1]);
+        let avoid = BTreeSet::from([0]);
+        let stubborn = Pin { avoid: Some(&avoid), ..pin };
+        assert_eq!(get_priority_via_defs(&stubborn, 3, 2), [1, 2]);
+        let all = BTreeSet::from([0, 1, 2]);
+        let none_left = Pin { avoid: Some(&all), ..stubborn };
+        assert!(get_priority_via_defs(&none_left, 3, 2).is_empty());
+    }
+
     /// Retrying tries EVERY via, but still keeps at most two.
     #[test]
     fn a_retry_keeps_at_most_two_vias() {
         let t = tech3();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let sh = shapes(&t, &[(2, Rect::new(-2000, -2000, 2000, 2000))]);
         let mut a = ap((0, 0), 2);
         let mut trace = Some(Vec::new());
@@ -619,7 +646,7 @@ mod tests {
         let t = tech3();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let w = t.via_defs.iter().position(|v| v.name == "w").unwrap();
         let mut a = AccessPoint { vias: vec![w, 0], ..ap((0, 0), 2) };
         let exts = sort_via_defs(&pin, &mut a, &[Rect::new(-150, -1000, 150, 1000)]);
@@ -647,7 +674,7 @@ mod tests {
         let t = tech();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Io, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Io, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let sh = shapes(&t, &[(4, Rect::new(-2000, -2000, 2000, 2000))]);
         let mut a = ap((0, 0), 4);
         filter_via_access(&pin, &sh, &mut a, false, &mut None);
@@ -660,7 +687,7 @@ mod tests {
         let t = tech();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Io, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Io, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         assert_eq!(get_priority_via_defs(&pin, 3, 0), vec![0]);
         assert_eq!(get_priority_via_defs(&pin, 3, 2), vec![0]);
     }
@@ -672,7 +699,7 @@ mod tests {
         let t = tech();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: Some(Rect::new(-80, -500, 500, 500)), target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::StdCell, is_block: false, boundary: Some(Rect::new(-80, -500, 500, 500)), target: &[], owner: &owner, via_target: None, avoid: None };
         let sh = shapes(&t, &[(2, Rect::new(-2000, -2000, 2000, 2000))]);
         let mut a = ap((0, 0), 2);
         let mut trace = Some(Vec::new());
@@ -691,7 +718,7 @@ mod tests {
         let cx = Context::new(&t, &[]);
         let owner = Owner::Net("n".into());
         let c = cfg(false);
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let a = create_access_point(&pin, (0, 0), 2, ApType::OnGrid, ApType::OnGrid);
         assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [true, true, false, false]);
         let c2 = cfg(true);
@@ -707,7 +734,7 @@ mod tests {
         t.layers[2].rect_only = true;
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let a = create_access_point(&pin, (0, 0), 2, ApType::OnGrid, ApType::OnGrid);
         assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [true, true, false, false]);
     }
@@ -721,7 +748,7 @@ mod tests {
         t.layers[2].right_way_on_grid_only = true;
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let a = create_access_point(&pin, (0, 0), 2, ApType::Center, ApType::OnGrid);
         assert_eq!([a.has(Access::N), a.has(Access::S), a.has(Access::E), a.has(Access::W)], [false, false, true, true]);
         let a = create_access_point(&pin, (0, 0), 2, ApType::OnGrid, ApType::Center);
@@ -738,7 +765,7 @@ mod tests {
             t.layers[4].rect_only = rect_only;
             let cx = Context::new(&t, &[]);
             let (c, owner) = (cfg(true), Owner::Net("n".into()));
-            let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None };
+            let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
             let sh = shapes(&t, &[(2, Rect::new(-2000, -2000, 2000, 2000))]);
             let mut trace = Some(Vec::new());
             let ok = check_directional_via_access(&pin, &sh, &ap((0, 0), 2), 0, Access::N, &mut trace);
@@ -754,7 +781,7 @@ mod tests {
         let t = tech();
         let cx = Context::new(&t, &[]);
         let (c, owner) = (cfg(true), Owner::Net("n".into()));
-        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: true, boundary: None, target: &[], owner: &owner, via_target: None };
+        let pin = Pin { cx: &cx, cfg: &c, kind: TermKind::Macro, is_block: true, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
         let rects = [Rect::new(0, 0, 1000, 200)];
         assert_eq!(gen_end_point(&pin, &rects, (500, 100), 2, Access::E), (1000 + 480, 100));
         assert_eq!(gen_end_point(&Pin { is_block: false, ..pin }, &rects, (500, 100), 2, Access::E), (500 + 3 * 170, 100));
