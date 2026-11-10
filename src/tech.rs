@@ -1141,12 +1141,12 @@ pub mod read {
     /// Every clause of a LAYER rule io keeps but the reference's check never marks.
     pub const LAYER_UNCHECKED: [&str; 4] = [LAYER_NO_CLASS, LAYER_NO_CLASS_SAME_NET, LAYER_NO_CORNER, LAYER_NO_CORNER_SAME_NET];
 
-    /// ⛔ No same-net list (divergence D6, upstream-fix 0005): the unpatched reference keeps a
-    /// SAMENET LAYER rule with no CUTCLASS, or a class but neither corner, in the layer's same-net
-    /// list, and `checkCutSpacing_main(rect)` then runs every different-net LEF58 rule with
-    /// skipDiffNet, pairing a cut only with shapes of its own net (OpenROAD issue #12188). The
-    /// patched reference drops those rules, so the list holds no rule this engine reads, and a
-    /// checked rule beside one judges every net. Every other SAMENET form is refused.
+    // ⛔ No same-net list (divergence D6, upstream-fix 0005): the unpatched reference keeps a
+    // SAMENET LAYER rule with no CUTCLASS, or a class but neither corner, in the layer's same-net
+    // list, and `checkCutSpacing_main(rect)` then runs every different-net LEF58 rule with
+    // skipDiffNet, pairing a cut only with shapes of its own net (OpenROAD issue #12188). The
+    // patched reference drops those rules, so the list holds no rule this engine reads, and a
+    // checked rule beside one judges every net. Every other SAMENET form is refused.
 
     /// The clause of an ADJACENTCUTS rule with two WITHIN values, which this engine skips.
     ///
