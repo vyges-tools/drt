@@ -74,7 +74,7 @@ fn emit(trace: &mut TraceSink<'_>, line: impl FnOnce() -> String) {
 }
 
 /// `FlexPA::updateDirtyInsts`: the sequence only.
-pub fn update_dirty_insts(inp: &DirtyIn<'_>, pa: &mut PinAccess, dirty: &BTreeSet<usize>, trace: &mut TraceSink<'_>) -> Result<(), DirtyError> {
+pub fn update_dirty_insts(inp: &DirtyIn<'_>, pa: &mut PinAccess, dirty: &BTreeSet<usize>, trace: &mut TraceSink<'_>, warn: &mut dyn FnMut(String)) -> Result<(), DirtyError> {
     let mut pattern_insts: BTreeSet<usize> = BTreeSet::new();
     let dirty_classes = reclassify_dirty_insts(inp, pa, dirty, &mut pattern_insts, trace);
     init_dirty_classes(pa, &dirty_classes, &mut pattern_insts);
@@ -85,7 +85,7 @@ pub fn update_dirty_insts(inp: &DirtyIn<'_>, pa: &mut PinAccess, dirty: &BTreeSe
         emit(trace, || format!("VYC MSPA INSTIDX inst={} idx={}", inp.insts[i].name, pa.pa_idx[pa.class_of[i]]));
     }
     for &c in &dirty_classes {
-        gen_dirty_class_access(inp, pa, c, trace)?;
+        gen_dirty_class_access(inp, pa, c, trace, warn)?;
     }
     for &i in dirty {
         add_to_insts_set(inp, pa, i);
@@ -204,7 +204,7 @@ fn init_dirty_classes(pa: &mut PinAccess, dirty_classes: &[usize], pattern_insts
 /// The parallel loop's body for one dirty class: `initSkipInstTerm`, `genInstAccessPoints` on its
 /// first instance (stubborn terminals avoiding the avoid list; points replaced), and for a
 /// standard cell `prepPatternInst`.
-fn gen_dirty_class_access(inp: &DirtyIn<'_>, pa: &mut PinAccess, c: usize, trace: &mut TraceSink<'_>) -> Result<(), DirtyError> {
+fn gen_dirty_class_access(inp: &DirtyIn<'_>, pa: &mut PinAccess, c: usize, trace: &mut TraceSink<'_>, warn: &mut dyn FnMut(String)) -> Result<(), DirtyError> {
     let rep = pa.classes[c].insts[0];
     let n = pa.classes[c].routes.len();
     for t in 0..n {
@@ -223,9 +223,12 @@ fn gen_dirty_class_access(inp: &DirtyIn<'_>, pa: &mut PinAccess, c: usize, trace
     let stubborn = |t: usize| inp.stubborn.contains(&(rep, t));
     let idx = pa.pa_idx[c];
     let routes = pa.classes[c].routes.clone();
+    let master_name = pa.classes[c].key.master.clone();
+    // DRT-355 (upstream fix 0008): `inst/term (master)`, the instance's master.
+    let mut fell_back = |t: usize| warn(format!("No access point for {}/{} ({master_name}) without the via defs avoided for max spacing; using all via defs.", inst.name, master.terms[t].name));
     let aps = gen_inst_access_points(&cx, inp.cfg, master, inst, &routes, None, &stubborn, Some(inp.avoid), &mut |t, got| {
         emit(trace, || format!("VYC MSPA APS inst={} term={} idx={idx} n={got} stubborn={}", inst.name, master.terms[t].name, u8::from(stubborn(t))));
-    });
+    }, &mut fell_back);
     let aps = aps.map_err(|e| match e {
         FlowError::NoAccessPoint(name) => {
             let (i, t) = name.rsplit_once('/').map_or((name.clone(), String::new()), |(i, t)| (i.to_string(), t.to_string()));
@@ -452,6 +455,11 @@ mod tests {
     }
 
     fn rerun(bar: bool, stubborn: &[(usize, usize)]) -> (PinAccess, Result<(), DirtyError>) {
+        let (pa, r, _) = rerun_warned(bar, stubborn);
+        (pa, r)
+    }
+
+    fn rerun_warned(bar: bool, stubborn: &[(usize, usize)]) -> (PinAccess, Result<(), DirtyError>, Vec<String>) {
         let (t, masters, insts) = fixture(bar);
         let c = cfg();
         let mut pa = pin_access(&t, &[], &c, &masters, &insts, &[]).expect("first pin access");
@@ -459,8 +467,9 @@ mod tests {
         let dirty: BTreeSet<usize> = stubborn.iter().map(|&(i, _)| i).collect();
         let avoid = BTreeSet::from([0]);
         let inp = DirtyIn { tech: &t, tracks: &[], cfg: &c, masters: &masters, insts: &insts, avoid: &avoid, stubborn: &stubborn };
-        let r = update_dirty_insts(&inp, &mut pa, &dirty, &mut None);
-        (pa, r)
+        let mut warned = Vec::new();
+        let r = update_dirty_insts(&inp, &mut pa, &dirty, &mut None, &mut |w| warned.push(w));
+        (pa, r, warned)
     }
 
     /// Rule (`FlexPA::updateDirtyInsts`, `computeUniqueClassKey` with `stubborn_terms`): a dirty
@@ -495,13 +504,21 @@ mod tests {
         assert!(pa.picks[0].is_some() && pa.picks[1].is_some());
     }
 
-    /// Rule (`genInstAccessPoints`, DRT-0073, OpenROAD issue #12199): once the avoided via defs are
-    /// dropped a stubborn pin whose only other via cannot be placed has no access point, and the
-    /// reference aborts; the re-run stops there, naming the terminal and the master.
+    /// Rule (`genInstAccessPoints` with upstream fix 0008; the clean reference aborts with DRT-0073,
+    /// OpenROAD issue #12199): once the avoided via defs are dropped a stubborn pin whose only other
+    /// via cannot be placed has no access point; it is made again with every via def, so it keeps
+    /// the via it had, and DRT-355 names the terminal and the master once.
     #[test]
-    fn a_stubborn_pin_with_no_other_via_has_no_access_point() {
-        let (_, r) = rerun(true, &[(0, 0)]);
-        assert_eq!(r, Err(DirtyError::NoAccessPoint { inst: "u0".into(), term: "A".into(), master: "m".into() }));
+    fn a_stubborn_pin_with_no_other_via_falls_back_to_every_via_def() {
+        let (pa, r, warned) = rerun_warned(true, &[(0, 0)]);
+        r.expect("the fallback finds the avoided via");
+        assert_eq!(warned, ["No access point for u0/A (m) without the via defs avoided for max spacing; using all via defs."]);
+        let aps = &pa.class_aps[pa.class_of[0]][0][0];
+        assert!(!aps.is_empty() && aps.iter().all(|a| a.vias.first() == Some(&0)), "{aps:?}");
+        // A pin the avoided defs do not empty warns nothing.
+        let (_, r, warned) = rerun_warned(false, &[(0, 0)]);
+        r.expect("the small via fits");
+        assert!(warned.is_empty(), "{warned:?}");
     }
 
     /// Rule (`UniqueClass::setSkipTerm`, `skip_term_[t] &= skip`, from `initSkipInstTerm`): the
@@ -515,13 +532,13 @@ mod tests {
         let stubborn = BTreeSet::from([(0, 0)]);
         let avoid = BTreeSet::from([0]);
         let inp = DirtyIn { tech: &t, tracks: &[], cfg: &c, masters: &masters, insts: &insts, avoid: &avoid, stubborn: &stubborn };
-        update_dirty_insts(&inp, &mut pa, &BTreeSet::from([0]), &mut None).expect("the small via fits");
+        update_dirty_insts(&inp, &mut pa, &BTreeSet::from([0]), &mut None, &mut |_| {}).expect("the small via fits");
         assert_eq!(pa.classes[1].routes, [true]);
         // The member that routed the terminal is gone; the one left does not route it.
         let (_, _, mut later) = fixture(false);
         later[0].unique.routes = vec![false];
         let inp = DirtyIn { insts: &later, ..inp };
-        gen_dirty_class_access(&inp, &mut pa, 1, &mut None).expect("the small via fits");
+        gen_dirty_class_access(&inp, &mut pa, 1, &mut None, &mut |_| {}).expect("the small via fits");
         assert_eq!(pa.classes[1].routes, [true], "a routed terminal was skipped again");
         assert!(!pa.class_aps[1][0][0].is_empty());
     }
@@ -537,13 +554,13 @@ mod tests {
         let avoid = BTreeSet::from([0]);
         let first = BTreeSet::from([(0, 0)]);
         let inp = DirtyIn { tech: &t, tracks: &[], cfg: &c, masters: &masters, insts: &insts, avoid: &avoid, stubborn: &first };
-        update_dirty_insts(&inp, &mut pa, &BTreeSet::from([0]), &mut None).expect("the small via fits");
+        update_dirty_insts(&inp, &mut pa, &BTreeSet::from([0]), &mut None, &mut |_| {}).expect("the small via fits");
         // The stubborn class as if its terminal were still skipped, with no points.
         pa.classes[1].routes = vec![false];
         pa.class_aps[1] = Vec::new();
         let second = BTreeSet::from([(0, 0), (1, 0)]);
         let inp = DirtyIn { stubborn: &second, ..inp };
-        update_dirty_insts(&inp, &mut pa, &BTreeSet::from([1]), &mut None).expect("the small via fits");
+        update_dirty_insts(&inp, &mut pa, &BTreeSet::from([1]), &mut None, &mut |_| {}).expect("the small via fits");
         assert_eq!((pa.classes[1].insts.clone(), pa.classes[1].routes.clone()), (vec![0, 1], vec![true]));
         assert!(pa.class_aps[1].first().is_some_and(|p| !p[0].is_empty()), "the joined class was not made again");
     }

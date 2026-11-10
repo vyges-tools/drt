@@ -147,18 +147,19 @@ with the terminals in their class key, their access points regenerated without t
 and their rows' patterns chosen again. Then the via-swap workers, one per merged region: each
 walks every lonely via in its region, gives it the layer's next secondary via def, checks the net,
 and keeps the swap only when the check is clean; a worker that ends with more markers than it began
-with is not written back. Two points differ from the reference on purpose, each the reference's own
-upstream fix: when a via has tried every secondary def it goes back to the def it had and the
+with is not written back. Three points differ from the reference on purpose, each the reference's own
+upstream fix: a stubborn terminal that the avoided via defs leave with no access point has its
+access made again with every via def, with warning DRT-355 (the reference stops with DRT-0073,
+upstream OpenROAD issue #12199); when a via has tried every secondary def it goes back to the def it had and the
 worker's check is told (the reference takes the layer's default via and checks the last one it
 tried, which leaves markers for a via that is in neither the route nor the design: upstream OpenROAD
 issue #12203); and a worker
 that holds none of a re-run terminal's new access points leaves that terminal out with warning
 DRT-356 (the reference stops with DRT-1231, upstream OpenROAD issue #12200). Minimum-step patching
 of a swapped via is not modelled yet, so a routing layer with a `MINSTEP` rule beside a cut layer
-with such a rule is refused before routing. Where the re-run leaves a terminal with no access point, the
-reference itself aborts (DRT-0073, upstream OpenROAD issue #12199); the run is refused at the same
-point with exit 4, `reason` and the report's `reference_aborts` name the error and the issue, and
-nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not
+with such a rule is refused before routing. Where a re-run terminal has no access point even with every via def, the
+reference itself aborts (DRT-0073); the run is refused at the same point with exit 4, `reason` and
+the report's `reference_aborts` name the error and the issue, and nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not
 model, is refused with exit 3. A cell obstruction with its own `DESIGNRULEWIDTH`
 or `SPACING` is checked on its own, by that rule. A net the global router gave antenna jumpers is
 kept to its guides: off them it costs ten times as much.

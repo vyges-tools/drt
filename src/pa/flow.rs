@@ -119,8 +119,12 @@ pub enum FlowError {
 /// [`FlowError::NoAccessPoint`]: a routed terminal with no access point on any pin (DRT-0073).
 /// `counted(t, n)` hears each routed terminal's count before that check, as the reference's
 /// instrument prints it.
+///
+/// A stubborn terminal left with no access point once the avoided via defs are dropped is made
+/// again with every via def, and `fell_back(t)` hears it (upstream fix 0008, warning DRT-355; the
+/// clean reference stops with DRT-0073, OpenROAD issue #12199; divergence register D1).
 #[allow(clippy::too_many_arguments)]
-pub fn gen_inst_access_points(cx: &Context<'_>, cfg: &Config, master: &Master, rep: &DesignInst, routes: &[bool], design: Option<&[TargetShape]>, stubborn: &dyn Fn(usize) -> bool, avoid: Option<&BTreeSet<usize>>, counted: &mut dyn FnMut(usize, usize)) -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
+pub fn gen_inst_access_points(cx: &Context<'_>, cfg: &Config, master: &Master, rep: &DesignInst, routes: &[bool], design: Option<&[TargetShape]>, stubborn: &dyn Fn(usize) -> bool, avoid: Option<&BTreeSet<usize>>, counted: &mut dyn FnMut(usize, usize), fell_back: &mut dyn FnMut(usize)) -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
     let mut per_term: Vec<Vec<Vec<AccessPoint>>> = master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect();
     let kind = if rep.class == MasterClass::StdCell { TermKind::StdCell } else { TermKind::Macro };
     for (t, term) in master.terms.iter().enumerate() {
@@ -134,6 +138,16 @@ pub fn gen_inst_access_points(cx: &Context<'_>, cfg: &Config, master: &Master, r
         for (p, mp) in term.pins.iter().enumerate() {
             let shapes: Vec<(usize, Rect)> = mp.shapes.iter().map(|&(l, r)| (l, rep.transform.apply(r))).collect();
             per_term[t][p] = gen_pin_access(&pin, &shapes, &mut None).map_err(FlowError::Unsupported)?;
+        }
+        // 0008: the stubborn flag cleared for one more pass over the pins, every via def allowed
+        // (`genPinAccess` clears a pin's points before it fills them).
+        if avoid.is_some() && per_term[t].iter().all(|a| a.is_empty()) {
+            fell_back(t);
+            let pin = ApPin { avoid: None, ..pin };
+            for (p, mp) in term.pins.iter().enumerate() {
+                let shapes: Vec<(usize, Rect)> = mp.shapes.iter().map(|&(l, r)| (l, rep.transform.apply(r))).collect();
+                per_term[t][p] = gen_pin_access(&pin, &shapes, &mut None).map_err(FlowError::Unsupported)?;
+            }
         }
         counted(t, per_term[t].iter().map(Vec::len).sum());
         if per_term[t].iter().all(|a| a.is_empty()) {
@@ -193,7 +207,7 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
         if rep.class == MasterClass::Other {
             return Ok(master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect());
         }
-        gen_inst_access_points(&cx, cfg, master, rep, &class.routes, design, &none, None, &mut |_, _| {})
+        gen_inst_access_points(&cx, cfg, master, rep, &class.routes, design, &none, None, &mut |_, _| {}, &mut |_| {})
     })
     .into_iter()
     .collect::<Result<_, _>>()?;

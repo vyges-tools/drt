@@ -43,7 +43,8 @@ pub struct UpstreamAbort {
 }
 
 /// The reference's aborts this pass refuses in its place: DRT-0073, a stubborn pin left with no
-/// access point by the pin-access re-run (OpenROAD issue #12199); DRT-1231, a worker that overlaps
+/// access point by the pin-access re-run (OpenROAD issue #12199; since upstream fix 0008's
+/// fallback is followed, only when every via def leaves it none); DRT-1231, a worker that overlaps
 /// a pin whose access points the re-run moved outside it (OpenROAD issue #12200).
 pub const UPSTREAM_ABORTS: [UpstreamAbort; 2] = [UpstreamAbort { code: "DRT-0073", issue: 12199 }, UpstreamAbort { code: "DRT-1231", issue: 12200 }];
 
@@ -271,8 +272,9 @@ fn trace_mark(p: &PassIn<'_>, via: &LonelyVia, region: Rect, log: Sink) {
 /// last re-run left it; with no dirty instance it changes nothing. The re-run's write-back into
 /// the database (`io::Writer::updateDb`, pin access only) is not made: this router writes no
 /// access point into its output at all (the routed DEF has none). Err: the reference aborts
-/// (DRT-0073: a routed terminal of a re-run class with no access point, OpenROAD issue #12199 —
-/// refused with [`upstream_abort_reason`]), or a case not modelled.
+/// (DRT-0073: a routed terminal of a re-run class with no access point even after upstream fix
+/// 0008's fallback to every via def — refused with [`upstream_abort_reason`]), or a case not
+/// modelled.
 fn update_dirty_pa_data(p: &PassIn<'_>, state: &mut MaxSpacingState, log: Sink) -> Result<(), String> {
     if state.dirty_insts.is_empty() {
         return Ok(());
@@ -290,15 +292,20 @@ fn update_dirty_pa_data(p: &PassIn<'_>, state: &mut MaxSpacingState, log: Sink) 
     let pa = state.pa.get_or_insert_with(|| pin.first.clone());
     let mut sink = |l: String| log(Line::OwnInfo(l));
     let mut trace: crate::pa::dirty::TraceSink<'_> = if state.trace { Some(&mut sink) } else { None };
-    let done = update_dirty_insts(&inp, pa, &state.dirty_insts, &mut trace);
+    // DRT-355 (upstream fix 0008, OpenROAD issue #12199, register D1): a stubborn terminal the
+    // avoided via defs leave with no access point is made again with every via def. Collected and
+    // logged after the re-run (only trace lines come between).
+    let mut warned: Vec<String> = Vec::new();
+    let done = update_dirty_insts(&inp, pa, &state.dirty_insts, &mut trace, &mut |w| warned.push(w));
+    for w in warned {
+        log(Line::Warn(355, w));
+    }
     state.dirty_insts.clear();
     state.pa_reruns += 1;
     done.map_err(|e| match e {
-        // ⚠️ INTERIM stage boundary. The clean reference aborts here (DRT-0073, OpenROAD issue
-        // #12199). Once the patched reference build exists (vyges-openroad-patches, the fix for
-        // #12199), this arm is the slot where its behaviour is transcribed and correlated against
-        // that build instead of refused.
-        DirtyError::NoAccessPoint { inst, term, master } => upstream_abort_reason(UPSTREAM_ABORTS[0], &format!("the pin-access re-run for the stubborn terminals finds no access point for {inst}/{term} ({master}) once the avoided via defs are dropped")),
+        // Even with every via def (after 0008's fallback) no access point: the patched reference
+        // stops here with DRT-0073 too.
+        DirtyError::NoAccessPoint { inst, term, master } => upstream_abort_reason(UPSTREAM_ABORTS[0], &format!("the pin-access re-run for the stubborn terminals finds no access point for {inst}/{term} ({master}) even with every via def")),
         DirtyError::NoRowPath(row) => format!("lef58_max_spacing: the pin-access re-run finds no access pattern combination for the row {row} (the reference aborts with DRT-0085)"),
         DirtyError::Unsupported(u) => u,
     })
