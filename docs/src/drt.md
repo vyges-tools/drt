@@ -131,8 +131,7 @@ m]`), and LEF58 cut spacing with adjacent cuts (`SPACING s [CENTERTOCENTER] ADJA
 `SIDEPARALLELOVERLAP` or `SAMEMASK` the rule is skipped with a warning, as the reference skips
 it; with two `WITHIN` values (`WITHIN w1 w2`) it is skipped with the warning the reference's own
 fix prints, DRT-359, where the unpatched reference keeps only `w1`, upstream OpenROAD issue
-#12202; a `SAMENET` rule beside one of these is refused, since the reference then judges only cuts of one
-net in them, upstream OpenROAD issue #12188; every other LEF58 cut spacing form is refused), and
+#12202; every other LEF58 cut spacing form is refused), and
 `LEF58_AREA` on a routing layer (`AREA a` with `RECTWIDTH w` or `EXCEPTRECTANGLE`: checked, and
 patched on the routed net as the reference patches it; a rule with `EXCEPTMINWIDTH`,
 `EXCEPTEDGELENGTH`, `EXCEPTMINSIZE`, `EXCEPTSTEP`, `MASK` or `LAYER` is skipped with a warning, as
@@ -172,9 +171,12 @@ reference warns and skips it) or one written per cut class (`MINIMUMCUT CUTCLASS
 database reader keeps it with a cut count of 0, so the reference drops it unread; upstream
 OpenROAD issue #12176). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
 (`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`), or with a cut class but neither `CONCAVECORNER`
-nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`). The reference keeps it, but its check
-acts only on a cut class with one of those corners, so it never checks it and routes as if it were
-absent, without a warning (upstream OpenROAD issue #12187).
+nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`), with the warning the reference's own
+fix prints (DRT-353 with no class, DRT-354 with neither corner). The unpatched reference keeps
+it, but its check acts only on a cut class with one of those corners, so it never checks it,
+without a warning, and a `SAMENET` one makes every other LEF58 cut spacing rule of the layer
+judge only cuts of one net (upstream OpenROAD issues #12187 and #12188); this router follows the
+fixed reading, by decision, so a rule beside such a `SAMENET` rule judges every net.
 
 ### Where this router differs from the reference, by decision
 

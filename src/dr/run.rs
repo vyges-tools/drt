@@ -179,7 +179,8 @@ pub fn init_design(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Desig
     let defaults = default_vias(&mut t, &RuleConfig { bottom_routing_layer: bottom_layer, top_routing_layer: cfg.top_routing_layer, enable_via_gen: true });
     // setLayers' io warnings, layer by layer in the technology's order: on a routing layer the
     // LEF58 end-of-line rules it skips (`setRoutingLayerProperties`); on a cut layer its skipped
-    // LEF58 cut spacing rules (two WITHIN values, DRT-359), then its skipped LEF58_ENCLOSURE
+    // LEF58 cut spacing rules (two WITHIN values DRT-359, unchecked LAYER rules DRT-353 / 354, in
+    // rule order), then its skipped LEF58_ENCLOSURE
     // rules, then its skipped LEF58_MAXSPACING rules (no CUTCLASS, DRT-350)
     // (`setCutLayerProperties` reads them in that order).
     let skipped: Vec<(u16, String)> = t.layers.iter()

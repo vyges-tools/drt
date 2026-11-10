@@ -1074,11 +1074,13 @@ pub mod read {
         if let Some((_, clause)) = unmodelled.iter().find(|(set, _)| *set) {
             return Err(clause);
         }
-        // io keeps a rule with no CUTCLASS (spacing, CENTERTOCENTER, SAMENET / SAMEMETAL / SAMEVIA
-        // and the second layer only), but `checkLef58CutSpacing_spc_layer` acts only under
-        // `hasCutClass()`, so the reference never checks it, and says nothing. Skipped here with a
-        // warning instead (a SAMENET one also goes to io's same-net list: see
-        // [`lef58_cut_spacing_same_net_refusal`]).
+        // ⛔ Divergence D6 (register; upstream OpenROAD issue #12187). Upstream rule: io keeps a
+        // rule with no CUTCLASS (spacing, CENTERTOCENTER, SAMENET / SAMEMETAL / SAMEVIA and the
+        // second layer only; a SAMENET one in the same-net list, which then makes every
+        // different-net rule skip other nets), but `checkLef58CutSpacing_spc_layer` acts only
+        // under `hasCutClass()`, so the rule never marks, and nothing warns. Our rule, the
+        // reference patched with vyges-openroad-patches upstream-fix 0005: warn (DRT-353) and
+        // drop the rule, from both lists.
         if class.is_empty() {
             return Ok(Lef58CutRule::Skipped(if db.cutspacingrule_is_same_net(layer, k) { LAYER_NO_CLASS_SAME_NET } else { LAYER_NO_CLASS }));
         }
@@ -1098,10 +1100,12 @@ pub mod read {
         let Some(c) = classes.iter().rposition(|c| c.name == class) else {
             return Err("a CUTCLASS the layer does not define");
         };
-        // io keeps a rule with a class but neither corner (with CENTERTOCENTER, SAMENET / SAMEMETAL
-        // / SAMEVIA, PRL), but `checkLef58CutSpacing_spc_layer`, past the class test, has only the
-        // CONCAVECORNER and NONEOLCONVEXCORNER branches, so the reference never checks it, and says
-        // nothing. Skipped here with a warning (a SAMENET one goes to io's same-net list).
+        // ⛔ Divergence D6 (#12187). Upstream rule: io keeps a rule with a class but neither corner
+        // (with CENTERTOCENTER, SAMENET / SAMEMETAL / SAMEVIA, PRL; a SAMENET one in the same-net
+        // list), but `checkLef58CutSpacing_spc_layer`, past the class test, has only the
+        // CONCAVECORNER and NONEOLCONVEXCORNER branches, so the rule never marks, and nothing
+        // warns. Our rule, upstream-fix 0005: warn (DRT-354, after io's other CUTCLASS-branch
+        // skips) and drop the rule.
         if !concave && !convex {
             return Ok(Lef58CutRule::Skipped(if db.cutspacingrule_is_same_net(layer, k) { LAYER_NO_CORNER_SAME_NET } else { LAYER_NO_CORNER }));
         }
@@ -1125,35 +1129,24 @@ pub mod read {
         Ok(Lef58CutRule::Layer((db.cutspacingrule_get_cut_spacing(layer, k), second, c + 1, corner)))
     }
 
-    /// The skipped clause of a LEF58 cut spacing LAYER rule with no CUTCLASS (io's different-net list).
+    /// The skipped clause of a LEF58 cut spacing LAYER rule with no CUTCLASS.
     pub const LAYER_NO_CLASS: &str = "LAYER without CUTCLASS";
-    /// The same, with SAMENET (io's same-net list).
+    /// The same, with SAMENET (the unpatched reference's same-net list).
     pub const LAYER_NO_CLASS_SAME_NET: &str = "LAYER without CUTCLASS, SAMENET";
     /// The skipped clause of a LEF58 cut spacing LAYER rule with a CUTCLASS but neither corner.
     pub const LAYER_NO_CORNER: &str = "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER";
-    /// The same, with SAMENET (io's same-net list).
+    /// The same, with SAMENET (the unpatched reference's same-net list).
     pub const LAYER_NO_CORNER_SAME_NET: &str = "LAYER CUTCLASS without CONCAVECORNER or NONEOLCONVEXCORNER, SAMENET";
 
     /// Every clause of a LAYER rule io keeps but the reference's check never marks.
     pub const LAYER_UNCHECKED: [&str; 4] = [LAYER_NO_CLASS, LAYER_NO_CLASS_SAME_NET, LAYER_NO_CORNER, LAYER_NO_CORNER_SAME_NET];
 
-    /// Whether io puts LEF58 cut spacing rule `k` of `layer` in the layer's SAME-NET list: a rule it
-    /// keeps (checked or skipped by this engine for being unchecked by the reference) with SAMENET.
-    fn in_same_net_list(rule: &Result<Lef58CutRule, &'static str>) -> bool {
-        matches!(rule, Ok(Lef58CutRule::Skipped(c)) if *c == LAYER_NO_CLASS_SAME_NET || *c == LAYER_NO_CORNER_SAME_NET)
-    }
-
-    /// `checkCutSpacing_main(rect)`: when the layer's same-net list holds any rule, every rule of
-    /// its different-net list is run with skipDiffNet, so it pairs a cut only with shapes of its OWN
-    /// net. Refused (the reason) when that would change a rule this engine checks: a rule in the
-    /// same-net list beside a checked rule. A same-net list beside only skipped rules changes
-    /// nothing (their checks never mark).
-    pub fn lef58_cut_spacing_same_net_refusal(db: &Db, layer: &str, classes: &[CutClass]) -> Option<&'static str> {
-        let rules: Vec<_> = (0..db.num_layer_get_tech_layer_cut_spacing_rules(layer)).map(|k| cut_layer_rule(db, layer, k, classes)).collect();
-        let same_net = rules.iter().any(in_same_net_list);
-        let checked = rules.iter().any(|r| matches!(r, Ok(Lef58CutRule::Layer(_) | Lef58CutRule::AdjacentCuts(_))));
-        (same_net && checked).then_some("a SAMENET rule beside a checked rule (the reference then skips other nets in every different-net rule: OpenROAD issue #12188)")
-    }
+    /// ⛔ No same-net list (divergence D6, upstream-fix 0005): the unpatched reference keeps a
+    /// SAMENET LAYER rule with no CUTCLASS, or a class but neither corner, in the layer's same-net
+    /// list, and `checkCutSpacing_main(rect)` then runs every different-net LEF58 rule with
+    /// skipDiffNet, pairing a cut only with shapes of its own net (OpenROAD issue #12188). The
+    /// patched reference drops those rules, so the list holds no rule this engine reads, and a
+    /// checked rule beside one judges every net. Every other SAMENET form is refused.
 
     /// The clause of an ADJACENTCUTS rule with two WITHIN values, which this engine skips.
     ///
@@ -1164,14 +1157,20 @@ pub mod read {
     /// [`lef58_cut_spacing_skip_warnings`]) and skip the rule, after the reference's own skips.
     pub const ADJ_TWO_WITHIN: &str = "ADJACENTCUTS WITHIN with two values";
 
-    /// The patched reference's io warnings (upstream-fix 0012) for the LEF58 cut spacing rules of
-    /// cut layer `layer` it skips for a second WITHIN value ([`ADJ_TWO_WITHIN`]), in rule order.
-    /// ⛔ Divergence D7 (upstream OpenROAD issue #12202): the unpatched reference says nothing and
-    /// checks the rule with the first value only.
+    /// The patched reference's io warnings for the LEF58 cut spacing rules of cut layer `layer`
+    /// that only its fixes skip, in rule order (io's one loop over the rules): DRT-359 for an
+    /// ADJACENTCUTS rule with a second WITHIN value ([`ADJ_TWO_WITHIN`], upstream-fix 0012,
+    /// divergence D7, OpenROAD issue #12202), DRT-353 for a LAYER rule with no CUTCLASS and DRT-354
+    /// for one with a CUTCLASS but neither corner ([`LAYER_UNCHECKED`], upstream-fix 0005,
+    /// divergence D6, #12187). The unpatched reference says nothing for any of them.
     pub fn lef58_cut_spacing_skip_warnings(db: &Db, layer: &str, classes: &[CutClass]) -> Vec<(u16, String)> {
         (0..db.num_layer_get_tech_layer_cut_spacing_rules(layer))
-            .filter(|&k| matches!(cut_layer_rule(db, layer, k, classes), Ok(Lef58CutRule::Skipped(c)) if c == ADJ_TWO_WITHIN))
-            .map(|_| (359, format!("Unsupported branch WITHIN with two values in LEF58_SPACING ADJACENTCUTS for layer {layer}, skipping rule.")))
+            .filter_map(|k| match cut_layer_rule(db, layer, k, classes) {
+                Ok(Lef58CutRule::Skipped(c)) if c == ADJ_TWO_WITHIN => Some((359, format!("Unsupported branch WITHIN with two values in LEF58_SPACING ADJACENTCUTS for layer {layer}, skipping rule."))),
+                Ok(Lef58CutRule::Skipped(c)) if c == LAYER_NO_CLASS || c == LAYER_NO_CLASS_SAME_NET => Some((353, format!("Unsupported LEF58_SPACING LAYER rule without CUTCLASS for layer {layer}, skipping rule."))),
+                Ok(Lef58CutRule::Skipped(c)) if c == LAYER_NO_CORNER || c == LAYER_NO_CORNER_SAME_NET => Some((354, format!("Unsupported LEF58_SPACING LAYER CUTCLASS rule without CONCAVECORNER or NONEOLCONVEXCORNER for layer {layer}, skipping rule."))),
+                _ => None,
+            })
             .collect()
     }
 
