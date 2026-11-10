@@ -464,9 +464,14 @@ fn area_patch_owner(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], p: &cr
         return Some(mine[0]);
     }
     let tech = q.mcfg.tech;
+    patch_owner_helper(patch_box(p), mine.into_iter().map(|i| (i, nets[i].pin_box, state[i].ext.iter().chain(&state[i].figs).map(|f| fig_bbox(tech, f)).collect())))
+}
+
+/// The patch's absolute box (`drPatchWire::getBBox()`): its offset box moved to its origin. The
+/// unpatched reference compares `getOffsetBox()`, the box relative to the origin (D4).
+fn patch_box(p: &crate::gc::AreaPatch) -> Rect {
     let o = p.origin;
-    let at = Rect::new(p.offset.xl + o.0, p.offset.yl + o.1, p.offset.xh + o.0, p.offset.yh + o.1);
-    patch_owner_helper(at, mine.into_iter().map(|i| (i, nets[i].pin_box, state[i].ext.iter().chain(&state[i].figs).map(|f| fig_bbox(tech, f)).collect())))
+    Rect::new(p.offset.xl + o.0, p.offset.yl + o.1, p.offset.xh + o.0, p.offset.yh + o.1)
 }
 
 /// `checkMetalShape_patchOwner_helper` on the patch's absolute box (divergence D4, upstream-fix
@@ -1041,6 +1046,9 @@ mod tests {
         assert_eq!(patch_owner_helper(b, [on_pin, abutting].into_iter()), Some(2), "the first in order, pin box first");
         let apart = (3, Rect::new(87281, 68000, 87300, 68100), vec![Rect::new(87000, 68321, 87100, 68400)]);
         assert_eq!(patch_owner_helper(b, [apart].into_iter()), None, "one unit apart");
+        // The box looked up is the absolute one: the trace's offset box at the trace's origin.
+        let p = crate::gc::AreaPatch { layer: 2, origin: (87210, 68320), offset: Rect::new(-70, -300, 70, 0), owner: Owner::Net("n".into()) };
+        assert_eq!(patch_box(&p), b, "the offset box moved to the origin, not the offset box");
     }
 
     /// Rule (`checkMetalShape_addPatch`, its end): per area patch in order, the owner first — a
