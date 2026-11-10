@@ -116,7 +116,7 @@ width, minimum area (patched, or reported where a patch cannot fix it), minimum 
 (`MINENCLOSEDAREA` without a width), minimum step, minimum cut (`MINIMUMCUT`, and
 `LEF58_MINIMUMCUT` converted into the same rule as the reference converts it), rect-only and
 right-way-on-grid-only layers, and the LEF58 families end-of-line keep-out, end-of-line spacing
-(its common clauses), corner spacing (convex corners, patched by the router), cut classes, the
+(its common clauses), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and
 costed by the router around the other layer's vias, except where the other layer's vias fall

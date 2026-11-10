@@ -589,7 +589,7 @@ fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state
         let markers = gw.min_step_markers();
         pw.extend(patch_min_step(q, state, rq, &markers, gw.target.as_ref(), via_swap));
     }
-    if q.mcfg.tech.layers.iter().any(|l| !l.corner_spacing.is_empty()) {
+    if patches_corners(&q.mcfg.tech.layers) {
         let markers = gw.corner_markers();
         pw.extend(patch_corner_spacing(q, state, rq, &markers, target));
     }
@@ -671,6 +671,15 @@ fn fig_bbox(tech: &crate::tech::Tech, f: &DrFig) -> Rect {
         }
         DrFig::Patch { origin, offset, .. } => Rect::new(offset.xl + origin.0, offset.yl + origin.1, offset.xh + origin.0, offset.yh + origin.1),
     }
+}
+
+/// The corner-spacing patch gate: the technology has corner spacing. DIVERGES from the reference
+/// on purpose (register D12, upstream OpenROAD issue #12207, fix 0014): the reference's flag for this gate,
+/// `hasCornerSpacingConstraint_`, is set by MINSTEP rules, not by corner spacing, so it corner-patches
+/// only a technology that also has a MINSTEP rule. Every technology with both kinds of rule, the
+/// only kind the reference's gate admits, patches the same.
+fn patches_corners(layers: &[crate::tech::Layer]) -> bool {
+    layers.iter().any(|l| !l.corner_spacing.is_empty())
 }
 
 /// `patchMetalShape_cornerSpacing`: per corner-spacing marker, the first route shape of a source
@@ -1378,6 +1387,21 @@ mod tests {
     // Rule (`patchMetalShape_cornerSpacing`): on a horizontal layer the patch spans the shape's y
     // and one grid past the marker in x — to the left when the shape starts at the marker's right
     // side, else to the right. Vertical: the same across.
+    // D12 (register; upstream OpenROAD issue #12207, fix 0014): we corner-patch whenever the technology has corner
+    // spacing. The reference's gate (`hasVia2ViaMinStep() || hasCornerSpacingConstraint()`, the
+    // flag set only by MINSTEP / LEF58 MINSTEP in `frTechObject::addUConstraint`) corner-patches
+    // only a technology that also has a MINSTEP rule; 0014 sets it from corner spacing.
+    #[test]
+    fn corner_patches_follow_corner_spacing_not_min_step() {
+        use crate::tech::{CornerSpacing, Layer, MinStep};
+        let corner = Layer { corner_spacing: vec![CornerSpacing::default()], ..Default::default() };
+        let step = Layer { min_step: Some(MinStep { min_step_length: 100, kind: None, max_length: -1, max_edges: 1 }), ..Default::default() };
+        assert!(patches_corners(std::slice::from_ref(&corner)), "corner spacing, no MINSTEP: patched (the reference does not; 0014 does)");
+        assert!(!patches_corners(std::slice::from_ref(&step)), "MINSTEP, no corner spacing: nothing to patch");
+        assert!(patches_corners(&[step, corner]), "both: patched, as the reference");
+        assert!(!patches_corners(&[Layer::default()]));
+    }
+
     #[test]
     fn a_corner_patch_takes_the_shape_across_and_one_grid_along() {
         let m = Rect::new(100, 10, 120, 30);
