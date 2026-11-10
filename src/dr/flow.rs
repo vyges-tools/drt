@@ -36,6 +36,9 @@ pub enum RipUp {
     NearDrc,
     /// The nets without routing of their own (an incremental run).
     Incr,
+    /// Nothing: the LEF58_MAXSPACING pass's workers swap the defs of the lonely vias
+    /// (`RipUpMode::VIASWAP`).
+    ViaSwap,
 }
 
 /// The rip-up mode an iteration runs: in an incremental run (some nets routed before routing
@@ -317,7 +320,7 @@ pub fn written_back(iter: usize, ripup: RipUp, wm: &WorkerMarkers, best: usize) 
     if iter > 0 && wm.init_num == 0 && !wm.need_recheck {
         return false;
     }
-    if matches!(ripup, RipUp::Drc | RipUp::NearDrc) && best > wm.init_num {
+    if matches!(ripup, RipUp::Drc | RipUp::NearDrc | RipUp::ViaSwap) && best > wm.init_num {
         return false;
     }
     !(iter > 0 && ripup == RipUp::All && best > 5 * wm.init_num)
@@ -802,6 +805,16 @@ mod tests {
         assert!(written_back(0, RipUp::All, &worker_markers(Vec::new(), 0), 99));
         // Incremental: neither cap — written back however many markers it ends with.
         assert!(written_back(2, RipUp::Incr, &wm, 99));
+    }
+
+    /// Rule (`FlexDRWorker::end`): a via-swap worker (`RipUpMode::VIASWAP`, the max-spacing
+    /// pass's, iteration 64) is not written back when it ends with more markers than it started
+    /// with, as a DRC or NEARDRC worker; nor when it started with none.
+    #[test]
+    fn a_via_swap_worker_is_written_back_unless_worse() {
+        let wm = worker_markers(vec![marker(Rule::Short, 0), marker(Rule::Short, 1)], 64);
+        assert!(written_back(64, RipUp::ViaSwap, &wm, 2) && !written_back(64, RipUp::ViaSwap, &wm, 3));
+        assert!(!written_back(64, RipUp::ViaSwap, &worker_markers(Vec::new(), 64), 0));
     }
 
     /// Rule: optimization above 100 markers or when all is ripped up; else guides after an

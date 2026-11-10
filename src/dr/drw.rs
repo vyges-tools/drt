@@ -226,6 +226,8 @@ pub struct DrNetInput<'a> {
     /// The top routing layer: the worker's grid ends there, so an access point above it is
     /// never a pin's pattern.
     pub top_routing_layer: usize,
+    /// Where a terminal left out of the worker is reported (DRT-356, upstream fix 0009).
+    pub skipped: Option<&'a std::sync::Mutex<Vec<String>>>,
 }
 
 fn sq_dist(a: &Rect, b: &Rect) -> i64 {
@@ -947,13 +949,17 @@ fn split_obj(rb: &Rect, f: &crate::dr::cost::DrFig) -> (Vec<crate::dr::cost::DrF
 /// Each terminal a pin: its pins' points (the instance's class) inside the route box, the chosen
 /// one costing 0 and the rest 1, each with its layer's minimum area. A point above the top routing
 /// layer is skipped (upstream a8d25bb0e6: the grid has no node there).
-/// Errors when a terminal has no access point inside the route box (the reference stops there),
-/// naming the top routing layer when every point it has lies above it.
+/// A terminal whose every routing-layer point lies OUTSIDE the route box (its access re-made
+/// after it was routed, by the max-spacing pass's pin-access re-run) is left out of the worker,
+/// as a terminal outside the box is, and reported (DRT-356): upstream fix 0009 for OpenROAD issue
+/// #12200, where the reference stops (DRT-1231, register D2). Errors when a terminal has no
+/// access point at all (the reference stops there), naming the top routing layer when every
+/// point it has lies above it.
 fn init_net_term(inp: &DrNetInput<'_>, route_box: &Rect, net: &mut DrNet, terms: &[usize], pin_cnt: &mut usize) -> Result<(), String> {
     for &t in terms {
         let term = &inp.terms[t];
         let mut patterns = Vec::new();
-        let (mut above_top, mut in_routing) = (false, false);
+        let (mut above_top, mut in_routing, mut outside) = (false, false, false);
         // ⚠️ The chosen point is looked up by a counter that advances only past pins WITH
         // access, and compared by identity with this pin's points: once the counter falls behind
         // (a pin without access came first), nothing matches and every point costs 1.
@@ -972,6 +978,8 @@ fn init_net_term(inp: &DrNetInput<'_>, route_box: &Rect, net: &mut DrNet, terms:
                 let dap = DrAccessPattern { point: ap.point, layer: ap.layer, begin_area: inp.min_area.get(ap.layer).copied().unwrap_or(0), pin_cost: u32::from(Some(k) != pref), ap: Some(ap.clone()) };
                 if touches(route_box, &Rect { xl: ap.point.0, yl: ap.point.1, xh: ap.point.0, yh: ap.point.1 }) {
                     patterns.push(dap);
+                } else {
+                    outside = true;
                 }
             }
             pin_idx += 1;
@@ -979,6 +987,12 @@ fn init_net_term(inp: &DrNetInput<'_>, route_box: &Rect, net: &mut DrNet, terms:
         if patterns.is_empty() {
             if above_top && !in_routing {
                 return Err(format!("terminal {} is only accessible above the top routing layer", term.name));
+            }
+            if outside {
+                if let Some(w) = inp.skipped {
+                    w.lock().expect("no worker panics holding the warning list").push(format!("Pin {} has no access point in the route box; skipping it in this worker.", term.name));
+                }
+                continue;
             }
             return Err(format!("terminal {} has no access point in the worker's route box", term.name));
         }
@@ -1435,7 +1449,7 @@ mod tests {
             }
             let gr_pins = PackedRTree::new(if gr { vec![(Rect::new(1000, 1000, 1000, 1000), 0)] } else { Vec::new() });
             let terms = [term.clone()];
-            let inp = DrNetInput { grid: &grid, guides: &trees, gr_pins: &gr_pins, terms: &terms, min_area: &[0, 0, 0], routes: Some((&t, &routes)), term_at: None, top_routing_layer: usize::MAX };
+            let inp = DrNetInput { grid: &grid, guides: &trees, gr_pins: &gr_pins, terms: &terms, min_area: &[0, 0, 0], routes: Some((&t, &routes)), term_at: None, top_routing_layer: usize::MAX, skipped: None };
             init_nets_init_dr(&inp, &route_box, &ext_box, &BoundaryPins::new(), Some(&initial)).expect("nets").len()
         };
         assert_eq!((run(true, false), run(false, true)), (0, 0));
@@ -1459,7 +1473,7 @@ mod tests {
         let term = |aps: Vec<DrAp>| DrTerm { name: "i/a".into(), is_port: false, order: 0, net: Some(0), bbox: Rect::new(900, 900, 1100, 1100), pins: vec![(true, aps, Some(1))] };
         let run = |aps: Vec<DrAp>| {
             let terms = [term(aps)];
-            let inp = DrNetInput { grid: &grid, guides: &trees, gr_pins: &gr_pins, terms: &terms, min_area: &[0; 7], routes: Some((&t, &routes)), term_at: None, top_routing_layer: 4 };
+            let inp = DrNetInput { grid: &grid, guides: &trees, gr_pins: &gr_pins, terms: &terms, min_area: &[0; 7], routes: Some((&t, &routes)), term_at: None, top_routing_layer: 4, skipped: None };
             let mut net = DrNet { id: 0, net: 0, pins: Vec::new(), num_pins_in: 0, pin_box: route_box, ext: Vec::new(), route: Vec::new() };
             let mut cnt = 0;
             init_net_term(&inp, &route_box, &mut net, &[0], &mut cnt).map(|()| net.pins[0].patterns.iter().map(|p| (p.layer, p.pin_cost)).collect::<Vec<_>>())
@@ -1467,6 +1481,35 @@ mod tests {
         assert_eq!(run(vec![ap(2), ap(6)]), Ok(vec![(2, 1)]));
         assert_eq!(run(vec![ap(2), ap(4)]), Ok(vec![(2, 1), (4, 0)]));
         assert!(run(vec![ap(6), ap(6)]).is_err_and(|e| e.contains("only accessible above the top routing layer")));
+    }
+
+    // Rule (upstream fix 0009, OpenROAD issue #12200, register D2): a terminal whose every
+    // routing-layer access point lies outside the route box is left out of the worker (no pin),
+    // with DRT-356 — the clean reference stops there with DRT-1231. A terminal with no access
+    // point at all is still an error.
+    #[test]
+    fn a_terminal_with_every_access_point_outside_the_route_box_is_skipped() {
+        use crate::dr::guides::GCellGrid;
+        use crate::rtree::PackedRTree;
+        let grid = GCellGrid { x: (0, 10, 1000), y: (0, 10, 1000), die: Rect::new(0, 0, 10000, 10000) };
+        let route_box = Rect::new(0, 0, 3000, 3000);
+        let t = Tech::default();
+        let routes = crate::dr::design::DesignRoutes::default();
+        let trees: Vec<PackedRTree<(usize, P, P)>> = (0..7).map(|_| PackedRTree::new(Vec::new())).collect();
+        let gr_pins = PackedRTree::new(Vec::new());
+        let ap = |x| DrAp { point: (x, 1000), layer: 2, access: 16, vias: vec![] };
+        let term = |aps: Vec<DrAp>| DrTerm { name: "i/a".into(), is_port: false, order: 0, net: Some(0), bbox: Rect::new(900, 900, 1100, 1100), pins: vec![(true, aps, None)] };
+        let run = |aps: Vec<DrAp>| {
+            let terms = [term(aps)];
+            let warn = std::sync::Mutex::new(Vec::new());
+            let inp = DrNetInput { grid: &grid, guides: &trees, gr_pins: &gr_pins, terms: &terms, min_area: &[0; 7], routes: Some((&t, &routes)), term_at: None, top_routing_layer: 4, skipped: Some(&warn) };
+            let mut net = DrNet { id: 0, net: 0, pins: Vec::new(), num_pins_in: 0, pin_box: route_box, ext: Vec::new(), route: Vec::new() };
+            let mut cnt = 0;
+            init_net_term(&inp, &route_box, &mut net, &[0], &mut cnt).map(|()| (net.pins.len(), cnt, warn.into_inner().expect("no panic")))
+        };
+        assert_eq!(run(vec![ap(5000), ap(6000)]), Ok((0, 0, vec!["Pin i/a has no access point in the route box; skipping it in this worker.".to_string()])));
+        assert_eq!(run(vec![ap(5000), ap(1000)]), Ok((1, 1, Vec::new())));
+        assert!(run(Vec::new()).is_err_and(|e| e.contains("has no access point")));
     }
 
     // Rule: a unidirectional layer takes its track patterns in BOTH directions into the grid —
@@ -1547,7 +1590,7 @@ mod tests {
     fn a_boundary_area_takes_the_first_via_or_patch_in_query_order() {
         use crate::dr::cost::DrFig;
         let (t, _, _, _, rb) = uni(false);
-        let via = DrFig::Via { via: 0, origin: (500, -30), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false };
+        let via = DrFig::Via { via: 0, origin: (500, -30), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false };
         let patch = DrFig::Patch { layer: 4, origin: (500, -30), offset: Rect::new(0, -70, 255, 70) };
         let seg = DrFig::Seg { layer: 4, begin: (500, -30), end: (500, 0), width: 140, begin_ext: 70, end_ext: 70, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false };
         let fill = [(810, -485, -159), (1656, -438, 212), (1002, 225, 808), (-1542, -1828, -1609), (-1308, -1941, -1704), (-1292, -1923, -1476), (505, -393, 250), (1669, -889, -128), (-681, 143, 379), (1119, -1187, -792), (1847, 859, 1601), (-1662, -1918, -1742), (239, 1934, 2413), (-734, -691, -151), (-162, -409, 187)];

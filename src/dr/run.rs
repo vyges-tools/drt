@@ -492,6 +492,28 @@ pub fn pin_has_pin_access(class_aps: &[Vec<Vec<Vec<AccessPoint>>>], same_master:
     same_master.iter().any(|&c| class_aps[c].get(t).and_then(|x| x.get(pi)).is_some())
 }
 
+/// An instance terminal's pins as a worker reads them: per pin, whether it has pin access at
+/// all, its access points (its class's, shifted from the class representative to the instance),
+/// and the index of the instance's preferred point among them.
+pub fn inst_dr_pins(pa: &PinAccess, insts: &[DesignInst], masters: &HashMap<String, Master>, i: usize, t: usize) -> Vec<(bool, Vec<DrAp>, Option<usize>)> {
+    let m = &masters[&insts[i].unique.master];
+    let prefs = pa.pref_access_points(insts, masters, i, t);
+    let same_master: Vec<usize> = (0..pa.classes.len()).filter(|&c| pa.classes[c].key.master == insts[i].unique.master).collect();
+    let loc = insts[i].unique.location;
+    let c = pa.class_of[i];
+    let rep = &insts[pa.reps[c]];
+    let shift = (loc.0 - rep.unique.location.0, loc.1 - rep.unique.location.1);
+    let mut out = Vec::new();
+    for pi in 0..m.terms[t].pins.len() {
+        let has = pin_has_pin_access(&pa.class_aps, &same_master, t, pi);
+        let pref = prefs.get(pi).copied().flatten().map(|(q, l)| ((q.0 + loc.0, q.1 + loc.1), l));
+        let aps: Vec<DrAp> = pa.class_aps[c].get(t).and_then(|x| x.get(pi)).map_or(Vec::new(), |v| v.iter().map(|a| DrAp { point: (a.point.0 + shift.0, a.point.1 + shift.1), layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect());
+        let pref_idx = pref.and_then(|(q, l)| aps.iter().position(|a| a.point == q && a.layer == l));
+        out.push((has, aps, pref_idx));
+    }
+    out
+}
+
 pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
     let (masters, insts, ports, pa, design) = (&d.masters, &d.insts, &d.ports, &d.pa, &d.design);
     let inst_index: HashMap<&str, usize> = insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
@@ -544,20 +566,14 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
                     let c0 = same_master[0];
                     let rep0 = &insts[pa.reps[c0]];
                     let loc = insts[i].unique.location;
-                    let c = pa.class_of[i];
-                    let rep = &insts[pa.reps[c]];
-                    let shift = (loc.0 - rep.unique.location.0, loc.1 - rep.unique.location.1);
                     let mut ta_pins = Vec::new();
-                    let mut dr_pins = Vec::new();
                     for pi in 0..m.terms[t].pins.len() {
                         let has = pin_has_pin_access(&pa.class_aps, &same_master, t, pi);
                         let first = pa.class_aps[c0].get(t).and_then(|x| x.get(pi)).and_then(|a| a.first()).map(|a| ((a.point.0 - rep0.unique.location.0 + loc.0, a.point.1 - rep0.unique.location.1 + loc.1), a.layer));
                         let pref = prefs.get(pi).copied().flatten().map(|(q, l)| ((q.0 + loc.0, q.1 + loc.1), l));
                         ta_pins.push((has, pref, first));
-                        let aps: Vec<DrAp> = pa.class_aps[c].get(t).and_then(|x| x.get(pi)).map_or(Vec::new(), |v| v.iter().map(|a| ap_of(a, shift)).collect());
-                        let pref_idx = pref.and_then(|(q, l)| aps.iter().position(|a| a.point == q && a.layer == l));
-                        dr_pins.push((has, aps, pref_idx));
                     }
+                    let dr_pins = inst_dr_pins(pa, insts, masters, i, t);
                     let net = insts[i].nets[t].as_ref().and_then(|n| design.net_index.get(n)).copied();
                     ta_terms.push(TaTerm::Inst { net, pins: ta_pins });
                     let xf = &insts[i].transform;
@@ -608,15 +624,25 @@ struct DrCtx<'a> {
     bpins: Vec<Vec<crate::dr::drw::BoundaryPins>>,
     min_area: Vec<i64>,
     through: Vec<[bool; 4]>,
-    term_aps: HashSet<((i32, i32), usize, usize)>,
-    /// Each instance's pin-access class (`usize::MAX`: none).
-    class_of: Vec<usize>,
+    /// Pin access as the workers read it (the first run's, or the max-spacing pass's re-run's).
+    pv: PaView,
     fixed_trees: Vec<PackedRTree<Fixed>>,
     index_trees: Vec<PackedRTree<usize>>,
     inst_index: HashMap<&'a str, usize>,
     term_base: Vec<usize>,
     /// Area patches dropped for want of a worker net, summed over the workers (any thread).
     area_patches_dropped: std::sync::atomic::AtomicUsize,
+    /// The workers' DRT-356 warnings (a terminal left out), logged after each batch.
+    skipped: std::sync::Mutex<Vec<String>>,
+}
+
+impl DrCtx<'_> {
+    /// The workers' warnings so far, logged and cleared.
+    fn log_skipped(&self, log: Sink) {
+        for w in std::mem::take(&mut *self.skipped.lock().expect("no worker panics holding the warning list")) {
+            log(Line::Warn(356, w));
+        }
+    }
 }
 
 /// The main loop: the strategy's rows in order until no marker stands, each row one
@@ -624,7 +650,8 @@ struct DrCtx<'a> {
 /// The routes, the markers standing after each iteration run, and each iteration's flow.
 pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, max_spacing_trace: bool, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>, usize)> {
     log(Line::Info(187, "Start routing data preparation.".into()));
-    let cx = dr_init(d, g, p, t);
+    let mut cx = dr_init(d, g, p, t);
+    let mut pa_reruns_seen = 0;
     log(Line::Info(194, "Start detail routing.".into()));
     let incremental = d.initial.iter().any(Option::is_some);
     let mut routes = DesignRoutes::with_initial(&p.tech, crate::dr::db::initial_shapes(&p.tech, &d.design.nets, &d.insts, &d.masters, &d.ports, &d.initial)?);
@@ -655,6 +682,14 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
         args.size = clip.size(&row, increase_clip);
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
         search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip, &mut max_spacing, &mut *log)?;
+        // The pass re-ran pin access: every later worker reads it (`updateDirtyPAData` writes it
+        // into the database).
+        if max_spacing.pa_reruns != pa_reruns_seen {
+            pa_reruns_seen = max_spacing.pa_reruns;
+            if let Some(pa) = &max_spacing.pa {
+                cx.pv = pa_view(d, t, pa, true);
+            }
+        }
         flow_by_iteration.push(flow.current.name());
         let standing = routes.markers().count();
         markers_by_iteration.push(standing);
@@ -675,6 +710,52 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
     Ok((routes, markers_by_iteration, flow_by_iteration, cx.area_patches_dropped.load(std::sync::atomic::Ordering::Relaxed)))
 }
 
+/// What the workers read of pin access: the access points themselves, every connected terminal's
+/// points (point, layer, net), and the terminals' pins. `refresh`: `pa` is not the first run's
+/// (the max-spacing pass re-ran it; `TritonRoute::updateDirtyPAData` writes the instances' new
+/// access into the database the workers read), so each instance terminal's pins are rebuilt.
+struct PaView {
+    pa: PinAccess,
+    term_aps: HashSet<((i32, i32), usize, usize)>,
+    dr_terms: Vec<DrTerm>,
+}
+
+fn pa_view(d: &DesignIn, t: &TaOut, pa: &PinAccess, refresh: bool) -> PaView {
+    let mut term_aps = HashSet::new();
+    for (i, inst) in d.insts.iter().enumerate() {
+        let c = pa.class_of[i];
+        if c == usize::MAX {
+            continue;
+        }
+        let rep = &d.insts[pa.reps[c]];
+        let shift = (inst.unique.location.0 - rep.unique.location.0, inst.unique.location.1 - rep.unique.location.1);
+        for (k, net) in inst.nets.iter().enumerate() {
+            let Some(n) = net.as_ref().and_then(|n| d.design.net_index.get(n)).copied() else { continue };
+            for aps in pa.class_aps[c].get(k).into_iter().flatten() {
+                for a in aps {
+                    term_aps.insert(((a.point.0 + shift.0, a.point.1 + shift.1), a.layer, n));
+                }
+            }
+        }
+    }
+    for (k, port) in d.ports.iter().enumerate() {
+        let Owner::Net(name) = &port.owner else { continue };
+        let Some(&n) = d.design.net_index.get(name) else { continue };
+        for a in pa.port_aps[k].iter().flatten() {
+            term_aps.insert((a.point, a.layer, n));
+        }
+    }
+    let mut dr_terms = t.dr_terms.clone();
+    if refresh {
+        for (k, term) in dr_terms.iter_mut().enumerate() {
+            if let Fixed::InstTerm { inst, term: tt, .. } = t.term_fixed[k] {
+                term.pins = inst_dr_pins(pa, &d.insts, &d.masters, inst, tt);
+            }
+        }
+    }
+    PaView { pa: pa.clone(), term_aps, dr_terms }
+}
+
 /// Routing's set-up: what the workers share.
 fn dr_init<'a>(d: &'a DesignIn, g: &'a GuidesIn, p: &'a Prep, t: &'a TaOut) -> DrCtx<'a> {
     let wires: Vec<(usize, usize, P, P)> = t.guides.iter().filter_map(|x| x.route.map(|(b, e)| (x.net, x.layer, b, e))).collect();
@@ -688,32 +769,7 @@ fn dr_init<'a>(d: &'a DesignIn, g: &'a GuidesIn, p: &'a Prep, t: &'a TaOut) -> D
     let gr_tree = PackedRTree::new(t.gr_pins.iter().map(|&(k, pt)| (Rect { xl: pt.0, yl: pt.1, xh: pt.0, yh: pt.1 }, k)).collect());
     let min_area = p.tech.layers.iter().map(|l| l.min_area).collect();
     let through = p.rules.layers.iter().map(|l| l.through).collect();
-    // Every connected terminal's access points: (point, layer, net).
-    let class_of = classes_of(d);
-    let mut term_aps = HashSet::new();
-    for (i, inst) in d.insts.iter().enumerate() {
-        let c = class_of[i];
-        if c == usize::MAX {
-            continue;
-        }
-        let rep = &d.insts[d.pa.reps[c]];
-        let shift = (inst.unique.location.0 - rep.unique.location.0, inst.unique.location.1 - rep.unique.location.1);
-        for (k, net) in inst.nets.iter().enumerate() {
-            let Some(n) = net.as_ref().and_then(|n| d.design.net_index.get(n)).copied() else { continue };
-            for aps in d.pa.class_aps[c].get(k).into_iter().flatten() {
-                for a in aps {
-                    term_aps.insert(((a.point.0 + shift.0, a.point.1 + shift.1), a.layer, n));
-                }
-            }
-        }
-    }
-    for (k, port) in d.ports.iter().enumerate() {
-        let Owner::Net(name) = &port.owner else { continue };
-        let Some(&n) = d.design.net_index.get(name) else { continue };
-        for a in d.pa.port_aps[k].iter().flatten() {
-            term_aps.insert((a.point, a.layer, n));
-        }
-    }
+    let pv = pa_view(d, t, &d.pa, false);
     let fixed_trees = d.design.fixed.iter().map(|v| PackedRTree::new(v.clone())).collect();
     let index_trees = d.design.fixed.iter().map(|v| PackedRTree::new(v.iter().enumerate().map(|(k, (b, _))| (*b, k)).collect())).collect();
     let inst_index = d.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
@@ -721,7 +777,7 @@ fn dr_init<'a>(d: &'a DesignIn, g: &'a GuidesIn, p: &'a Prep, t: &'a TaOut) -> D
     for (i, x) in d.insts.iter().enumerate() {
         term_base[i + 1] = term_base[i] + d.masters[&x.unique.master].terms.len();
     }
-    DrCtx { d, g, p, t, guide_trees, gr_tree, bpins, min_area, through, term_aps, class_of, fixed_trees, index_trees, inst_index, term_base, area_patches_dropped: Default::default() }
+    DrCtx { d, g, p, t, guide_trees, gr_tree, bpins, min_area, through, pv, fixed_trees, index_trees, inst_index, term_base, area_patches_dropped: Default::default(), skipped: Default::default() }
 }
 
 impl DrCtx<'_> {
@@ -781,7 +837,9 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
             tile_batches(&boxes, mt).into_iter().map(|b| b.into_iter().map(|i| WorkerBoxes { start: (0, 0), route: boxes[i], ext: bloat(&boxes[i], mt), drc: bloat(&boxes[i], 500) }).collect()).collect()
         }
         Flow::Stubborn => {
-            stubborn_tiles_flow(cx, routes, flow_state, iter, args, ripup_all, mt)?;
+            let done = stubborn_tiles_flow(cx, routes, flow_state, iter, args, ripup_all, mt);
+            cx.log_skipped(&mut *log);
+            done?;
             return check_then_fix_max_spacing(cx, routes, flow_state, max_spacing, log);
         }
         // `case SKIP: return;` — before the connectivity check and the max-spacing pass.
@@ -795,7 +853,9 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
     }
     for group in batches {
         let jobs: Vec<(WorkerBoxes, crate::dr::flow::IterArgs)> = group.into_iter().map(|w| (w, *args)).collect();
-        let results = route_batch(cx, routes, iter, ripup_all, &jobs)?;
+        let results = route_batch(cx, routes, iter, ripup_all, &jobs);
+        cx.log_skipped(&mut *log);
+        let results = results?;
         if flow == Flow::Optimization && results.iter().any(|r| r.4) {
             *increase_clip = true;
         }
@@ -831,8 +891,84 @@ fn check_then_fix_max_spacing(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_st
         let d = cx.d;
         let pa = PaIn { tech: &d.tech, tracks: &d.tracks, cfg: &d.cfg, masters: &d.masters, insts: &d.insts, first: &d.pa };
         let pass = PassIn { tech: &cx.p.tech, defaults: &cx.p.defaults, block_vias: &d.block_vias, fixed: &d.design.fixed, fixed_trees: &cx.fixed_trees, grid: &cx.g.grid, net_name: &net_name, inst_term_name: &inst_term_name, pa: Some(pa) };
-        fix_max_spacing(&pass, routes, max_spacing, log)?;
+        fix_max_spacing(&pass, routes, max_spacing, log, &mut |routes, merged, st, log| via_swap_workers(cx, routes, merged, st, log))?;
         flow_state.fixing_max_spacing = true;
+    }
+    Ok(())
+}
+
+/// What a via-swap worker reads beyond a worker's: per cut layer, its secondary via defs (indices
+/// into the router's technology); the pass's trace lines, when tracing.
+struct SwapIn<'a> {
+    tech: &'a Tech,
+    secondary: &'a [Vec<usize>],
+    trace: Option<std::cell::RefCell<Vec<String>>>,
+}
+
+impl SwapIn<'_> {
+    /// ⛔ MEASUREMENT ONLY: the queue's swap events as the correlation instrument prints the
+    /// reference's (`VYC MAXSPC VS init/swap/gc`).
+    fn trace(&self, ev: &Event, name: &dyn Fn(usize) -> String) {
+        let Some(lines) = &self.trace else { return };
+        let def = |v: usize| self.tech.via_defs[v].name.clone();
+        let line = match ev {
+            Event::SwapInit { net, via } => format!("VYC MAXSPC VS init net={} def={}", name(*net), def(*via)),
+            Event::Swap { net, reroute, old, new, no_solution } => format!("VYC MAXSPC VS swap net={} reroute={reroute} old={} new={} nosol={}", name(*net), def(*old), def(*new), u8::from(*no_solution)),
+            Event::SwapCheck { net, markers } => format!("VYC MAXSPC VS gc net={} markers={markers}", name(*net)),
+            _ => return,
+        };
+        lines.borrow_mut().push(line);
+    }
+}
+
+/// `FlexDR::fixMaxSpacing`'s workers: per merged region in order (serially: the reference's loop
+/// runs them in parallel but writes each back in a critical section, and its runs here are
+/// single-threaded), a worker on the region (extended by the multi-thread safe distance, its check
+/// box by 500), iteration 64, `RipUpMode::VIASWAP`, the worker's default costs; written back
+/// unless it ends worse. The workers read pin access as the pass's re-run left it. Err: a
+/// secondary via def the router's technology does not hold (a generated `_FR` def).
+fn via_swap_workers(cx: &DrCtx<'_>, routes: &mut DesignRoutes, merged: &[Rect], st: &MaxSpacingState, log: Sink) -> Res<()> {
+    let tech = &cx.p.tech;
+    let mut secondary: Vec<Vec<usize>> = vec![Vec::new(); tech.layers.len()];
+    for (l, defs) in st.secondary.iter().enumerate() {
+        for v in defs {
+            let k = tech.via_defs.iter().position(|x| x.name == v.name).ok_or_else(|| format!("lef58_max_spacing: the secondary via def {} is generated (not in the technology); a via swap to it is not modelled", v.name))?;
+            secondary[l].push(k);
+        }
+    }
+    let fresh;
+    let pv = match &st.pa {
+        Some(pa) => {
+            fresh = pa_view(cx.d, cx.t, pa, true);
+            &fresh
+        }
+        None => &cx.pv,
+    };
+    let mt = mt_safe_dist(tech, &cx.d.ndrs.iter().collect::<Vec<_>>());
+    let bloat = |r: &Rect, k: i32| Rect { xl: r.xl - k, yl: r.yl - k, xh: r.xh + k, yh: r.yh + k };
+    // `FlexDRWorker`'s defaults: maze end 1, the shape and marker costs, no fixed-shape cost, no
+    // decay, guides not followed.
+    let args = crate::dr::flow::IterArgs { size: 0, offset: 0, maze_end: 1, drc_cost: ROUTE_SHAPE_COST, marker_cost: MARKER_COST, fixed_cost: 0, decay: 0.0, ripup: RipUp::ViaSwap, follow_guide: false };
+    const ITER: usize = 64;
+    for r in merged {
+        let w = WorkerBoxes { start: (0, 0), route: *r, ext: bloat(r, mt), drc: bloat(r, 500) };
+        let sw = SwapIn { tech, secondary: &secondary, trace: st.trace.then(Default::default) };
+        let res = route_worker(cx, pv, routes, ITER, &args, false, &w, Some(&sw));
+        cx.log_skipped(&mut *log);
+        let (w, routed, markers, wm, _) = res?;
+        let best = in_check_box(&markers, &w.drc).len();
+        if let Some(lines) = sw.trace {
+            for l in lines.into_inner() {
+                log(Line::OwnInfo(l));
+            }
+            log(Line::OwnInfo(format!("VYC MAXSPC WORKER box=({},{},{},{}) init={} best={best}", r.xl, r.yl, r.xh, r.yh, wm.init_num)));
+        }
+        if written_back(ITER, RipUp::ViaSwap, &wm, best) {
+            end_worker(cx, routes, &w, &routed, &markers, ITER);
+        }
+    }
+    if st.trace {
+        log(Line::OwnInfo(format!("VYC MAXSPC DONE markers={}", routes.markers().count())));
     }
     Ok(())
 }
@@ -891,9 +1027,9 @@ fn stubborn_tiles_flow(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &m
 fn route_batch(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, ripup_all: bool, jobs: &[(WorkerBoxes, crate::dr::flow::IterArgs)]) -> Res<Vec<WorkerResult>> {
     use rayon::prelude::*;
     let routed: Vec<Res<WorkerResult>> = if rayon::current_num_threads() > 1 {
-        jobs.par_iter().map(|(w, a)| route_worker(cx, routes, iter, a, ripup_all, w)).collect()
+        jobs.par_iter().map(|(w, a)| route_worker(cx, &cx.pv, routes, iter, a, ripup_all, w, None)).collect()
     } else {
-        jobs.iter().map(|(w, a)| route_worker(cx, routes, iter, a, ripup_all, w)).collect()
+        jobs.iter().map(|(w, a)| route_worker(cx, &cx.pv, routes, iter, a, ripup_all, w, None)).collect()
     };
     routed.into_iter().collect()
 }
@@ -903,12 +1039,13 @@ fn route_batch(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, ripup_all: bo
 type WorkerResult = (WorkerBoxes, Vec<(usize, Vec<DrFig>)>, Vec<Marker>, crate::dr::flow::WorkerMarkers, bool);
 
 /// One worker: its nets, grid, costs and queue. Its routed nets' shapes, its final markers.
-fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, w: &WorkerBoxes) -> Res<WorkerResult> {
+#[allow(clippy::too_many_arguments)]
+fn route_worker(cx: &DrCtx<'_>, pv: &PaView, routes: &DesignRoutes, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, w: &WorkerBoxes, swap: Option<&SwapIn<'_>>) -> Res<WorkerResult> {
     let (d, p, t) = (cx.d, cx.p, cx.t);
     let tech = &p.tech;
     let term_shape_at = |k: usize, pt: (i32, i32), l: usize| cx.term_shapes(&t.term_fixed[k]).iter().any(|&(tl, r)| tl == l && r.xl <= pt.0 && pt.0 <= r.xh && r.yl <= pt.1 && pt.1 <= r.yh);
-    let term_at = |pt: (i32, i32), l: usize, net: usize| -> Vec<usize> { (0..t.dr_terms.len()).filter(|&k| t.dr_terms[k].net == Some(net) && term_shape_at(k, pt, l)).collect() };
-    let dinp = DrNetInput { grid: &cx.g.grid, guides: &cx.guide_trees, gr_pins: &cx.gr_tree, terms: &t.dr_terms, min_area: &cx.min_area, routes: Some((tech, routes)), term_at: Some(&term_at), top_routing_layer: d.cfg.top_routing_layer };
+    let term_at = |pt: (i32, i32), l: usize, net: usize| -> Vec<usize> { (0..pv.dr_terms.len()).filter(|&k| pv.dr_terms[k].net == Some(net) && term_shape_at(k, pt, l)).collect() };
+    let dinp = DrNetInput { grid: &cx.g.grid, guides: &cx.guide_trees, gr_pins: &cx.gr_tree, terms: &pv.dr_terms, min_area: &cx.min_area, routes: Some((tech, routes)), term_at: Some(&term_at), top_routing_layer: d.cfg.top_routing_layer, skipped: Some(&cx.skipped) };
     let wm = worker_markers(routes.markers_in(&w.drc), iter);
     let built = if wm.skipped(iter) {
         Vec::new()
@@ -946,19 +1083,20 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
         .map(|r| (d.ndrs.iter().find(|x| x.name == r.name).expect("a rule"), p.rules.ndrs.iter().find(|x| x.name == r.name).map(|x| x.eol.clone()).unwrap_or_default()))
         .collect();
     let term_shapes = |f: &Fixed| cx.term_shapes(f);
-    let port_aps = |k: usize| -> Vec<DrAp> { d.pa.port_aps[k].iter().flatten().map(|a| DrAp { point: a.point, layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect() };
+    let port_aps = |k: usize| -> Vec<DrAp> { pv.pa.port_aps[k].iter().flatten().map(|a| DrAp { point: a.point, layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect() };
     let inst_is_block = |i: usize| d.insts[i].is_block;
     let inst_is_macro = |i: usize| d.insts[i].class == crate::pa::flow::MasterClass::Macro;
     // A terminal's access points per pin, in design coordinates: its class representative's,
     // shifted by the instance's offset from it (as the connected-terminal set is built).
     let inst_term_aps = |i: usize, k: usize| -> Vec<Vec<DrAp>> {
-        let c = cx.class_of[i];
+        let pa = &pv.pa;
+        let c = pa.class_of[i];
         if c == usize::MAX {
             return Vec::new();
         }
-        let (inst, rep) = (&d.insts[i], &d.insts[d.pa.reps[c]]);
+        let (inst, rep) = (&d.insts[i], &d.insts[pa.reps[c]]);
         let shift = (inst.unique.location.0 - rep.unique.location.0, inst.unique.location.1 - rep.unique.location.1);
-        d.pa.class_aps[c].get(k).map_or(Vec::new(), |pins| {
+        pa.class_aps[c].get(k).map_or(Vec::new(), |pins| {
             pins.iter().map(|aps| aps.iter().map(|a| DrAp { point: (a.point.0 + shift.0, a.point.1 + shift.1), layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() }).collect()).collect()
         })
     };
@@ -979,7 +1117,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
     };
     let mut cw = CostWorker { cx: &ccx, g: &mut g, ap_svia: Default::default() };
     init_maze_cost(&mut cw, &nets, &w.ext, &rule_of).map_err(|e| e.0)?;
-    let (routed, markers) = run_queue(cx, &mut cw, &nets, &wm, iter, args, ripup_all, &near_ripped, w);
+    let (routed, markers) = run_queue(cx, pv, &mut cw, &nets, &wm, iter, args, ripup_all, &near_ripped, w, swap);
     // identifyCongestionLevel, at the worker's end, iterations 7 to 30.
     let congested = (7..=30).contains(&iter) && {
         let pts: Vec<Vec<((i32, i32), usize)>> = nets.iter().map(|n| n.pins.iter().filter(|p| p.term.is_none()).flat_map(|p| p.patterns.iter().map(|a| (a.point, a.layer))).collect()).collect();
@@ -992,7 +1130,7 @@ fn route_worker(cx: &DrCtx<'_>, routes: &DesignRoutes, iter: usize, args: &crate
 /// whose worker nets rerouted, in worker order: a rerouted one's last shapes, another's the
 /// routes it started from) and its final markers.
 #[allow(clippy::too_many_arguments)]
-fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &crate::dr::flow::WorkerMarkers, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, near_ripped: &[usize], w: &WorkerBoxes) -> (Vec<(usize, Vec<DrFig>)>, Vec<Marker>) {
+fn run_queue(cx: &DrCtx<'_>, pv: &PaView, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &crate::dr::flow::WorkerMarkers, iter: usize, args: &crate::dr::flow::IterArgs, ripup_all: bool, near_ripped: &[usize], w: &WorkerBoxes, swap: Option<&SwapIn<'_>>) -> (Vec<(usize, Vec<DrFig>)>, Vec<Marker>) {
     let (d, p, t) = (cx.d, cx.p, cx.t);
     let tech = &p.tech;
     let (r, e) = (w.route, w.ext);
@@ -1024,13 +1162,13 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
         .iter()
         .map(|n| {
             let id = n.net;
-            Box::new(move |pt: (i32, i32), l: usize| cx.term_aps.contains(&(pt, l, id))) as Box<dyn Fn((i32, i32), usize) -> bool>
+            Box::new(move |pt: (i32, i32), l: usize| pv.term_aps.contains(&(pt, l, id))) as Box<dyn Fn((i32, i32), usize) -> bool>
         })
         .collect();
-    let pin_name = |pn: &DrPin| pn.term.map_or(String::new(), |k| t.dr_terms[k].name.strip_prefix("PIN/").unwrap_or(&t.dr_terms[k].name).to_string());
+    let pin_name = |pn: &DrPin| pn.term.map_or(String::new(), |k| pv.dr_terms[k].name.strip_prefix("PIN/").unwrap_or(&pv.dr_terms[k].name).to_string());
     let tf = |k: usize| t.term_fixed[k];
     let mt = |k: usize| t.macro_term[k];
-    let ipt = |k: usize| t.dr_terms[k].is_port;
+    let ipt = |k: usize| pv.dr_terms[k].is_port;
     let net_ctx = |i: usize| NetCtx { ext_box: &e, guides: &guides[i], term_fixed: &tf, is_macro_term: &mt, pin_name: &pin_name, ndr: ndr_t[i], auto_taper: !d.no_taper.contains(&nets[i].net), route_with_jumpers: d.jumpers.contains(&nets[i].net), is_port_term: &ipt, has_access_point: haps[i].as_ref(), ndr_rule: ndr_rule[i], route_box: r, ndr_cost: ndr_eol[i] };
     let ndr = |i: usize| ndr_eol[i];
     let max_avoids = |i: usize| if st_nets[nets[i].net].is_clock { 100 } else if st_nets[nets[i].net].ndr.is_some() { 3 } else { 0 };
@@ -1090,16 +1228,36 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
     if !args.follow_guide {
         mst.all_guided();
     }
+    // Per worker net, its latest figures; the worker nets marked modified (`setModified`).
     let mut last: BTreeMap<usize, Vec<DrFig>> = BTreeMap::new();
+    let mut kept: BTreeSet<usize> = BTreeSet::new();
     let mut final_markers = Vec::new();
-    let start = if ripup_all || near { Start::Nets(&order) } else { Start::Markers(&worker_markers) };
+    let start = match swap {
+        Some(sw) => Start::ViaSwap(sw.secondary),
+        None if ripup_all || near => Start::Nets(&order),
+        None => Start::Markers(&worker_markers),
+    };
     for ev in route_queue(cw, &mut mst, &q, nets, start, hist) {
+        if let Some(sw) = swap {
+            sw.trace(&ev, &name_of);
+        }
         match ev {
             Event::Route { net, figs, .. } => {
                 last.insert(net, figs);
+                kept.insert(net);
             }
             // A check patch joins the net's route (and marks it modified).
-            Event::Patch { net, fig, .. } => last.entry(net).or_insert_with(|| nets[net].route.clone()).push(fig),
+            Event::Patch { net, fig, .. } => {
+                last.entry(net).or_insert_with(|| nets[net].route.clone()).push(fig);
+                kept.insert(net);
+            }
+            // A swap changes the net's figures; only a clean check keeps the net.
+            Event::SwapFigs { net, figs } => {
+                last.insert(net, figs);
+            }
+            Event::SwapCheck { net, markers: 0 } => {
+                kept.insert(net);
+            }
             Event::Final { markers, .. } => final_markers = markers,
             Event::AreaPatchesDropped(n) => {
                 cx.area_patches_dropped.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1107,7 +1265,7 @@ fn run_queue(cx: &DrCtx<'_>, cw: &mut CostWorker<'_, '_>, nets: &[DrNet], wm: &c
             _ => {}
         }
     }
-    let modified: BTreeSet<usize> = last.keys().map(|&i| nets[i].net).collect();
+    let modified: BTreeSet<usize> = kept.iter().map(|&i| nets[i].net).collect();
     let mut routed = Vec::new();
     for (i, n) in nets.iter().enumerate() {
         if modified.contains(&n.net) {

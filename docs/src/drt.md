@@ -144,9 +144,17 @@ reference's warning (DRT-350). Then, per such via, its marker, the three-by-thre
 around it and the pin terminals it lands on, and the regions' merge, as the reference does them.
 The pin-access re-run for those terminals follows: the instances they belong to are reclassified
 with the terminals in their class key, their access points regenerated without the rule's vias,
-and their rows' patterns chosen again. The via-swap workers that come next are not modelled yet: a
-run that reaches them is refused there (exit 3; `reason` names `lef58_max_spacing`, the stage and
-its counts), and nothing is written. Where the re-run leaves a terminal with no access point, the
+and their rows' patterns chosen again. Then the via-swap workers, one per merged region: each
+walks every lonely via in its region, gives it the layer's next secondary via def, checks the net,
+and keeps the swap only when the check is clean; a worker that ends with more markers than it began
+with is not written back. Two points differ from the reference on purpose, each the reference's own
+upstream fix: when a via has tried every secondary def it goes back to the def it had and the
+worker's check is told (the reference takes the layer's default via and checks the last one it
+tried, which leaves markers for a via that is in neither the route nor the design: upstream OpenROAD
+issue #12203); and a worker
+that holds none of a re-run terminal's new access points leaves that terminal out with warning
+DRT-356 (the reference stops with DRT-1231, upstream OpenROAD issue #12200). Minimum-step patching
+of a swapped via is not modelled yet. Where the re-run leaves a terminal with no access point, the
 reference itself aborts (DRT-0073, upstream OpenROAD issue #12199); the run is refused at the same
 point with exit 4, `reason` and the report's `reference_aborts` name the error and the issue, and
 nothing is written. A re-run that needs the nearby-track access rounds, which this engine does not

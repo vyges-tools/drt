@@ -418,7 +418,7 @@ mod tests {
         let v = |name: &str, cut: usize, cuts: usize| ViaDef { name: name.into(), is_default: true, layer1: cut - 1, cut, layer2: cut + 1, layer1_figs: vec![], cut_figs: vec![Rect::new(0, 0, 1, 1); cuts], layer2_figs: vec![], cut_class: None };
         t.via_defs = vec![v("L1M1", 3, 1), v("M1M2", 5, 1), v("M2M3", 7, 1), v("M2M3x2", 7, 2)];
         let seg = |layer: usize, len: i32| DrFig::Seg { layer, begin: (0, 0), end: (len, 0), width: 1, begin_ext: 0, end_ext: 0, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false };
-        let via = |via: usize| DrFig::Via { via, origin: (0, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false };
+        let via = |via: usize| DrFig::Via { via, origin: (0, 0), bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, bottom_connected: false, top_connected: false, lonely: false };
         let mut figs = vec![seg(4, 256_728_999), seg(6, 288_254_000)];
         figs.extend(std::iter::repeat_n(via(0), 36455));
         figs.extend(std::iter::repeat_n(via(1), 48766));

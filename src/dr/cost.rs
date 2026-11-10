@@ -895,7 +895,11 @@ pub enum DrFig {
     /// `tapered`: a non-default-rule net's via inside a pin's taper box.
     /// `bottom_connected` / `top_connected`: the via's end on the layer below / above lands on an
     /// access point of the net's pin (under the rule that truncates a wire end there).
-    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool, bottom_connected: bool, top_connected: bool },
+    /// `lonely`: the LEF58_MAXSPACING pass found the via with no other cut within the rule's
+    /// spacing (`frVia::isLonely_`). STICKY, as upstream's: set by `getLonelyVias`, copied by
+    /// every via copy (the worker's `drVia(frVia)`, the write-back's `frVia(drVia)`, a swap's
+    /// `drVia(*old)`), never cleared — a via swapped since, or no longer lonely, keeps it.
+    Via { via: usize, origin: P, bi: (usize, usize, usize), ei: (usize, usize, usize), tapered: bool, bottom_connected: bool, top_connected: bool, lonely: bool },
     Patch { layer: usize, origin: P, offset: Rect },
 }
 
