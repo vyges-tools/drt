@@ -150,7 +150,15 @@ fix prints, DRT-359, where the unpatched reference keeps only `w1`, upstream Ope
 `LEF58_AREA` on a routing layer (`AREA a` with `RECTWIDTH w` or `EXCEPTRECTANGLE`: checked, and
 patched on the routed net as the reference patches it; a rule with `EXCEPTMINWIDTH`,
 `EXCEPTEDGELENGTH`, `EXCEPTMINSIZE`, `EXCEPTSTEP`, `MASK` or `LAYER` is skipped with a warning, as
-the reference skips it), and the orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
+the reference skips it), `LEF58_MINSTEP` on a routing layer (`MINSTEP l … NOBETWEENEOL w`: a
+line end narrower than `w` between two edges shorter than `l`; `MINSTEP l … MINADJACENTLENGTH m`,
+with `EXCEPTRECTANGLE`: an edge shorter than `l` beside one shorter than `m`; checked per rule, a marker named `Min Step` as the
+reference names it, and patched by the via-swap workers' minimum-step patch as the reference
+patches it; a rule with `MAXEDGES` above 1 is skipped with the reference's warning, DRT-335; a
+rule with `NOADJACENTEOL`, `EXCEPTRECTANGLE` with `NOBETWEENEOL`, `MINBETWEENLENGTH`, a second
+`MINADJACENTLENGTH` value or its corner forms, or neither checked form, is refused, since the
+reference's check reads none of them as the LEF defines them), and the
+orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
 and closer than `s` across that run, is marked; the marker names the pair as its victims, each
 box its cut, which the router reads when it picks the nets to rip up; the unpatched reference

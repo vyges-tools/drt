@@ -220,7 +220,7 @@ pub fn viol_name(rule: Rule) -> &'static str {
         Rule::CornerSpacing => "Corner Spacing",
         Rule::Lef58CutSpacingTable | Rule::Lef58CutSpacingTableInter => "CutSpcTbl",
         Rule::Lef58CutSpacing(_) => "Cut Spacing",
-        Rule::MinStep => "Min Step",
+        Rule::MinStep | Rule::Lef58MinStep(_) => "Min Step",
         Rule::MinimumCut => "Minimum Cut",
         Rule::SpacingRange => "SpacingRange",
         Rule::Lef58Enclosure => "Lef58Enclosure",

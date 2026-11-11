@@ -106,6 +106,9 @@ pub struct Layer {
     pub mt_safe_dist: i32,
     /// A routing layer's v5.8 MINSTEP rule as io keeps it (`frMinStepConstraint`).
     pub min_step: Option<MinStep>,
+    /// A routing layer's LEF58_MINSTEP rules io keeps (`frLef58MinStepConstraint`), in the
+    /// technology's order: every rule but one with MAXEDGES above 1 (skipped, DRT-335).
+    pub lef58_min_step: Vec<Lef58MinStep>,
     /// A routing layer's v5.4 SPACING … RANGE rules, in the technology's order
     /// (`frSpacingRangeConstraint`; io keeps them out of the spacing table).
     pub spacing_ranges: Vec<SpacingRange>,
@@ -229,6 +232,24 @@ pub struct MinStep {
     pub max_length: i32,
     /// MAXEDGES, -1 without one.
     pub max_edges: i32,
+}
+
+/// `frLef58MinStepConstraint` as io keeps a LEF58_MINSTEP rule. Only two forms are checked
+/// (`checkMetalShape_lef58MinStep`): NOBETWEENEOL (`eol_width`) and MINADJACENTLENGTH
+/// (`min_adjacent_length`, with NOADJACENTEOL's width and EXCEPTRECTANGLE); io keeps the rest of
+/// the rule (MAXEDGES, the second length, the corner forms, MINBETWEENLENGTH) unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Lef58MinStep {
+    pub min_step_length: i32,
+    /// MAXEDGES, -1 without one (kept; the check never reads it).
+    pub max_edges: i32,
+    /// MINADJACENTLENGTH's first value, -1 without one.
+    pub min_adjacent_length: i32,
+    /// NOADJACENTEOL's width, -1 without one.
+    pub no_adj_eol: i32,
+    /// NOBETWEENEOL's width, -1 without one.
+    pub eol_width: i32,
+    pub except_rectangle: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1487,7 +1508,8 @@ pub mod read {
                     });
                     let min_cuts = v54_min_cuts(db, &name);
                     let lef58_area = lef58_area_rules(db, &name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![] });
+                    let lef58_min_step = lef58_min_step_rules(db, &name);
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![] });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1656,6 +1678,90 @@ pub mod read {
         (0..db.num_layer_get_tech_layer_max_spacing_rules(layer))
             .filter(|&k| !db.maxspacingrule_has_cut_class(layer, k))
             .map(|_| (350, format!("LEF58_MAXSPACING with no CUTCLASS is not supported. Skipping for layer {layer}")))
+            .collect()
+    }
+
+    /// The LEF58_MINSTEP rules of routing layer `layer` io keeps, in the technology's order
+    /// (`setRoutingLayerProperties`, after the end-of-line rules). Upstream rule: a rule whose
+    /// MAXEDGES is above 1 is skipped with a warning ([`lef58_min_step_skip_warnings`]); the rest
+    /// keep MINSTEP, MAXEDGES (-1 when not given), MINADJACENTLENGTH's first value (-1 when not
+    /// given), the end-of-line width as NOADJACENTEOL's or as NOBETWEENEOL's (-1 for the other),
+    /// and EXCEPTRECTANGLE.
+    pub fn lef58_min_step_rules(db: &Db, layer: &str) -> Vec<Lef58MinStep> {
+        (0..db.num_layer_get_tech_layer_min_step_rules(layer))
+            .filter(|&k| !lef58_min_step_skipped(db, layer, k))
+            .map(|k| {
+                let eol = db.minsteprule_get_eol_width(layer, k);
+                let max_edges =
+                    i32::try_from(db.minsteprule_get_max_edges(layer, k)).unwrap_or(i32::MAX);
+                Lef58MinStep {
+                    min_step_length: db.minsteprule_get_min_step_length(layer, k),
+                    max_edges: if db.minsteprule_is_max_edges_valid(layer, k) {
+                        max_edges
+                    } else {
+                        -1
+                    },
+                    min_adjacent_length: if db.minsteprule_is_min_adj_length1_valid(layer, k) {
+                        db.minsteprule_get_min_adj_length1(layer, k)
+                    } else {
+                        -1
+                    },
+                    no_adj_eol: if db.minsteprule_is_no_adjacent_eol(layer, k) { eol } else { -1 },
+                    eol_width: if db.minsteprule_is_no_between_eol(layer, k) { eol } else { -1 },
+                    except_rectangle: db.minsteprule_is_except_rectangle(layer, k),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether io skips LEF58_MINSTEP rule `k` of `layer`. Upstream rule: MAXEDGES above 1, read
+    /// whether or not the rule gives MAXEDGES (the database's 0 when it does not).
+    pub fn lef58_min_step_skipped(db: &Db, layer: &str, k: usize) -> bool {
+        db.minsteprule_get_max_edges(layer, k) > 1
+    }
+
+    /// The first clause of LEF58_MINSTEP rule `k` of `layer` the reference's check does not read
+    /// as the LEF defines it, so this engine REFUSES it (a rule io skips is not one of these):
+    /// NOADJACENTEOL (alone it is never checked; with MINADJACENTLENGTH the length is read as one
+    /// more violation, where the LEF makes it a condition on the other neighbour edge), EXCEPTRECTANGLE
+    /// with NOBETWEENEOL (that check never reads it), MINBETWEENLENGTH, a second MINADJACENTLENGTH
+    /// value or its CONVEXCORNER / CONCAVECORNER (the check reads only the first length and ignores
+    /// the corner), or a rule with neither NOBETWEENEOL nor MINADJACENTLENGTH (kept by io and never
+    /// checked). The forms the foundry kits use (MAXEDGES 1 with MINADJACENTLENGTH or NOBETWEENEOL)
+    /// are none of these.
+    pub fn lef58_min_step_unmodelled(db: &Db, layer: &str, k: usize) -> Option<&'static str> {
+        if lef58_min_step_skipped(db, layer, k) {
+            None
+        } else if db.minsteprule_is_no_adjacent_eol(layer, k) {
+            Some("NOADJACENTEOL")
+        } else if db.minsteprule_is_except_rectangle(layer, k) && db.minsteprule_is_no_between_eol(layer, k) {
+            Some("EXCEPTRECTANGLE with NOBETWEENEOL")
+        } else if db.minsteprule_is_min_between_length_valid(layer, k) {
+            Some("MINBETWEENLENGTH")
+        } else if db.minsteprule_is_min_adj_length2_valid(layer, k) {
+            Some("MINADJACENTLENGTH with a second length")
+        } else if db.minsteprule_is_convex_corner(layer, k) {
+            Some("MINADJACENTLENGTH CONVEXCORNER")
+        } else if db.minsteprule_is_concave_corner(layer, k) {
+            Some("MINADJACENTLENGTH CONCAVECORNER")
+        } else if !db.minsteprule_is_no_between_eol(layer, k)
+            && !db.minsteprule_is_min_adj_length1_valid(layer, k)
+        {
+            Some("neither NOBETWEENEOL nor MINADJACENTLENGTH (never checked)")
+        } else {
+            None
+        }
+    }
+
+    /// io's warnings for the LEF58_MINSTEP rules of routing layer `layer` it skips, in the
+    /// rules' order: DRT-335 with the MAXEDGES value (the text as the reference words it).
+    pub fn lef58_min_step_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_min_step_rules(layer))
+            .filter(|&k| lef58_min_step_skipped(db, layer, k))
+            .map(|k| {
+                let n = db.minsteprule_get_max_edges(layer, k);
+                (335, format!("LEF58_MINSTEP MAXEDGES {n}  is not supported"))
+            })
             .collect()
     }
 

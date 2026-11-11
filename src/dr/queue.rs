@@ -580,13 +580,14 @@ fn flush_pending(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &
 /// `target`: the worker net checked (`setTargetNet(drNet)`), none after the queue. The check's
 /// markers and patches, and the count of area patches dropped for want of a worker net.
 /// `patchMetalShape` starts with `patchMetalShape_minStep` ([`patch_min_step`]) on the
-/// minimum-step markers of `checkMetalShape(true)`, when the technology keeps a MINSTEP rule
-/// (`hasCornerSpacingConstraint()`, which only a MINSTEP rule sets, or `hasVia2ViaMinStep()`);
-/// it patches only in a via-swap worker (`via_swap`).
+/// minimum-step markers of `checkMetalShape(true)`, when the technology keeps a MINSTEP or a
+/// LEF58_MINSTEP rule (`hasCornerSpacingConstraint()`, which only those rules set in
+/// `frTechObject::addUConstraint`, or `hasVia2ViaMinStep()`); it patches only in a via-swap
+/// worker (`via_swap`).
 #[allow(clippy::too_many_arguments)]
 fn gc_main_surgical(gw: &mut Worker<'_>, q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], rq: &RouteRq, target: Option<usize>, via_swap: bool) -> (Vec<Marker>, Vec<(usize, PatchWire)>, usize) {
     let (mut pw, dropped) = own_area_patches(gw.area_patches(), &|p| area_patch_owner(q, nets, state, p), &q.route_box);
-    if q.mcfg.tech.layers.iter().any(|l| l.min_step.is_some()) {
+    if q.mcfg.tech.layers.iter().any(|l| l.min_step.is_some() || !l.lef58_min_step.is_empty()) {
         let markers = gw.min_step_markers();
         pw.extend(patch_min_step(q, state, rq, &markers, gw.target.as_ref(), via_swap));
     }
@@ -762,7 +763,8 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
 /// box on the layer, lonely.
 type ViasByOrigin = BTreeMap<(i32, i32), Vec<(usize, Rect, bool)>>;
 
-/// `patchMetalShape_minStep`: per minimum-step marker, in order, on a routing layer beside a cut
+/// `patchMetalShape_minStep`: per minimum-step marker (MINSTEP or LEF58_MINSTEP, the reference's
+/// `frcMinStepConstraint` or `frcLef58MinStepConstraint`), in order, on a routing layer beside a cut
 /// layer that keeps a LEF58_MAXSPACING rule (the via-to-via half of its condition is refused
 /// before routing, `min_step_via`) and at least the layer's width long on one side: the vias of
 /// the marker's first source net (and the target's, with one) in the worker's region query of
@@ -779,7 +781,7 @@ fn patch_min_step(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, markers: &
     let tech = q.mcfg.tech;
     let max_spacing = |l: Option<usize>| l.and_then(|l| tech.layers.get(l)).is_some_and(|c| !c.lef58_max_spacing.is_empty());
     let mut out = Vec::new();
-    for m in markers.iter().filter(|m| m.rule == Rule::MinStep) {
+    for m in markers.iter().filter(|m| matches!(m.rule, Rule::MinStep | Rule::Lef58MinStep(_))) {
         let l = m.layer;
         let layer = &tech.layers[l];
         if !max_spacing(l.checked_sub(1)) && !max_spacing(Some(l + 1)) {
@@ -1407,7 +1409,7 @@ mod tests {
     // side, else to the right. Vertical: the same across.
     // D12 (register; upstream OpenROAD issue #12207, fix 0014): we corner-patch whenever the technology has corner
     // spacing. The reference's gate (`hasVia2ViaMinStep() || hasCornerSpacingConstraint()`, the
-    // flag set only by MINSTEP / LEF58 MINSTEP in `frTechObject::addUConstraint`) corner-patches
+    // flag set only by MINSTEP / LEF58_MINSTEP in `frTechObject::addUConstraint`) corner-patches
     // only a technology that also has a MINSTEP rule; 0014 sets it from corner spacing.
     #[test]
     fn corner_patches_follow_corner_spacing_not_min_step() {

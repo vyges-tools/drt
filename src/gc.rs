@@ -124,6 +124,10 @@ pub enum Rule {
     /// A run of edges shorter than the layer's MINSTEP between two longer ones
     /// (`checkMetalShape_minStep`).
     MinStep,
+    /// A short edge breaking a LEF58_MINSTEP rule (`checkMetalShape_lef58MinStep`), named as
+    /// [`Rule::MinStep`]; the rule's place among the layer's kept rules (the reference keeps a
+    /// marker once per constraint).
+    Lef58MinStep(u16),
     /// A wide metal rectangle reached by a single cut where MINIMUMCUT needs more
     /// (`checkMinimumCut`).
     MinimumCut,
@@ -423,6 +427,103 @@ fn min_step_marks(con: &crate::tech::MinStep, edges: i32, length: i32, has_route
         Some(crate::tech::MinStepKind::Step) => length > con.max_length,
         None => con.max_edges == -1 || edges > con.max_edges,
     }
+}
+
+/// A ring edge's length.
+fn ring_len(e: &RingEdge) -> i32 {
+    (e.1 .0 - e.0 .0).abs() + (e.1 .1 - e.0 .1).abs()
+}
+
+/// Whether the corner where ring edge `a` ends and `b` starts is CONVEX (a left turn: the
+/// shape's inside is on each edge's left).
+fn ring_convex(a: &RingEdge, b: &RingEdge) -> bool {
+    let (ax, ay) = (i64::from(a.1 .0 - a.0 .0), i64::from(a.1 .1 - a.0 .1));
+    let (bx, by) = (i64::from(b.1 .0 - b.0 .0), i64::from(b.1 .1 - b.0 .1));
+    ax * by - ay * bx > 0
+}
+
+/// The box joining ring edges' end points.
+fn ring_box(edges: &[&RingEdge]) -> Rect {
+    let pts = edges.iter().flat_map(|e| [e.0, e.1]);
+    let (mut xl, mut yl, mut xh, mut yh) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for (x, y) in pts {
+        (xl, yl, xh, yh) = (xl.min(x), yl.min(y), xh.max(x), yh.max(y));
+    }
+    Rect::new(xl, yl, xh, yh)
+}
+
+/// The start edges of a LEF58_MINSTEP check: every edge of every ring (outer, then holes) shorter
+/// than MINSTEP, in ring order, as (ring, index).
+fn lef58_min_step_starts(rings: &[Vec<RingEdge>], min_step_length: i32) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (r, ring) in rings.iter().enumerate() {
+        out.extend((0..ring.len()).filter(|&i| ring_len(&ring[i]) < min_step_length).map(|i| (r, i)));
+    }
+    out
+}
+
+/// `checkMetalShape_lef58MinStep_noBetweenEol` on one pin's rings. Upstream rule: per start edge
+/// ([`lef58_min_step_starts`]), skip unless the edge after next is shorter than MINSTEP, the next
+/// edge has both corners CONVEX and is shorter than the NOBETWEENEOL width, and not all three
+/// edges are fixed; the box joins the start edge's two ends and the next two edges' far ends.
+pub(crate) fn lef58_min_step_no_between_eol_boxes(
+    rings: &[Vec<RingEdge>],
+    con: &crate::tech::Lef58MinStep,
+) -> Vec<Rect> {
+    let mut out = Vec::new();
+    for (r, i) in lef58_min_step_starts(rings, con.min_step_length) {
+        let ring = &rings[r];
+        let n = ring.len();
+        let (start, next, nnext) = (&ring[i], &ring[(i + 1) % n], &ring[(i + 2) % n]);
+        if ring_len(nnext) >= con.min_step_length {
+            continue;
+        }
+        if !ring_convex(start, next) || !ring_convex(next, nnext) {
+            continue;
+        }
+        if ring_len(next) >= con.eol_width {
+            continue;
+        }
+        if start.2 && next.2 && nnext.2 {
+            continue;
+        }
+        out.push(ring_box(&[start, next, nnext]));
+    }
+    out
+}
+
+/// `checkMetalShape_lef58MinStep_minAdjLength` on one pin's rings. Upstream rule: nothing for a
+/// pin whose outer ring has four edges under EXCEPTRECTANGLE (`poly->size() == 4`, holes or
+/// not); per start edge ([`lef58_min_step_starts`]), a violation when the next or the previous
+/// edge is shorter than MINADJACENTLENGTH or, with NOADJACENTEOL, has both corners CONVEX and is
+/// shorter than its width — unless all three edges are fixed; the box joins the three edges.
+pub(crate) fn lef58_min_step_min_adj_length_boxes(
+    rings: &[Vec<RingEdge>],
+    con: &crate::tech::Lef58MinStep,
+) -> Vec<Rect> {
+    if con.except_rectangle && rings.first().is_some_and(|outer| outer.len() == 4) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (r, i) in lef58_min_step_starts(rings, con.min_step_length) {
+        let ring = &rings[r];
+        let n = ring.len();
+        let (pprev, prev, start) = (&ring[(i + n - 2) % n], &ring[(i + n - 1) % n], &ring[i]);
+        let (next, nnext) = (&ring[(i + 1) % n], &ring[(i + 2) % n]);
+        let mut violating = ring_len(next) < con.min_adjacent_length || ring_len(prev) < con.min_adjacent_length;
+        if con.no_adj_eol > -1 {
+            violating |= ring_convex(start, next) && ring_convex(next, nnext) && ring_len(next) < con.no_adj_eol;
+            violating |= ring_convex(pprev, prev) && ring_convex(prev, start) && ring_len(prev) < con.no_adj_eol;
+        }
+        if start.2 && next.2 && prev.2 {
+            continue;
+        }
+        if !violating {
+            continue;
+        }
+        out.push(ring_box(&[start, next, prev]));
+    }
+    out
 }
 
 /// An edge's box (its two points, low to high).
@@ -1232,12 +1333,14 @@ impl<'a> Worker<'a> {
 
     /// The minimum-step markers of `checkMetalShape(true)`, as the surgical fix's patch pass reads
     /// them (`patchMetalShape_minStep` walks `markers_` after that check): per routing layer
-    /// (bottom up), per owner checked from, per pin, in the order made.
+    /// (bottom up), per owner checked from, per pin, in the order made — the MINSTEP markers, then
+    /// the LEF58_MINSTEP ones (`checkMetalShape_main` checks them in that order).
     pub fn min_step_markers(&mut self) -> Vec<Marker> {
         self.markers.clear();
         self.seen.clear();
         for layer in 0..self.tech.layers.len() {
-            if self.tech.layers[layer].kind != LayerKind::Routing || self.tech.layers[layer].min_step.is_none() {
+            let l = &self.tech.layers[layer];
+            if l.kind != LayerKind::Routing || (l.min_step.is_none() && l.lef58_min_step.is_empty()) {
                 continue;
             }
             for net in 0..self.nets.len() {
@@ -1246,6 +1349,7 @@ impl<'a> Worker<'a> {
                 }
                 for k in 0..self.nets[net].pins[layer].len() {
                     self.min_step(layer, net, k);
+                    self.lef58_min_step(layer, net, k);
                 }
             }
         }
@@ -1331,6 +1435,7 @@ impl<'a> Worker<'a> {
         }
         self.min_area(layer, net, pin);
         self.min_step(layer, net, k);
+        self.lef58_min_step(layer, net, k);
         self.rect_only(layer, net, pin);
         self.off_grid(layer, net, pin);
         self.min_enclosed_area(layer, net, pin);
@@ -1648,9 +1753,9 @@ impl<'a> Worker<'a> {
         orientation(&segs[e.prev], e) == 1 && orientation(e, &segs[e.next]) == 1
     }
 
-    /// `checkMetalShape_minStep` on the owner's pin `k`: its rings as the list holds them.
-    fn min_step(&mut self, layer: usize, net: usize, k: usize) {
-        let Some(con) = self.tech.layers[layer].min_step else { return };
+    /// The owner's pin `k`'s rings (`gcPin::getPolygonEdges`) as the list holds them: the outer
+    /// ring, then the holes, each edge (from, to, fixed) in ring order.
+    fn pin_rings(&self, layer: usize, net: usize, k: usize) -> Vec<Vec<RingEdge>> {
         let segs = &self.segs[layer];
         let mut rings: Vec<Vec<RingEdge>> = Vec::new();
         let mut seen = vec![false; segs.len()];
@@ -1667,8 +1772,65 @@ impl<'a> Worker<'a> {
             }
             rings.push(ring);
         }
+        rings
+    }
+
+    /// `checkMetalShape_minStep` on the owner's pin `k`: its rings as the list holds them.
+    fn min_step(&mut self, layer: usize, net: usize, k: usize) {
+        let Some(con) = self.tech.layers[layer].min_step else { return };
+        let rings = self.pin_rings(layer, net, k);
         for b in min_step_boxes(&rings, &con) {
             self.add_marker_of(Rule::MinStep, layer, b, (net, b, false), (net, b, false));
+        }
+    }
+
+    /// `checkMetalShape_lef58MinStep` on the owner's pin `k`: per kept LEF58_MINSTEP rule, in
+    /// order, NOBETWEENEOL ([`Self::lef58_min_step_no_between_eol`]) then MINADJACENTLENGTH
+    /// ([`Self::lef58_min_step_min_adj_length`]), each when the rule has it.
+    fn lef58_min_step(&mut self, layer: usize, net: usize, k: usize) {
+        let tech = self.tech;
+        if tech.layers[layer].lef58_min_step.is_empty() {
+            return;
+        }
+        let rings = self.pin_rings(layer, net, k);
+        for (i, con) in tech.layers[layer].lef58_min_step.iter().enumerate() {
+            let rule = Rule::Lef58MinStep(u16::try_from(i).unwrap_or(u16::MAX));
+            if con.eol_width != -1 {
+                self.lef58_min_step_no_between_eol(layer, net, rule, &rings, con);
+            }
+            if con.min_adjacent_length != -1 {
+                self.lef58_min_step_min_adj_length(layer, net, rule, &rings, con);
+            }
+        }
+    }
+
+    /// `checkMetalShape_lef58MinStep_noBetweenEol`: a marker per box of
+    /// [`lef58_min_step_no_between_eol_boxes`], the owner as victim and aggressor, not fixed.
+    fn lef58_min_step_no_between_eol(
+        &mut self,
+        layer: usize,
+        net: usize,
+        rule: Rule,
+        rings: &[Vec<RingEdge>],
+        con: &crate::tech::Lef58MinStep,
+    ) {
+        for b in lef58_min_step_no_between_eol_boxes(rings, con) {
+            self.add_marker_of(rule, layer, b, (net, b, false), (net, b, false));
+        }
+    }
+
+    /// `checkMetalShape_lef58MinStep_minAdjLength`: a marker per box of
+    /// [`lef58_min_step_min_adj_length_boxes`], the owner as victim and aggressor, not fixed.
+    fn lef58_min_step_min_adj_length(
+        &mut self,
+        layer: usize,
+        net: usize,
+        rule: Rule,
+        rings: &[Vec<RingEdge>],
+        con: &crate::tech::Lef58MinStep,
+    ) {
+        for b in lef58_min_step_min_adj_length_boxes(rings, con) {
+            self.add_marker_of(rule, layer, b, (net, b, false), (net, b, false));
         }
     }
 
@@ -3179,9 +3341,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -3298,6 +3460,26 @@ pub(crate) mod tests {
         }
         w.init();
         w.run().to_vec()
+    }
+
+    /// Rule (`checkMetalShape_main`, after `checkMetalShape_minStep`; `addMarker` keeps a marker
+    /// once per box, layer, CONSTRAINT and sources): every kept LEF58_MINSTEP rule checks the pin,
+    /// so two MINADJACENTLENGTH rules mark the bump's three boxes twice, each named after its rule;
+    /// the minimum-step markers the router's patch pass reads (`checkMetalShape(true)`) hold them
+    /// too (witness `aa`).
+    #[test]
+    fn each_lef58_min_step_rule_marks_its_own_boxes() {
+        let mut t = tech();
+        let rule = |min_adjacent_length| crate::tech::Lef58MinStep { min_step_length: 50, max_edges: 1, min_adjacent_length, no_adj_eol: -1, eol_width: -1, except_rectangle: false };
+        t.layers[4].lef58_min_step = vec![rule(60), rule(70)];
+        let mut w = Worker::new(&t);
+        w.add(&net("a"), 4, Rect::new(980, 1000, 2020, 1040), false);
+        w.add(&net("a"), 4, Rect::new(1395, 1000, 1435, 1070), false);
+        w.init();
+        let steps = |m: &[Marker]| m.iter().filter(|m| matches!(m.rule, Rule::Lef58MinStep(_))).map(|m| m.rule).collect::<Vec<_>>();
+        let want = [Rule::Lef58MinStep(0), Rule::Lef58MinStep(0), Rule::Lef58MinStep(0), Rule::Lef58MinStep(1), Rule::Lef58MinStep(1), Rule::Lef58MinStep(1)];
+        assert_eq!(steps(w.run()), want);
+        assert_eq!(steps(&w.min_step_markers()), want);
     }
 
     /// Rule (`checkMetalShape_lef58Area`, the marker pass, after `checkMetalShape_minEnclosedArea`):
@@ -4109,6 +4291,81 @@ mod min_step_tests {
         assert!(min_step_boxes(&[ring(&notch, false)], &MinStep { min_step_length: 10, ..step(-1) }).is_empty());
         // A plain rectangle has no short edge.
         assert!(min_step_boxes(&[ring(&[(0, 0), (100, 0), (100, 100), (0, 100)], false)], &step(-1)).is_empty());
+    }
+
+    /// A 1040 x 40 wire with a 40 wide, 30 tall bump on its top edge (counter-clockwise from the
+    /// bottom left: bottom, right end, top right, bump right, bump top, bump left, top left, left
+    /// end).
+    const BUMP: [P; 8] = [(980, 1000), (2020, 1000), (2020, 1040), (1435, 1040), (1435, 1070), (1395, 1070), (1395, 1040), (980, 1040)];
+    const SQUARE: [P; 4] = [(2480, 2480), (2520, 2480), (2520, 2520), (2480, 2520)];
+
+    fn lef58(min_adjacent_length: i32, no_adj_eol: i32, eol_width: i32, except_rectangle: bool) -> crate::tech::Lef58MinStep {
+        crate::tech::Lef58MinStep { min_step_length: 50, max_edges: 1, min_adjacent_length, no_adj_eol, eol_width, except_rectangle }
+    }
+
+    // Rule (`checkMetalShape_lef58MinStep_noBetweenEol`): from each edge shorter than MINSTEP, the
+    // edge after next must be short too and the next edge an end of line (both corners convex)
+    // narrower than the NOBETWEENEOL width; the box joins the start edge and the next two edges'
+    // far ends. Only the bump's top qualifies; the wire's ends face a long edge.
+    #[test]
+    fn a_short_end_of_line_between_two_short_edges_breaks_lef58_min_step_no_between_eol() {
+        let n = lef58(-1, -1, 50, false);
+        assert_eq!(lef58_min_step_no_between_eol_boxes(&[ring(&BUMP, false)], &n), vec![Rect::new(1395, 1040, 1435, 1070)]);
+        // The bump top exactly the width wide is not narrower: clean.
+        assert!(lef58_min_step_no_between_eol_boxes(&[ring(&BUMP, false)], &lef58(-1, -1, 40, false)).is_empty());
+        // The bump sides exactly MINSTEP long are not short: clean.
+        let long_sides = crate::tech::Lef58MinStep { min_step_length: 30, ..n };
+        assert!(lef58_min_step_no_between_eol_boxes(&[ring(&BUMP, false)], &long_sides).is_empty());
+        // All fixed: skipped; one route edge among the three: marked.
+        assert!(lef58_min_step_no_between_eol_boxes(&[ring(&BUMP, true)], &n).is_empty());
+        let mut one = ring(&BUMP, true);
+        one[4].2 = false;
+        assert_eq!(lef58_min_step_no_between_eol_boxes(&[one], &n).len(), 1);
+        // A square: each edge starts a qualifying run, the same box four times (the marker is kept
+        // once per box).
+        assert_eq!(lef58_min_step_no_between_eol_boxes(&[ring(&SQUARE, false)], &n), vec![Rect::new(2480, 2480, 2520, 2520); 4]);
+        // A plain wire: its ends are short but the edge between them is long.
+        assert!(lef58_min_step_no_between_eol_boxes(&[ring(&[(980, 1000), (2020, 1000), (2020, 1040), (980, 1040)], false)], &n).is_empty());
+        // The bump's left side 40 long (the wire's top steps down to 1030 on the left): the box
+        // reaches the far end of the edge after next.
+        let tall = [(980, 1000), (2020, 1000), (2020, 1040), (1435, 1040), (1435, 1070), (1395, 1070), (1395, 1030), (980, 1030)];
+        assert_eq!(lef58_min_step_no_between_eol_boxes(&[ring(&tall, false)], &n), vec![Rect::new(1395, 1030, 1435, 1070)]);
+        // A narrow end of line after a short jog, the edge after it long: clean.
+        let jog = [(0, -20), (60, -20), (60, 0), (100, 0), (100, 40), (0, 40)];
+        assert!(lef58_min_step_no_between_eol_boxes(&[ring(&jog, false)], &n).is_empty());
+        // A notch: the short edge between its two short sides has concave corners: clean.
+        let notch = [(0, 0), (200, 0), (200, 100), (120, 100), (120, 70), (80, 70), (80, 100), (0, 100)];
+        assert!(lef58_min_step_no_between_eol_boxes(&[ring(&notch, false)], &n).is_empty());
+    }
+
+    // Rule (`checkMetalShape_lef58MinStep_minAdjLength`): from each edge shorter than MINSTEP, a
+    // violation when the next or the previous edge is shorter than MINADJACENTLENGTH; with
+    // NOADJACENTEOL also when one of them is an end of line (both corners convex) narrower than its
+    // width; the box joins the three edges. EXCEPTRECTANGLE exempts a pin whose outer ring has
+    // four edges.
+    #[test]
+    fn a_short_edge_beside_a_short_neighbour_breaks_lef58_min_step_min_adj_length() {
+        let a = lef58(60, -1, -1, false);
+        // The bump's right side (next: its top), its top (next: its left side) and its left side
+        // (previous: its top), each boxed with both neighbours.
+        let want = vec![Rect::new(1395, 1040, 2020, 1070), Rect::new(1395, 1040, 1435, 1070), Rect::new(980, 1040, 1435, 1070)];
+        assert_eq!(lef58_min_step_min_adj_length_boxes(&[ring(&BUMP, false)], &a), want);
+        assert_eq!(lef58_min_step_min_adj_length_boxes(&[ring(&BUMP, false)], &lef58(60, -1, -1, true)), want, "not a rectangle");
+        assert!(lef58_min_step_min_adj_length_boxes(&[ring(&BUMP, true)], &a).is_empty(), "all fixed");
+        // An edge exactly MINSTEP long starts nothing: under MINSTEP 40 only the bump's sides do.
+        let a40 = crate::tech::Lef58MinStep { min_step_length: 40, ..a };
+        assert_eq!(lef58_min_step_min_adj_length_boxes(&[ring(&BUMP, false)], &a40), vec![want[0], want[2]]);
+        // The square: every edge's neighbours are short; EXCEPTRECTANGLE exempts it, holes or not.
+        assert_eq!(lef58_min_step_min_adj_length_boxes(&[ring(&SQUARE, false)], &a).len(), 4);
+        assert!(lef58_min_step_min_adj_length_boxes(&[ring(&SQUARE, false)], &lef58(60, -1, -1, true)).is_empty());
+        let hole = [(2490, 2490), (2490, 2510), (2510, 2510), (2510, 2490)];
+        assert!(lef58_min_step_min_adj_length_boxes(&[ring(&SQUARE, false), ring(&hole, false)], &lef58(60, -1, -1, true)).is_empty());
+        // NOADJACENTEOL 50 with MINADJACENTLENGTH 30: the bump's sides are not shorter than 30, but
+        // each faces the bump top, an end of line narrower than 50: the right and the left side
+        // mark; the top's neighbours have a concave corner, so it does not.
+        let j = lef58(30, 50, -1, false);
+        assert_eq!(lef58_min_step_min_adj_length_boxes(&[ring(&BUMP, false)], &j), vec![want[0], want[2]]);
+        assert!(lef58_min_step_min_adj_length_boxes(&[ring(&BUMP, false)], &lef58(30, 40, -1, false)).is_empty(), "end of line not narrower");
     }
 }
 

@@ -112,6 +112,17 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 }
                 continue;
             }
+            if family == "lef58_min_step" {
+                // LEF58_MINSTEP: the check (`checkMetalShape_lef58MinStep`, its NOBETWEENEOL and
+                // MINADJACENTLENGTH forms, with NOADJACENTEOL and EXCEPTRECTANGLE) and the router's
+                // minimum-step patch pass, its only consumers; a rule with MAXEDGES above 1 is
+                // skipped with a warning (`skipped_rules`); the first rule the check does not read
+                // as written names the refusal.
+                if let Some(clause) = (0..n).find_map(|k| crate::tech::read::lef58_min_step_unmodelled(db, &l.name, k)) {
+                    out.push(format!("{}: {family} ({n}, {clause})", l.name));
+                }
+                continue;
+            }
             if family == "lef58_min_cut" {
                 // Modelled through io's conversion into minimum-cut rules (the check, the maze cost
                 // around vias and macro pins, the via-to-via prep, MTSAFEDIST): AREA,
@@ -211,6 +222,10 @@ impl SkippedRule {
                 "layer {}: LEF58_AREA rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
             ),
+            ("lef58_min_step", clause) => format!(
+                "layer {}: LEF58_MINSTEP rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
+                self.layer, self.index
+            ),
             ("lef58_min_cut", clause) => format!(
                 "layer {}: LEF58_MINIMUMCUT rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
@@ -239,7 +254,8 @@ impl SkippedRule {
 /// reference skips ([`crate::tech::read::lef58_min_cut_skipped_clause`]: AREA,
 /// SAMEMETALOVERLAP, FULLYENCLOSED), then each LEF58_AREA rule io
 /// skips ([`crate::tech::read::lef58_area_skipped_clause`]: EXCEPTMINWIDTH, EXCEPTEDGELENGTH,
-/// EXCEPTMINSIZE, EXCEPTSTEP, MASK, LAYER), then on each cut layer each LEF58
+/// EXCEPTMINSIZE, EXCEPTSTEP, MASK, LAYER), then each LEF58_MINSTEP rule io skips
+/// ([`crate::tech::read::lef58_min_step_skipped`]: MAXEDGES above 1), then on each cut layer each LEF58
 /// cut spacing ADJACENTCUTS rule io skips ([`crate::tech::read::adjacent_cuts_rule`]:
 /// EXACTALIGNED, EXCEPTSAMEPGNET, TO ALL, SIDEPARALLELOVERLAP, SAMEMASK) and each LAYER rule with
 /// no CUTCLASS (kept by io, never checked by the reference's GC) — routed as the
@@ -262,6 +278,12 @@ pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
         for k in 0..db.num_layer_get_tech_layer_area_rules(&l.name) {
             if let Some(clause) = crate::tech::read::lef58_area_skipped_clause(db, &l.name, k) {
                 out.push(SkippedRule { layer: l.name.clone(), family: "lef58_area", index: k, clause });
+            }
+        }
+        for k in 0..db.num_layer_get_tech_layer_min_step_rules(&l.name) {
+            if crate::tech::read::lef58_min_step_skipped(db, &l.name, k) {
+                let clause = "MAXEDGES above 1";
+                out.push(SkippedRule { layer: l.name.clone(), family: "lef58_min_step", index: k, clause });
             }
         }
     }
@@ -1157,6 +1179,70 @@ mod skipped_rule_tests {
         assert_eq!(l.rect_width, [r(13, 20_000, 40, true), r(10, 5_000, 50, false), r(2, 10_000, 50, false)]);
         assert_eq!(l.area, [r(11, 40_000, 0, false), r(9, 20_000, 0, true), r(0, 20_000, 0, false)]);
         assert!(tech.layers[tech.layer_num("M2").expect("M2")].lef58_area.is_empty());
+    }
+
+    /// Rule (reference io `setRoutingLayerProperties`, its LEF58_MINSTEP loop): a rule whose
+    /// MAXEDGES is above 1 is skipped with DRT-335 (MAXEDGES read whether given or not); every
+    /// other rule is kept with MINSTEP, MAXEDGES (-1 when not given), the first MINADJACENTLENGTH
+    /// (-1 when not given), the end-of-line width as NOADJACENTEOL's or NOBETWEENEOL's (-1 for
+    /// the other) and EXCEPTRECTANGLE. MODELLED (the check and the router's minimum-step patch
+    /// pass), nothing refused.
+    #[test]
+    fn lef58_min_step_rules_are_kept_but_maxedges_above_one_is_skipped_with_a_warning() {
+        let rules = [
+            "MINSTEP 0.05 MAXEDGES 1 MINADJACENTLENGTH 0.06 ;",
+            "MINSTEP 0.05 MAXEDGES 1 NOBETWEENEOL 0.04 ;",
+            "MINSTEP 0.05 MAXEDGES 2 MINADJACENTLENGTH 0.06 ;",
+            "MINSTEP 0.07 EXCEPTRECTANGLE MINADJACENTLENGTH 0.08 ;",
+        ];
+        let m1 = format!("  PROPERTY LEF58_MINSTEP \"{}\" ;\n", rules.join(" "));
+        let d = db("minstep", &m1, "");
+        assert_eq!(d.num_layer_get_tech_layer_min_step_rules("M1"), rules.len(), "every rule parsed");
+        let (skipped, refused, _) = census(&d);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(skipped, [super::SkippedRule { layer: "M1".into(), family: "lef58_min_step", index: 2, clause: "MAXEDGES above 1" }]);
+        assert!(skipped[0].warning().contains("LEF58_MINSTEP rule 2 uses MAXEDGES above 1") && skipped[0].warning().contains("SKIPPED"));
+        assert_eq!(crate::tech::read::lef58_min_step_skip_warnings(&d, "M1"), [(335, "LEF58_MINSTEP MAXEDGES 2  is not supported".to_string())]);
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let r = |min_step_length, max_edges, min_adjacent_length, no_adj_eol, eol_width, except_rectangle| crate::tech::Lef58MinStep { min_step_length, max_edges, min_adjacent_length, no_adj_eol, eol_width, except_rectangle };
+        assert_eq!(
+            tech.layers[tech.layer_num("M1").expect("M1")].lef58_min_step,
+            [r(50, 1, 60, -1, -1, false), r(50, 1, -1, -1, 40, false), r(70, -1, 80, -1, -1, true)]
+        );
+        assert!(tech.layers[tech.layer_num("M2").expect("M2")].lef58_min_step.is_empty());
+    }
+
+    /// A LEF58_MINSTEP rule the reference's check does not read as written is refused, naming the
+    /// clause: MINBETWEENLENGTH, a second MINADJACENTLENGTH value or a corner form, or a rule with
+    /// neither checked form (io keeps it and the check never reads it). A rule io skips is
+    /// skipped, not refused.
+    #[test]
+    fn a_lef58_min_step_rule_the_check_does_not_read_as_written_is_refused() {
+        for (rule, clause) in [
+            ("MINSTEP 0.05 MINBETWEENLENGTH 0.06 ;", "MINBETWEENLENGTH"),
+            ("MINSTEP 0.05 MINADJACENTLENGTH 0.06 0.07 ;", "MINADJACENTLENGTH with a second length"),
+            ("MINSTEP 0.05 MINADJACENTLENGTH 0.06 CONVEXCORNER ;", "MINADJACENTLENGTH CONVEXCORNER"),
+            ("MINSTEP 0.05 MINADJACENTLENGTH 0.06 CONCAVECORNER ;", "MINADJACENTLENGTH CONCAVECORNER"),
+            ("MINSTEP 0.05 MAXEDGES 1 ;", "neither NOBETWEENEOL nor MINADJACENTLENGTH (never checked)"),
+            ("MINSTEP 0.05 NOADJACENTEOL 0.06 ;", "NOADJACENTEOL"),
+            ("MINSTEP 0.05 MAXEDGES 1 NOADJACENTEOL 0.06 MINADJACENTLENGTH 0.03 ;", "NOADJACENTEOL"),
+            ("MINSTEP 0.05 MAXEDGES 1 EXCEPTRECTANGLE NOBETWEENEOL 0.06 ;", "EXCEPTRECTANGLE with NOBETWEENEOL"),
+        ] {
+            let d = db("msref", &format!("  PROPERTY LEF58_MINSTEP \"{rule}\" ;\n"), "");
+            assert_eq!(d.num_layer_get_tech_layer_min_step_rules("M1"), 1, "{rule} parsed");
+            let (skipped, refused, _) = census(&d);
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(refused, [format!("M1: lef58_min_step (1, {clause})")], "{rule}");
+        }
+        // A refused rule is still read as io keeps it (the check reads it where refusals are
+        // waived): NOADJACENTEOL's width, the first MINADJACENTLENGTH.
+        let d = db("msadj", "  PROPERTY LEF58_MINSTEP \"MINSTEP 0.05 MAXEDGES 1 NOADJACENTEOL 0.06 MINADJACENTLENGTH 0.03 ;\" ;\n", "");
+        let tech = crate::tech::read::tech(&d).expect("tech");
+        let want = crate::tech::Lef58MinStep { min_step_length: 50, max_edges: 1, min_adjacent_length: 30, no_adj_eol: 60, eol_width: -1, except_rectangle: false };
+        assert_eq!(tech.layers[tech.layer_num("M1").expect("M1")].lef58_min_step, [want]);
+        let d = db("msskip", "  PROPERTY LEF58_MINSTEP \"MINSTEP 0.05 MAXEDGES 2 MINBETWEENLENGTH 0.06 ;\" ;\n", "");
+        let (skipped, refused, _) = census(&d);
+        assert!(refused.is_empty() && skipped.len() == 1, "{refused:?} {skipped:?}");
     }
 
     /// Rule (reference io `setCutLayerProperties`, LAYER branch): `SPACING s LAYER m CUTCLASS c
