@@ -61,12 +61,14 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         // it drops that way) — and refused (none is modelled). SPACINGTABLE ORTHOGONAL is
         // modelled (the check, its only consumer) and no longer listed here; neither is
         // LEF58_MAXSPACING, whose pass refuses at run time when it reaches a stage not ported
-        // (`crate::dr::max_spacing`).
+        // (`crate::dr::max_spacing`); nor LEF58_WIDTHTABLE … ORTHOGONAL, which io folds into one
+        // constraint (`tech::read::width_tbl_orth`) whose only consumer is the check
+        // (`checkWidthTableOrth`, in the corner spacing walk; the corner-spacing patch pass runs
+        // that walk but keeps only corner spacing markers).
         let name = l.name.as_str();
         let kept = |n: usize, keeps: &dyn Fn(usize) -> bool| (0..n).filter(|&k| keeps(k)).count();
         let untracked = [
             ("lef58_two_wires_forbidden_spacing", db.num_layer_get_tech_layer_two_wires_forbidden_spc_rules(name)),
-            ("lef58_width_table_orthogonal", kept(db.num_layer_get_tech_layer_width_table_rules(name), &|k| db.widthtablerule_is_orthogonal(name, k))),
             ("lef58_wrong_dir_spacing", kept(db.num_layer_get_tech_layer_wrong_dir_spacing_rules(name), &|k| !db.wrongdirspacingrule_is_length_valid(name, k) && db.wrongdirspacingrule_get_prl_length(name, k) >= 0)),
         ];
         for (family, n) in untracked {
@@ -1179,6 +1181,26 @@ mod skipped_rule_tests {
         assert_eq!(l.rect_width, [r(13, 20_000, 40, true), r(10, 5_000, 50, false), r(2, 10_000, 50, false)]);
         assert_eq!(l.area, [r(11, 40_000, 0, false), r(9, 20_000, 0, true), r(0, 20_000, 0, false)]);
         assert!(tech.layers[tech.layer_num("M2").expect("M2")].lef58_area.is_empty());
+    }
+
+    /// Rule (reference io, its LEF58_WIDTHTABLE loop): only ORTHOGONAL tables are read; the first
+    /// width of the last one without WRONGDIRECTION is the width, of the last one with it the
+    /// wrong-way width (the width when none); on a horizontal layer x is spaced by the wrong-way
+    /// width and y by the width. A table without ORTHOGONAL is not read. MODELLED (the check is
+    /// its only consumer), nothing refused.
+    #[test]
+    fn orthogonal_width_tables_fold_into_one_constraint_and_are_not_refused() {
+        let orth = |name: &str, rules: &str| {
+            let d = db(name, &format!("  PROPERTY LEF58_WIDTHTABLE \"{rules}\" ;\n"), "");
+            let (_, refused, _) = census(&d);
+            assert!(refused.is_empty(), "{rules}: {refused:?}");
+            let tech = crate::tech::read::tech(&d).expect("tech");
+            tech.layers[tech.layer_num("M1").expect("M1")].width_tbl_orth.map(|o| (o.horz_spc, o.vert_spc))
+        };
+        assert_eq!(orth("k", "WIDTHTABLE 0.05 0.1 ORTHOGONAL ; WIDTHTABLE 0.06 0.12 WRONGDIRECTION ORTHOGONAL ;"), Some((60, 50)));
+        assert_eq!(orth("two", "WIDTHTABLE 0.07 ORTHOGONAL ; WIDTHTABLE 0.05 ORTHOGONAL ;"), Some((50, 50)), "the last wins");
+        assert_eq!(orth("wdp", "WIDTHTABLE 0.05 ORTHOGONAL ; WIDTHTABLE 0.09 WRONGDIRECTION ;"), Some((50, 50)), "not ORTHOGONAL: not read");
+        assert_eq!(orth("pl", "WIDTHTABLE 0.05 0.1 ;"), None);
     }
 
     /// Rule (reference io `setRoutingLayerProperties`, its LEF58_MINSTEP loop): a rule whose

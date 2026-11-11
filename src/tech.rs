@@ -120,6 +120,17 @@ pub struct Layer {
     /// A cut layer's LEF58_MAXSPACING rules io keeps (`frLef58MaxSpacingConstraint`), in the
     /// technology's order: the ones with a CUTCLASS naming a class of this layer.
     pub lef58_max_spacing: Vec<MaxSpacingRule>,
+    /// A routing layer's LEF58_WIDTHTABLE … ORTHOGONAL rules as io folds them into one constraint
+    /// (`frLef58WidthTableOrthConstraint`), see [`read::width_tbl_orth`].
+    pub width_tbl_orth: Option<WidthTblOrth>,
+}
+
+/// The one width-table-orthogonal constraint io makes per routing layer: two concave corners of
+/// one polygon closer than `horz_spc` in x AND `vert_spc` in y break it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidthTblOrth {
+    pub horz_spc: i32,
+    pub vert_spc: i32,
 }
 
 /// A LEF58_MAXSPACING rule as io keeps it: `MAXSPACING max CUTCLASS c` — every via of class `c`
@@ -1509,7 +1520,8 @@ pub mod read {
                     let min_cuts = v54_min_cuts(db, &name);
                     let lef58_area = lef58_area_rules(db, &name);
                     let lef58_min_step = lef58_min_step_rules(db, &name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![] });
+                    let width_tbl_orth = width_tbl_orth(db, &name, dir == Dir::Horizontal);
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1687,6 +1699,42 @@ pub mod read {
     /// keep MINSTEP, MAXEDGES (-1 when not given), MINADJACENTLENGTH's first value (-1 when not
     /// given), the end-of-line width as NOADJACENTEOL's or as NOBETWEENEOL's (-1 for the other),
     /// and EXCEPTRECTANGLE.
+    /// io's LEF58_WIDTHTABLE reading: only the ORTHOGONAL tables count; the first width of the last
+    /// one without WRONGDIRECTION is the width, of the last one with it the wrong-way width (the
+    /// width when there is none). Both 0: no constraint. A horizontal layer's horizontal spacing is
+    /// the wrong-way width and its vertical spacing the width; a vertical layer's the other way
+    /// round. (An empty table, which io would throw on, reads as 0.)
+    pub fn width_tbl_orth(db: &Db, layer: &str, is_horz: bool) -> Option<WidthTblOrth> {
+        let (mut width, mut wrong_way) = (0u32, 0u32);
+        for k in 0..db.num_layer_get_tech_layer_width_table_rules(layer) {
+            if !db.widthtablerule_is_orthogonal(layer, k) {
+                continue;
+            }
+            // frUInt4: the database's int as io stores it.
+            let first = db.widthtablerule_get_width_table(layer, k).first().copied().unwrap_or(0) as u32;
+            if db.widthtablerule_is_wrong_direction(layer, k) {
+                wrong_way = first;
+            } else {
+                width = first;
+            }
+        }
+        width_tbl_orth_of(width, wrong_way, is_horz)
+    }
+
+    /// [`width_tbl_orth`]'s fold from the two widths (frCoord of frUInt4).
+    pub fn width_tbl_orth_of(width: u32, wrong_way: u32, is_horz: bool) -> Option<WidthTblOrth> {
+        let wrong_way = if wrong_way == 0 { width } else { wrong_way };
+        if width == 0 && wrong_way == 0 {
+            return None;
+        }
+        let (width, wrong_way) = (width as i32, wrong_way as i32);
+        Some(if is_horz {
+            WidthTblOrth { horz_spc: wrong_way, vert_spc: width }
+        } else {
+            WidthTblOrth { horz_spc: width, vert_spc: wrong_way }
+        })
+    }
+
     pub fn lef58_min_step_rules(db: &Db, layer: &str) -> Vec<Lef58MinStep> {
         (0..db.num_layer_get_tech_layer_min_step_rules(layer))
             .filter(|&k| !lef58_min_step_skipped(db, layer, k))

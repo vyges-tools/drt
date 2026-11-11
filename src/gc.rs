@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech};
+use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech, WidthTblOrth};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -145,6 +145,9 @@ pub enum Rule {
     /// the check: the pass marks each lonely via over its three-layer box, on the cut layer, the
     /// via's net as source, victim and aggressor).
     Lef58MaxSpacing,
+    /// Two concave corners of one polygon closer than the layer's LEF58_WIDTHTABLE ORTHOGONAL
+    /// spacing in both x and y (`checkWidthTableOrth`, inside the corner spacing walk).
+    WidthTableOrth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2137,20 +2140,22 @@ impl<'a> Worker<'a> {
 
     // ---- LEF58 corner spacing ----
 
-    /// `checkMetalCornerSpacing`: per routing layer with corner spacing rules, per owner, per
-    /// polygon corner (the corner BEFORE each edge, in ring order): the maximal rectangles in the
-    /// box reaching the rules' largest (last-row) spacing out from the corner, each against each
-    /// rule.
+    /// `checkMetalCornerSpacing`: per routing layer with corner spacing rules or a width-table
+    /// orthogonal constraint, per owner, per polygon corner (the corner BEFORE each edge, in ring
+    /// order): the corner spacing rules first — the maximal rectangles in the box reaching the
+    /// rules' largest (last-row) spacing out from the corner, each against each rule — then
+    /// [`Self::check_width_table_orth`].
     fn check_metal_corner_spacing(&mut self) {
         if self.ignore_corner_spacing {
             return;
         }
         for layer in 0..self.tech.layers.len() {
             let l = &self.tech.layers[layer];
-            if l.kind != LayerKind::Routing || l.corner_spacing.is_empty() {
+            if l.kind != LayerKind::Routing || (l.corner_spacing.is_empty() && l.width_tbl_orth.is_none()) {
                 continue;
             }
             let rules = l.corner_spacing.clone();
+            let orth = l.width_tbl_orth;
             let (mx, my) = rules.iter().fold((0, 0), |(x, y), r| (x.max(r.find_max().0), y.max(r.find_max().1)));
             for net in 0..self.nets.len() {
                 if !self.checks_from(net) {
@@ -2161,21 +2166,68 @@ impl<'a> Worker<'a> {
                         continue;
                     }
                     let Some(c) = self.corner(layer, k) else { continue };
-                    let (x, y) = (c.x, c.y);
-                    let q = match c.dir {
-                        CornerDir::NE => Rect::new(x, y, x + mx, y + my),
-                        CornerDir::SE => Rect::new(x, y - my, x + mx, y),
-                        CornerDir::SW => Rect::new(x - mx, y - my, x, y),
-                        CornerDir::NW => Rect::new(x - mx, y, x, y + my),
-                    };
-                    for s in self.query(layer, &q) {
-                        for r in &rules {
-                            self.corner_spacing_helper(layer, &c, s, r);
+                    if !rules.is_empty() {
+                        let (x, y) = (c.x, c.y);
+                        let q = match c.dir {
+                            CornerDir::NE => Rect::new(x, y, x + mx, y + my),
+                            CornerDir::SE => Rect::new(x, y - my, x + mx, y),
+                            CornerDir::SW => Rect::new(x - mx, y - my, x, y),
+                            CornerDir::NW => Rect::new(x - mx, y, x, y + my),
+                        };
+                        for s in self.query(layer, &q) {
+                            for r in &rules {
+                                self.corner_spacing_helper(layer, &c, s, r);
+                            }
                         }
+                    }
+                    if let Some(o) = orth {
+                        self.check_width_table_orth(layer, &c, k, o);
                     }
                 }
             }
         }
+    }
+
+    /// `checkWidthTableOrth`: a CONCAVE corner (the one before edge `k`) against both corners of
+    /// every polygon edge of its own polygon within (`horz_spc`, `vert_spc`) of it, in the edge
+    /// tree's order.
+    fn check_width_table_orth(&mut self, layer: usize, c: &Corner, k: usize, o: WidthTblOrth) {
+        if c.convex {
+            return;
+        }
+        let (x, y) = (c.x, c.y);
+        let q = Rect::new(x - o.horz_spc, y - o.vert_spc, x + o.horz_spc, y + o.vert_spc);
+        let pin = (self.segs[layer][k].net, self.segs[layer][k].pin);
+        for s in self.query_segs(layer, &q) {
+            let e = self.segs[layer][s];
+            if (e.net, e.pin) != pin {
+                continue;
+            }
+            self.check_width_table_orth_main(layer, c, k, s, o);
+            self.check_width_table_orth_main(layer, c, k, e.next, o);
+        }
+    }
+
+    /// `checkWidthTableOrth_main(c1, c2)`: `c2` is the corner before edge `k2` (an edge's low corner
+    /// is the one before it, its high corner the one before the next). Not the same corner, `c2`
+    /// concave, not both fixed, and the box between the two closer than `horz_spc` in x and
+    /// `vert_spc` in y: a marker on the box, the owner on both sides, each side the point of its
+    /// corner with the corner's fixed flag.
+    fn check_width_table_orth_main(&mut self, layer: usize, c1: &Corner, k1: usize, k2: usize, o: WidthTblOrth) {
+        if k2 == k1 {
+            return;
+        }
+        let Some(c2) = self.corner(layer, k2) else { return };
+        if c2.convex || (c1.fixed && c2.fixed) {
+            return;
+        }
+        let bbox = Rect::new(c1.x.min(c2.x), c1.y.min(c2.y), c1.x.max(c2.x), c1.y.max(c2.y));
+        if bbox.xh - bbox.xl >= o.horz_spc || bbox.yh - bbox.yl >= o.vert_spc {
+            return;
+        }
+        let p1 = Rect::new(c1.x, c1.y, c1.x, c1.y);
+        let p2 = Rect::new(c2.x, c2.y, c2.x, c2.y);
+        self.add_marker_of(Rule::WidthTableOrth, layer, bbox, (c1.net, p1, c1.fixed), (c1.net, p2, c2.fixed));
     }
 
     /// The corner before edge `k` (`initNet_pins_polygonCorners_helper`): its type from the turn,
@@ -3341,9 +3393,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -5348,5 +5400,94 @@ mod orth_spacing_tests {
         let (a, b, c) = (cut(1000, 1000), cut(1010, 1010), cut(1070, 1005));
         let m = run(vec![(60, 60)], &[("a", a, false), ("b", b, false), ("c", c, false)]);
         assert!(!m.iter().any(|m| m.aggressor.as_ref().map(|g| g.2) == Some(c)), "{m:?}");
+    }
+}
+
+#[cfg(test)]
+mod width_tbl_orth_tests {
+    //! LEF58_WIDTHTABLE ORTHOGONAL on constructed geometry: layer 4 of `tests::tech()`, a jog of
+    //! two overlapping rectangles, (0, 0)–(500, 40) and (500 - d, 30)–(1000, 70): its two concave
+    //! corners, (500, 30) and (500 - d, 40), are `d` apart in x and 10 in y.
+    use super::*;
+
+    fn jog(o: WidthTblOrth, d: i32, second: &str, fixed: (bool, bool)) -> Vec<Marker> {
+        let mut t = tests::tech();
+        t.layers[4].width_tbl_orth = Some(o);
+        let mut w = Worker::new(&t);
+        w.add(&Owner::Net("a".into()), 4, Rect::new(0, 0, 500, 40), fixed.0);
+        w.add(&Owner::Net(second.into()), 4, Rect::new(500 - d, 30, 1000, 70), fixed.1);
+        w.init();
+        w.run().iter().filter(|m| m.rule == Rule::WidthTableOrth).cloned().collect()
+    }
+
+    const O: WidthTblOrth = WidthTblOrth { horz_spc: 60, vert_spc: 50 };
+
+    // Rule (`checkWidthTableOrth_main`): two concave corners of one polygon break it when the box
+    // between them is narrower than `horz_spc` in x AND shorter than `vert_spc` in y; one marker
+    // per box (both corners find the pair), the corners' points as victim and aggressor.
+    #[test]
+    fn two_concave_corners_closer_than_both_spacings() {
+        let m = jog(O, 50, "a", (false, false));
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].layer, m[0].bbox), (4, Rect::new(450, 30, 500, 40)));
+        let pts = [m[0].victim.as_ref().map(|v| v.2), m[0].aggressor.as_ref().map(|v| v.2)];
+        assert!(pts.contains(&Some(Rect::new(500, 30, 500, 30))) && pts.contains(&Some(Rect::new(450, 40, 450, 40))));
+        assert!(jog(O, 60, "a", (false, false)).is_empty(), "dx 60 is not below horz_spc 60");
+        assert_eq!(jog(O, 59, "a", (false, false)).len(), 1);
+        assert!(jog(WidthTblOrth { horz_spc: 60, vert_spc: 10 }, 50, "a", (false, false)).is_empty(), "dy 10 is not below 10");
+    }
+
+    // Rule (`checkWidthTableOrth`: `edge->getPin() != corner->getPin()`): only the corner's own
+    // polygon; and (`checkWidthTableOrth_main`) not when both corners are fixed.
+    #[test]
+    fn only_one_polygon_and_not_both_fixed() {
+        assert!(jog(O, 50, "b", (false, false)).is_empty(), "two owners: two polygons");
+        assert!(jog(O, 50, "a", (true, true)).is_empty(), "both corners fixed");
+        assert_eq!(jog(O, 50, "a", (true, false)).len(), 1, "fixed shapes, neither corner theirs");
+        // A fixed rectangle inside the polygon with (500, 30) as its vertex: that corner alone is
+        // fixed, the other is not — still a marker.
+        let mut t = tests::tech();
+        t.layers[4].width_tbl_orth = Some(O);
+        let mut w = Worker::new(&t);
+        let a = Owner::Net("a".into());
+        w.add(&a, 4, Rect::new(0, 0, 500, 40), false);
+        w.add(&a, 4, Rect::new(450, 30, 1000, 70), false);
+        w.add(&a, 4, Rect::new(0, 0, 500, 30), true);
+        w.init();
+        let m: Vec<Marker> = w.run().iter().filter(|m| m.rule == Rule::WidthTableOrth).cloned().collect();
+        assert_eq!(m.len(), 1, "one corner fixed");
+        let fixed = [m[0].victim.as_ref().map(|v| (v.2, v.3)), m[0].aggressor.as_ref().map(|v| (v.2, v.3))];
+        assert!(fixed.contains(&Some((Rect::new(500, 30, 500, 30), true))) && fixed.contains(&Some((Rect::new(450, 40, 450, 40), false))));
+    }
+
+    // Rule (`checkWidthTableOrth`: the corner's PIN, a polygon, not its net): two jogs of one owner
+    // a gap apart pair their own corners only — the pair across the gap is never checked.
+    #[test]
+    fn two_polygons_of_one_owner_never_pair() {
+        let mut t = tests::tech();
+        t.layers[4].width_tbl_orth = Some(WidthTblOrth { horz_spc: 300, vert_spc: 200 });
+        let mut w = Worker::new(&t);
+        let a = Owner::Net("a".into());
+        for (y, d) in [(0, 200), (80, 200)] {
+            w.add(&a, 4, Rect::new(0, y, 500, y + 40), false);
+            w.add(&a, 4, Rect::new(500 - d, y + 30, 1000, y + 70), false);
+        }
+        w.init();
+        let mut m: Vec<Rect> = w.run().iter().filter(|m| m.rule == Rule::WidthTableOrth).map(|m| m.bbox).collect();
+        m.sort();
+        assert_eq!(m, [Rect::new(300, 30, 500, 40), Rect::new(300, 110, 500, 120)]);
+    }
+
+    // Rule (io): the wrong-way width falls back to the width; a horizontal layer spaces x by the
+    // wrong-way width and y by the width, a vertical one the other way round; both 0: none.
+    #[cfg(feature = "odb")]
+    #[test]
+    fn io_folds_the_two_widths_by_layer_direction() {
+        use crate::tech::read::width_tbl_orth_of;
+        assert_eq!(width_tbl_orth_of(50, 60, true), Some(WidthTblOrth { horz_spc: 60, vert_spc: 50 }));
+        assert_eq!(width_tbl_orth_of(50, 60, false), Some(WidthTblOrth { horz_spc: 50, vert_spc: 60 }));
+        assert_eq!(width_tbl_orth_of(50, 0, true), Some(WidthTblOrth { horz_spc: 50, vert_spc: 50 }));
+        assert_eq!(width_tbl_orth_of(0, 60, true), Some(WidthTblOrth { horz_spc: 60, vert_spc: 0 }));
+        assert_eq!(width_tbl_orth_of(0, 0, true), None);
     }
 }

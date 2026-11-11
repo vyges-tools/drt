@@ -158,7 +158,12 @@ patches it; a rule with `MAXEDGES` above 1 is skipped with the reference's warni
 rule with `NOADJACENTEOL`, `EXCEPTRECTANGLE` with `NOBETWEENEOL`, `MINBETWEENLENGTH`, a second
 `MINADJACENTLENGTH` value or its corner forms, or neither checked form, is refused, since the
 reference's check reads none of them as the LEF defines them; upstream OpenROAD issue #12229
-asks about the first two, which the reference's own fix checks), and the
+asks about the first two, which the reference's own fix checks),
+`LEF58_WIDTHTABLE … ORTHOGONAL` on a routing layer (the first width of the last orthogonal table,
+and of the last one with `WRONGDIRECTION` for the other axis, the width when there is none: two
+concave corners of one polygon closer than both, across and along, are a marker named
+`WidthTableOrth` as the reference names it; checked only, as the reference only checks it; a table
+without `ORTHOGONAL` is not read, as the reference does not read it), and the
 orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
 and closer than `s` across that run, is marked; the marker names the pair as its victims, each

@@ -226,6 +226,7 @@ pub fn viol_name(rule: Rule) -> &'static str {
         Rule::Lef58Enclosure => "Lef58Enclosure",
         Rule::OffGrid => "Off Grid",
         Rule::Lef58MaxSpacing => "Lef58MaxSpacing",
+        Rule::WidthTableOrth => "WidthTableOrth",
     }
 }
 
