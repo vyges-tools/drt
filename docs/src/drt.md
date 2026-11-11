@@ -157,7 +157,8 @@ reference names it, and patched by the via-swap workers' minimum-step patch as t
 patches it; a rule with `MAXEDGES` above 1 is skipped with the reference's warning, DRT-335; a
 rule with `NOADJACENTEOL`, `EXCEPTRECTANGLE` with `NOBETWEENEOL`, `MINBETWEENLENGTH`, a second
 `MINADJACENTLENGTH` value or its corner forms, or neither checked form, is refused, since the
-reference's check reads none of them as the LEF defines them), and the
+reference's check reads none of them as the LEF defines them; upstream OpenROAD issue #12229
+asks about the first two, which the reference's own fix checks), and the
 orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
 and closer than `s` across that run, is marked; the marker names the pair as its victims, each

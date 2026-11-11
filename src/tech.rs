@@ -1721,6 +1721,7 @@ pub mod read {
     }
 
     /// The first clause of LEF58_MINSTEP rule `k` of `layer` the reference's check does not read
+    /// (NOADJACENTEOL and EXCEPTRECTANGLE: upstream OpenROAD issue #12229, register D14)
     /// as the LEF defines it, so this engine REFUSES it (a rule io skips is not one of these):
     /// NOADJACENTEOL (alone it is never checked; with MINADJACENTLENGTH the length is read as one
     /// more violation, where the LEF makes it a condition on the other neighbour edge), EXCEPTRECTANGLE

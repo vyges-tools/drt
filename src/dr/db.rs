@@ -1212,6 +1212,7 @@ mod skipped_rule_tests {
         assert!(tech.layers[tech.layer_num("M2").expect("M2")].lef58_min_step.is_empty());
     }
 
+    /// Upstream OpenROAD issue #12229 (register D14) asks about NOADJACENTEOL and EXCEPTRECTANGLE.
     /// A LEF58_MINSTEP rule the reference's check does not read as written is refused, naming the
     /// clause: MINBETWEENLENGTH, a second MINADJACENTLENGTH value or a corner form, or a rule with
     /// neither checked form (io keeps it and the check never reads it). A rule io skips is
