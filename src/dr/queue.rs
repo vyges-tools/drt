@@ -760,13 +760,14 @@ fn patch_corner_spacing(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, mark
 }
 
 /// Per via origin (`std::map<odb::Point, std::vector<drVia*>>`), its vias: worker net, enclosure
-/// box on the layer, lonely.
-type ViasByOrigin = BTreeMap<(i32, i32), Vec<(usize, Rect, bool)>>;
+/// box on the layer, lonely, and whether its cut is the one above the layer (an up via).
+type ViasByOrigin = BTreeMap<(i32, i32), Vec<(usize, Rect, bool, bool)>>;
 
 /// `patchMetalShape_minStep`: per minimum-step marker (MINSTEP or LEF58_MINSTEP, the reference's
-/// `frcMinStepConstraint` or `frcLef58MinStepConstraint`), in order, on a routing layer beside a cut
-/// layer that keeps a LEF58_MAXSPACING rule (the via-to-via half of its condition is refused
-/// before routing, `min_step_via`) and at least the layer's width long on one side: the vias of
+/// `frcMinStepConstraint` or `frcLef58MinStepConstraint`), in order, on a routing layer whose
+/// default vias' pads break its MINSTEP (`hasVia2ViaMinStepViol`, [`RuleTables::min_step_via`]) or
+/// beside a cut layer that keeps a LEF58_MAXSPACING rule, and at least the layer's width long on
+/// one side: the vias of
 /// the marker's first source net (and the target's, with one) in the worker's region query of
 /// the layer, cut just below or above it, grouped by origin (`std::map<Point>`: x, then y; each
 /// group in query order). In a via-swap worker, a LONELY via whose enclosure box on the layer
@@ -784,7 +785,8 @@ fn patch_min_step(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, markers: &
     for m in markers.iter().filter(|m| matches!(m.rule, Rule::MinStep | Rule::Lef58MinStep(_))) {
         let l = m.layer;
         let layer = &tech.layers[l];
-        if !max_spacing(l.checked_sub(1)) && !max_spacing(Some(l + 1)) {
+        let v2v = q.mcfg.rules.min_step_via.get(l).copied().unwrap_or(false);
+        if !v2v && !max_spacing(l.checked_sub(1)) && !max_spacing(Some(l + 1)) {
             continue;
         }
         let mut mb = m.bbox;
@@ -803,11 +805,11 @@ fn patch_min_step(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, markers: &
             }
             let cut = tech.via_defs[via].cut;
             if cut == l + 1 || cut + 1 == l {
-                vias.entry(origin).or_default().push((ni, via_enclosure(tech, via, l, origin), lonely));
+                vias.entry(origin).or_default().push((ni, via_enclosure(tech, via, l, origin), lonely, cut == l + 1));
             }
         }
         let min_step_length = layer.min_step.map(|ms| ms.min_step_length);
-        let (grown, chosen) = min_step_take(mb, &vias, min_step_length, via_swap);
+        let (grown, chosen) = min_step_take(mb, &vias, min_step_length, via_swap, v2v);
         let Some((ni, origin)) = chosen else { continue };
         mb = grown;
         let p = PatchWire { layer: l, origin, offset: Rect::new(mb.xl - origin.0, mb.yl - origin.1, mb.xh - origin.0, mb.yh - origin.1), owner: Owner::Net((q.name)(ni)) };
@@ -819,16 +821,29 @@ fn patch_min_step(q: &QueueCtx<'_>, state: &[NetState], rq: &RouteRq, markers: &
 }
 
 /// `patchMetalShape_minStep`'s walk over the vias of one marker, by origin (`std::map` order) and
-/// in each group in order: the first lonely via in a via-swap worker that the marker box grows
-/// against ([`min_step_bloat`]) ends its GROUP (`break`), not the walk; a later group's may take
-/// the marker again from the box already grown, and the last one taken wins. Without a classic
-/// MINSTEP length (`getMinStepConstraint()` null) no via takes it. The box as grown, and the
-/// (worker net, origin) that took it last.
+/// in each group in order. Per via, first: once the group has shown an up via AND a down via
+/// (counting this one) on a layer whose default vias break its MINSTEP (`v2v`), this via takes the
+/// marker as it stands (a stacked via: the patch is the marker box, not grown), in ANY worker;
+/// else a lonely via in a via-swap worker that the marker box grows against ([`min_step_bloat`])
+/// takes it. Either ends its GROUP (`break`), not the walk: a later group's via may take the marker
+/// again (from the box already grown), and the last one taken wins. Without a classic MINSTEP
+/// length (`getMinStepConstraint()` null) no lonely via takes it (the stacked branch needs none).
+/// The box as grown, and the (worker net, origin) that took it last.
 #[allow(clippy::type_complexity)]
-fn min_step_take(mut mb: Rect, vias: &ViasByOrigin, min_step_length: Option<i32>, via_swap: bool) -> (Rect, Option<(usize, (i32, i32))>) {
+fn min_step_take(mut mb: Rect, vias: &ViasByOrigin, min_step_length: Option<i32>, via_swap: bool, v2v: bool) -> (Rect, Option<(usize, (i32, i32))>) {
     let mut chosen = None;
     for (&origin, objs) in vias {
-        for &(ni, enc, lonely) in objs {
+        let (mut up_found, mut down_found) = (false, false);
+        for &(ni, enc, lonely, up) in objs {
+            if up {
+                up_found = true;
+            } else {
+                down_found = true;
+            }
+            if up_found && down_found && v2v {
+                chosen = Some((ni, origin));
+                break;
+            }
             if !(lonely && via_swap) {
                 continue;
             }
@@ -1586,9 +1601,9 @@ mod tests {
     fn a_later_origin_retakes_a_min_step_marker_from_the_grown_box() {
         let r = Rect::new;
         let mb = r(135, 0, 200, 70);
-        let a = (0, r(0, 0, 200, 70), true);
-        let b = (1, r(100, 0, 235, 70), true);
-        type Via = (usize, Rect, bool);
+        let a = (0, r(0, 0, 200, 70), true, false);
+        let b = (1, r(100, 0, 235, 70), true, false);
+        type Via = (usize, Rect, bool, bool);
         let group = |v: Vec<((i32, i32), Via)>| {
             let mut m: ViasByOrigin = BTreeMap::new();
             for (o, x) in v {
@@ -1596,10 +1611,37 @@ mod tests {
             }
             m
         };
-        assert_eq!(min_step_take(mb, &group(vec![((20, 0), b), ((5, 0), a)]), Some(100), true), (r(135, 0, 235, 70), Some((1, (20, 0)))));
-        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a), ((5, 0), b)]), Some(100), true), (r(135, 0, 235, 70), Some((0, (5, 0)))));
-        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a)]), Some(100), false).1, None, "not a via-swap worker");
-        assert_eq!(min_step_take(mb, &group(vec![((5, 0), (0, a.1, false))]), Some(100), true).1, None, "not lonely");
-        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a)]), None, true).1, None, "no classic MINSTEP");
+        assert_eq!(min_step_take(mb, &group(vec![((20, 0), b), ((5, 0), a)]), Some(100), true, false), (r(135, 0, 235, 70), Some((1, (20, 0)))));
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a), ((5, 0), b)]), Some(100), true, false), (r(135, 0, 235, 70), Some((0, (5, 0)))));
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a)]), Some(100), false, false).1, None, "not a via-swap worker");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), (0, a.1, false, false))]), Some(100), true, false).1, None, "not lonely");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), a)]), None, true, false).1, None, "no classic MINSTEP");
+    }
+
+    #[test]
+    fn a_stacked_via_takes_a_min_step_marker_unchanged_on_a_via_to_via_layer() {
+        // Rule (`patchMetalShape_minStep`, pin 4155ac31): per origin group, in order, once the group
+        // has an up via and a down via (counting the current one) and the layer's default vias'
+        // pads break its MINSTEP (`hasVia2ViaMinStepViol`), the current via takes the marker box
+        // as it is, in any worker (no via-swap or lonely test); the group ends there, a later
+        // origin's via may take it again, and the last one taken wins.
+        let r = Rect::new;
+        let mb = r(135, 0, 200, 70);
+        let enc = r(0, 0, 70, 70);
+        let (down, up) = ((0, enc, false, false), (1, enc, false, true));
+        type Via = (usize, Rect, bool, bool);
+        let group = |v: Vec<((i32, i32), Via)>| {
+            let mut m: ViasByOrigin = BTreeMap::new();
+            for (o, x) in v {
+                m.entry(o).or_default().push(x);
+            }
+            m
+        };
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), down), ((5, 0), up)]), None, false, true), (mb, Some((1, (5, 0)))), "the second via of the stack takes it, box unchanged");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), up), ((5, 0), down)]), None, false, true), (mb, Some((0, (5, 0)))));
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), down), ((5, 0), up)]), None, false, false).1, None, "layer not flagged");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), down), ((9, 0), up)]), None, false, true).1, None, "up and down at two origins: no stack");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), up), ((5, 0), down), ((9, 0), (2, enc, false, true)), ((9, 0), (3, enc, false, false))]), None, false, true).1, Some((3, (9, 0))), "a later origin's stack wins");
+        assert_eq!(min_step_take(mb, &group(vec![((5, 0), (0, enc, false, true)), ((5, 0), (1, enc, false, true))]), None, false, true).1, None, "two up vias: no stack");
     }
 }

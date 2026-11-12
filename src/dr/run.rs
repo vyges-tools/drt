@@ -21,7 +21,7 @@ use crate::dr::guides::{build_gcell_patterns, gen_guides, GCellGrid, GuideConfig
 use crate::dr::maze::{MazeCfg, MazeState};
 use crate::dr::queue::{initial_marker_cost, recheck_markers, route_queue, Event, QueueCtx, Start};
 use crate::dr::route::{abs_priority, init_queue, NetCtx};
-use crate::dr::max_spacing::{fix_max_spacing, BlockVia, MaxSpacingState, PaIn, PassIn};
+use crate::dr::max_spacing::{fix_max_spacing, prepare_secondary_vias, BlockVia, MaxSpacingState, PaIn, PassIn};
 use crate::dr::rules::{default_vias, rule_tables, EolTable, NdrRule, NdrTables, RuleConfig, RuleTables};
 use crate::dr::ta::{track_assignment, Fixed, TaConfig, TaGuide, TaInput, TaState, TaTerm};
 use crate::gc::{Marker, Owner};
@@ -110,14 +110,6 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     let d = pa_main(db, r, log)?;
     let g = init_guide(db, &d, log)?;
     let p = prep(&d);
-    // A layer whose default vias' pads break its MINSTEP makes the reference patch such shapes in
-    // its check (`patchMetalShape_minStep`, not modelled).
-    if !opts.unchecked_rules {
-        let flagged: Vec<&str> = p.rules.min_step_via.iter().enumerate().filter(|(_, &f)| f).map(|(l, _)| p.tech.layers[l].name.as_str()).collect();
-        if !flagged.is_empty() {
-            return Err(format!("rule families not modelled: {}: via-to-via min step patching (patchMetalShape_minStep)", flagged.join(", ")));
-        }
-    }
     let t = ta(&d, &g, &p, log);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
     let (routes, markers_by_iteration, flow_by_iteration, area_patches_dropped_no_owner) = dr(&d, &g, &p, &t, end, opts.max_spacing_trace, log)?;
@@ -563,6 +555,9 @@ pub struct Prep {
     pub tech: Tech,
     pub defaults: Vec<Option<usize>>,
     pub rules: RuleTables,
+    /// How many of `tech`'s via defs are the layers' own; the max-spacing pass's generated
+    /// secondaries follow them.
+    pub layer_vias: usize,
 }
 
 pub fn prep(d: &DesignIn) -> Prep {
@@ -571,7 +566,8 @@ pub fn prep(d: &DesignIn) -> Prep {
     let defaults = default_vias(&mut tech, &rcfg);
     crate::dr::rules::prep_cut_spc_tbl(&mut tech, &defaults);
     let rules = rule_tables(&tech, &defaults, &d.ndrs, &rcfg);
-    Prep { tech, defaults, rules }
+    let layer_vias = prepare_secondary_vias(&mut tech, &defaults, &d.block_vias);
+    Prep { tech, defaults, rules, layer_vias }
 }
 
 /// Track assignment's result and the terminal tables detailed routing reads.
@@ -1006,7 +1002,7 @@ fn check_then_fix_max_spacing(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_st
         };
         let d = cx.d;
         let pa = PaIn { tech: &d.tech, tracks: &d.tracks, cfg: &d.cfg, masters: &d.masters, insts: &d.insts, first: &d.pa };
-        let pass = PassIn { tech: &cx.p.tech, defaults: &cx.p.defaults, block_vias: &d.block_vias, fixed: &d.design.fixed, fixed_trees: &cx.fixed_trees, grid: &cx.g.grid, net_name: &net_name, inst_term_name: &inst_term_name, pa: Some(pa) };
+        let pass = PassIn { tech: &cx.p.tech, defaults: &cx.p.defaults, block_vias: &d.block_vias, layer_vias: cx.p.layer_vias, fixed: &d.design.fixed, fixed_trees: &cx.fixed_trees, grid: &cx.g.grid, net_name: &net_name, inst_term_name: &inst_term_name, pa: Some(pa) };
         fix_max_spacing(&pass, routes, max_spacing, log, &mut |routes, merged, st, log| via_swap_workers(cx, routes, merged, st, log))?;
         flow_state.fixing_max_spacing = true;
     }
@@ -1041,14 +1037,14 @@ impl SwapIn<'_> {
 /// runs them in parallel but writes each back in a critical section, and its runs here are
 /// single-threaded), a worker on the region (extended by the multi-thread safe distance, its check
 /// box by 500), iteration 64, `RipUpMode::VIASWAP`, the worker's default costs; written back
-/// unless it ends worse. The workers read pin access as the pass's re-run left it. Err: a
-/// secondary via def the router's technology does not hold (a generated `_FR` def).
+/// unless it ends worse. The workers read pin access as the pass's re-run left it. A generated
+/// `_FR` secondary is held by the router's technology from prep on ([`prepare_secondary_vias`]).
 fn via_swap_workers(cx: &DrCtx<'_>, routes: &mut DesignRoutes, merged: &[Rect], st: &MaxSpacingState, log: Sink) -> Res<()> {
     let tech = &cx.p.tech;
     let mut secondary: Vec<Vec<usize>> = vec![Vec::new(); tech.layers.len()];
     for (l, defs) in st.secondary.iter().enumerate() {
         for v in defs {
-            let k = tech.via_defs.iter().position(|x| x.name == v.name).ok_or_else(|| format!("lef58_max_spacing: the secondary via def {} is generated (not in the technology); a via swap to it is not modelled", v.name))?;
+            let k = tech.via_defs.iter().position(|x| x.name == v.name).ok_or_else(|| format!("lef58_max_spacing: the secondary via def {} was not prepared in the router's technology", v.name))?;
             secondary[l].push(k);
         }
     }

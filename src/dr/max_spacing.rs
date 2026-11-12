@@ -104,6 +104,9 @@ pub struct PassIn<'a> {
     /// Each cut layer's default via (`frLayer::getDefaultViaDef`).
     pub defaults: &'a [Option<usize>],
     pub block_vias: &'a [BlockVia],
+    /// How many of `tech`'s via defs are the layers' own (`frLayer::getViaDefs`): the ones after
+    /// them are the router's generated secondaries, prepared before routing ([`prepare_secondary_vias`]).
+    pub layer_vias: usize,
     /// The design's shapes per layer, in the region query's order, and their packed trees.
     pub fixed: &'a [Vec<(Rect, Fixed)>],
     pub fixed_trees: &'a [PackedRTree<Fixed>],
@@ -130,7 +133,7 @@ pub struct PaIn<'a> {
 /// reference's step. Err: a stage that is not ported was reached (nothing is written).
 pub fn fix_max_spacing(p: &PassIn<'_>, routes: &mut DesignRoutes, state: &mut MaxSpacingState, log: Sink, swap: ViaSwapWorkers<'_>) -> Result<(), String> {
     log(Line::Info(227, "Checking For LEF58_MAXSPACING violations".into()));
-    init_secondary_vias(p.tech, p.defaults, p.block_vias, state)?;
+    init_secondary_vias_of(p.tech, p.layer_vias, p.defaults, p.block_vias, state)?;
     let mut lonely_vias = Vec::new();
     for (l, layer) in p.tech.layers.iter().enumerate() {
         if layer.kind != LayerKind::Cut || layer.lef58_max_spacing.is_empty() {
@@ -336,6 +339,12 @@ pub fn merge_regions(mut regions: Vec<Rect>) -> Result<Vec<Rect>, String> {
 /// secondary (its shapes are not read), or an end-of-line LEF58 enclosure on a secondary's class
 /// (`getBloatingDist` is not ported).
 pub fn init_secondary_vias(tech: &Tech, defaults: &[Option<usize>], block_vias: &[BlockVia], state: &mut MaxSpacingState) -> Result<(), String> {
+    init_secondary_vias_of(tech, tech.via_defs.len(), defaults, block_vias, state)
+}
+
+/// [`init_secondary_vias`] over the first `layer_vias` via defs of `tech` only: the layers' own
+/// via lists (`frLayer::getViaDefs`), which a via `frTechObject::addVia` appends later never joins.
+pub fn init_secondary_vias_of(tech: &Tech, layer_vias: usize, defaults: &[Option<usize>], block_vias: &[BlockVia], state: &mut MaxSpacingState) -> Result<(), String> {
     if state.secondary.len() < tech.layers.len() {
         state.secondary.resize(tech.layers.len(), Vec::new());
     }
@@ -352,7 +361,7 @@ pub fn init_secondary_vias(tech: &Tech, defaults: &[Option<usize>], block_vias: 
         // index into `tech.via_defs`); the tuple ends with the name. A design via is settled
         // first: of the default's class it is skipped wherever it sorts, else refused.
         let mut cuts_to_viadefs: BTreeMap<usize, BTreeMap<ViaRawPriority, usize>> = BTreeMap::new();
-        for (v, vd) in tech.via_defs.iter().enumerate().filter(|(_, vd)| vd.cut == l) {
+        for (v, vd) in tech.via_defs[..layer_vias].iter().enumerate().filter(|(_, vd)| vd.cut == l) {
             cuts_to_viadefs.entry(vd.cut_figs.len()).or_default().insert(via_raw_priority(tech, vd), v);
         }
         for b in block_vias.iter().filter(|b| b.cut == l) {
@@ -385,6 +394,21 @@ pub fn init_secondary_vias(tech: &Tech, defaults: &[Option<usize>], block_vias: 
         }
     }
     Ok(())
+}
+
+/// The secondary via defs the max-spacing pass will generate (`<name>_FR`), appended to the router's
+/// technology before routing, in the order `initSecondaryVias` adds them (`frTechObject::addVia`
+/// appends: their ids follow every via io made). The pass's own call then finds each one held by
+/// name and equal and reuses it, as `addVia` does; preparing them lets every worker index a
+/// swapped via. A technology the pass would refuse gets none (the pass refuses it when it runs).
+/// The number of via defs before them (the layers' own, [`PassIn::layer_vias`]).
+pub fn prepare_secondary_vias(tech: &mut Tech, defaults: &[Option<usize>], block_vias: &[BlockVia]) -> usize {
+    let layer_vias = tech.via_defs.len();
+    let mut st = MaxSpacingState::default();
+    if init_secondary_vias_of(tech, layer_vias, defaults, block_vias, &mut st).is_ok() {
+        tech.via_defs.extend(st.generated);
+    }
+    layer_vias
 }
 
 /// io's generated secondary via: one rectangle per layer — the bounding boxes of the via's
@@ -632,6 +656,31 @@ mod tests {
         assert_eq!(st.generated.len(), 1);
     }
 
+    /// Rule (`initSecondaryVias` + `frTechObject::addVia`): the generated `_FR` vias, prepared
+    /// before routing, follow every via already held; the pass's own call reads the layers' vias
+    /// only (the prepared ones never become secondaries of their own), finds each generated one
+    /// held by name and equal, and lists the same secondaries as an unprepared call.
+    #[test]
+    fn prepared_secondaries_are_appended_once_and_reused_by_the_pass() {
+        let (mut t, defaults) = tech_with_rule();
+        let mut plain = MaxSpacingState::default();
+        init_secondary_vias(&t, &defaults, &[], &mut plain).expect("ported");
+        let n = prepare_secondary_vias(&mut t, &defaults, &[]);
+        assert_eq!(n, 4);
+        let names: Vec<&str> = t.via_defs.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["A", "B", "C", "D", "C_FR"]);
+        let mut st = MaxSpacingState::default();
+        init_secondary_vias_of(&t, n, &defaults, &[], &mut st).expect("ported");
+        let got: Vec<&str> = st.secondary[1].iter().map(|v| v.name.as_str()).collect();
+        let want: Vec<&str> = plain.secondary[1].iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(got, want);
+        assert!(st.generated.is_empty(), "held, not generated again");
+        // Read over every via (the prepared one included), C_FR would be a secondary of its own.
+        let mut all = MaxSpacingState::default();
+        init_secondary_vias(&t, &defaults, &[], &mut all).expect("ported");
+        assert_ne!(all.secondary[1].len(), st.secondary[1].len());
+    }
+
     /// Rule (`initSecondaryVias`): a layer with no default via, or no max-spacing rule, gets no
     /// secondary; a design via of another class than the default's is refused (its shapes are not
     /// read), one of the default's class is skipped as io skips it.
@@ -740,7 +789,7 @@ mod tests {
     }
 
     fn pass_in<'a>(t: &'a Tech, defaults: &'a [Option<usize>], fixed: &'a [Vec<(Rect, Fixed)>], trees: &'a [PackedRTree<Fixed>], g: &'a GCellGrid) -> PassIn<'a> {
-        PassIn { tech: t, defaults, block_vias: &[], fixed, fixed_trees: trees, grid: g, net_name: &|n| format!("n{n}"), inst_term_name: &|i, t| (format!("i{i}"), format!("t{t}")), pa: None }
+        PassIn { tech: t, defaults, block_vias: &[], layer_vias: t.via_defs.len(), fixed, fixed_trees: trees, grid: g, net_name: &|n| format!("n{n}"), inst_term_name: &|i, t| (format!("i{i}"), format!("t{t}")), pa: None }
     }
 
     /// Rule (`FlexDR::fixMaxSpacing`, stubborn terminals): the design's shapes on the layer of the
