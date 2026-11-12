@@ -1049,6 +1049,8 @@ pub fn mod_eol_costs_poly(w: &mut CostWorker<'_, '_>, owner: usize, ext_box: &Re
 /// As [`mod_eol_costs_poly`], the net's route shapes (layer, box) merged in too.
 pub fn mod_eol_costs_poly_with(w: &mut CostWorker<'_, '_>, owner: usize, ext_box: &Rect, routes: &[(usize, Rect)], t: ModCost) {
     let tech = w.cx.tech;
+    // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+    #[allow(clippy::needless_range_loop)]
     for l in 0..tech.layers.len() {
         if tech.layers[l].kind != LayerKind::Routing {
             continue;
@@ -1278,6 +1280,8 @@ fn init_maze_cost_ap(w: &mut CostWorker<'_, '_>, nets: &[DrNet]) {
 
 fn init_maze_cost_planar_term(w: &mut CostWorker<'_, '_>, ext_box: &Rect) {
     let tech = w.cx.tech;
+    // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+    #[allow(clippy::needless_range_loop)]
     for l in 0..tech.layers.len() {
         if tech.layers[l].kind != LayerKind::Routing {
             continue;

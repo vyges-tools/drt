@@ -348,6 +348,8 @@ pub fn write_plan(masters: &HashMap<String, Master>, insts: &[DesignInst], ports
         let rep = &insts[pa.reps[c]];
         let master = &masters[&class.key.master];
         for (t, term) in master.terms.iter().enumerate() {
+            // Index loop kept as written: the index is used beyond this container (order and bounds unchanged).
+            #[allow(clippy::needless_range_loop)]
             for p in 0..term.pins.len() {
                 for (a, ap) in pa.class_aps[c][t][p].iter().enumerate() {
                     let point = (ap.point.0 - rep.unique.location.0, ap.point.1 - rep.unique.location.1);
