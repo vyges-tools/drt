@@ -123,6 +123,22 @@ pub struct Layer {
     /// A routing layer's LEF58_WIDTHTABLE … ORTHOGONAL rules as io folds them into one constraint
     /// (`frLef58WidthTableOrthConstraint`), see [`read::width_tbl_orth`].
     pub width_tbl_orth: Option<WidthTblOrth>,
+    /// A routing layer's LEF58_SPACING … WRONGDIRECTION rules io keeps
+    /// (`frLef58SpacingWrongDirConstraint`, one per rule), in the technology's order, see
+    /// [`read::lef58_wrong_dir_spacing_rules`].
+    pub lef58_wrong_dir_spacing: Vec<WrongDirSpacing>,
+}
+
+/// A LEF58_SPACING `SPACING s WRONGDIRECTION [NONEOL w] [PRL p]` rule as the check reads it: two
+/// wrong-direction edges (vertical on a horizontal layer, horizontal on a vertical one), neither
+/// shorter than `noneol` when it is given, running parallel longer than `prl`, closer than `space`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrongDirSpacing {
+    pub space: i32,
+    /// NONEOL's width, `None` without one.
+    pub noneol: Option<i32>,
+    /// PRL's length, 0 without one (the database's default).
+    pub prl: i32,
 }
 
 /// The one width-table-orthogonal constraint io makes per routing layer: two concave corners of
@@ -1521,7 +1537,8 @@ pub mod read {
                     let lef58_area = lef58_area_rules(db, &name);
                     let lef58_min_step = lef58_min_step_rules(db, &name);
                     let width_tbl_orth = width_tbl_orth(db, &name, dir == Dir::Horizontal);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth });
+                    let lef58_wrong_dir_spacing = lef58_wrong_dir_spacing_rules(db, &name);
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth, lef58_wrong_dir_spacing });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1691,6 +1708,40 @@ pub mod read {
             .filter(|&k| !db.maxspacingrule_has_cut_class(layer, k))
             .map(|_| (350, format!("LEF58_MAXSPACING with no CUTCLASS is not supported. Skipping for layer {layer}")))
             .collect()
+    }
+
+    /// The LEF58_SPACING … WRONGDIRECTION rules of routing layer `layer` io keeps, in the
+    /// technology's order (`setRoutingLayerProperties`, after the end-of-line rules, before
+    /// LEF58_MINSTEP). Upstream rule: a rule with LENGTH (DRT-333) or a negative PRL (DRT-334) is
+    /// skipped with a warning ([`lef58_wrong_dir_spacing_skip_warnings`]); every other rule is one
+    /// constraint, read by the check alone (`checkMetalSpacing_wrongDir`).
+    pub fn lef58_wrong_dir_spacing_rules(db: &Db, layer: &str) -> Vec<WrongDirSpacing> {
+        (0..db.num_layer_get_tech_layer_wrong_dir_spacing_rules(layer))
+            .filter(|&k| lef58_wrong_dir_spacing_skip(db, layer, k).is_none())
+            .map(|k| WrongDirSpacing {
+                space: db.wrongdirspacingrule_get_wrongdir_space(layer, k),
+                noneol: db.wrongdirspacingrule_is_noneol_valid(layer, k).then(|| db.wrongdirspacingrule_get_noneol_width(layer, k)),
+                prl: db.wrongdirspacingrule_get_prl_length(layer, k),
+            })
+            .collect()
+    }
+
+    /// io's warning for a LEF58_SPACING … WRONGDIRECTION rule it skips: LENGTH first (DRT-333),
+    /// then a negative PRL (DRT-334), the texts as the reference words them.
+    pub fn lef58_wrong_dir_spacing_skip(db: &Db, layer: &str, k: usize) -> Option<(u16, String)> {
+        if db.wrongdirspacingrule_is_length_valid(layer, k) {
+            Some((333, "Unsupported branch LENGTH in WrongDirSpacingRule.".to_string()))
+        } else if db.wrongdirspacingrule_get_prl_length(layer, k) < 0 {
+            Some((334, "Unsupported negative value for prlLength in branch PRL in WrongDirSpacingRule.".to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// io's warnings for the LEF58_SPACING … WRONGDIRECTION rules of routing layer `layer` it
+    /// skips, in the rules' order.
+    pub fn lef58_wrong_dir_spacing_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_wrong_dir_spacing_rules(layer)).filter_map(|k| lef58_wrong_dir_spacing_skip(db, layer, k)).collect()
     }
 
     /// The LEF58_MINSTEP rules of routing layer `layer` io keeps, in the technology's order

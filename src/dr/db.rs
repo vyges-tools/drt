@@ -64,12 +64,12 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
         // (`crate::dr::max_spacing`); nor LEF58_WIDTHTABLE … ORTHOGONAL, which io folds into one
         // constraint (`tech::read::width_tbl_orth`) whose only consumer is the check
         // (`checkWidthTableOrth`, in the corner spacing walk; the corner-spacing patch pass runs
-        // that walk but keeps only corner spacing markers).
+        // that walk but keeps only corner spacing markers); nor LEF58_SPACING … WRONGDIRECTION, one
+        // constraint per kept rule (`tech::read::lef58_wrong_dir_spacing_rules`) whose only
+        // consumer is the check (`checkMetalSpacing_wrongDir`).
         let name = l.name.as_str();
-        let kept = |n: usize, keeps: &dyn Fn(usize) -> bool| (0..n).filter(|&k| keeps(k)).count();
         let untracked = [
             ("lef58_two_wires_forbidden_spacing", db.num_layer_get_tech_layer_two_wires_forbidden_spc_rules(name)),
-            ("lef58_wrong_dir_spacing", kept(db.num_layer_get_tech_layer_wrong_dir_spacing_rules(name), &|k| !db.wrongdirspacingrule_is_length_valid(name, k) && db.wrongdirspacingrule_get_prl_length(name, k) >= 0)),
         ];
         for (family, n) in untracked {
             if n > 0 {
@@ -228,6 +228,10 @@ impl SkippedRule {
                 "layer {}: LEF58_MINSTEP rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
             ),
+            ("lef58_wrong_dir_spacing", clause) => format!(
+                "layer {}: LEF58_SPACING WRONGDIRECTION rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
+                self.layer, self.index
+            ),
             ("lef58_min_cut", clause) => format!(
                 "layer {}: LEF58_MINIMUMCUT rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
@@ -280,6 +284,12 @@ pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
         for k in 0..db.num_layer_get_tech_layer_area_rules(&l.name) {
             if let Some(clause) = crate::tech::read::lef58_area_skipped_clause(db, &l.name, k) {
                 out.push(SkippedRule { layer: l.name.clone(), family: "lef58_area", index: k, clause });
+            }
+        }
+        for k in 0..db.num_layer_get_tech_layer_wrong_dir_spacing_rules(&l.name) {
+            if let Some((id, _)) = crate::tech::read::lef58_wrong_dir_spacing_skip(db, &l.name, k) {
+                let clause = if id == 333 { "LENGTH" } else { "a negative PRL" };
+                out.push(SkippedRule { layer: l.name.clone(), family: "lef58_wrong_dir_spacing", index: k, clause });
             }
         }
         for k in 0..db.num_layer_get_tech_layer_min_step_rules(&l.name) {
@@ -1201,6 +1211,44 @@ mod skipped_rule_tests {
         assert_eq!(orth("two", "WIDTHTABLE 0.07 ORTHOGONAL ; WIDTHTABLE 0.05 ORTHOGONAL ;"), Some((50, 50)), "the last wins");
         assert_eq!(orth("wdp", "WIDTHTABLE 0.05 ORTHOGONAL ; WIDTHTABLE 0.09 WRONGDIRECTION ;"), Some((50, 50)), "not ORTHOGONAL: not read");
         assert_eq!(orth("pl", "WIDTHTABLE 0.05 0.1 ;"), None);
+    }
+
+    /// Rule (reference io `setRoutingLayerProperties`, its LEF58_SPACING WRONGDIRECTION loop): one
+    /// constraint per rule (space, NONEOL width when given, PRL, 0 without one); a rule with LENGTH
+    /// is skipped with DRT-333, one with a negative PRL with DRT-334 (LENGTH tested first). MODELLED
+    /// (the check is its only consumer), nothing refused.
+    #[test]
+    fn wrong_dir_spacing_rules_are_kept_but_length_or_a_negative_prl_is_skipped_with_a_warning() {
+        let d = |name: &str, rule: &str| db(name, &format!("  PROPERTY LEF58_SPACING \"{rule}\" ;\n"), "");
+        let kept = |d: &Db| {
+            let tech = crate::tech::read::tech(d).expect("tech");
+            tech.layers[tech.layer_num("M1").expect("M1")].lef58_wrong_dir_spacing.clone()
+        };
+        let w = |space, noneol, prl| crate::tech::WrongDirSpacing { space, noneol, prl };
+        for (name, rule, want) in [
+            ("kit", "SPACING 0.06 WRONGDIRECTION NONEOL 0.05 ;", w(60, Some(50), 0)),
+            ("prl", "SPACING 0.06 WRONGDIRECTION NONEOL 0.05 PRL 0.02 ;", w(60, Some(50), 20)),
+            ("plain", "SPACING 0.06 WRONGDIRECTION ;", w(60, None, 0)),
+        ] {
+            let d = d(name, rule);
+            let (skipped, refused, _) = census(&d);
+            assert!(refused.is_empty() && skipped.is_empty(), "{rule}: {refused:?} {skipped:?}");
+            assert_eq!(kept(&d), [want], "{rule}");
+            assert!(crate::tech::read::lef58_wrong_dir_spacing_skip_warnings(&d, "M1").is_empty());
+        }
+        for (name, rule, id, text, clause) in [
+            ("len", "SPACING 0.06 WRONGDIRECTION NONEOL 0.05 LENGTH 0.5 ;", 333, "Unsupported branch LENGTH in WrongDirSpacingRule.", "LENGTH"),
+            ("neg", "SPACING 0.06 WRONGDIRECTION PRL -0.01 ;", 334, "Unsupported negative value for prlLength in branch PRL in WrongDirSpacingRule.", "a negative PRL"),
+            ("both", "SPACING 0.06 WRONGDIRECTION PRL -0.01 LENGTH 0.5 ;", 333, "Unsupported branch LENGTH in WrongDirSpacingRule.", "LENGTH"),
+        ] {
+            let d = d(name, rule);
+            let (skipped, refused, _) = census(&d);
+            assert!(refused.is_empty(), "{rule}: {refused:?}");
+            assert_eq!(skipped, [super::SkippedRule { layer: "M1".into(), family: "lef58_wrong_dir_spacing", index: 0, clause }], "{rule}");
+            assert!(skipped[0].warning().contains("LEF58_SPACING WRONGDIRECTION rule 0 uses") && skipped[0].warning().contains("SKIPPED"));
+            assert_eq!(crate::tech::read::lef58_wrong_dir_spacing_skip_warnings(&d, "M1"), [(id, text.to_string())], "{rule}");
+            assert!(kept(&d).is_empty(), "{rule}");
+        }
     }
 
     /// Rule (reference io `setRoutingLayerProperties`, its LEF58_MINSTEP loop): a rule whose

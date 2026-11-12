@@ -163,7 +163,13 @@ asks about the first two, which the reference's own fix checks),
 and of the last one with `WRONGDIRECTION` for the other axis, the width when there is none: two
 concave corners of one polygon closer than both, across and along, are a marker named
 `WidthTableOrth` as the reference names it; checked only, as the reference only checks it; a table
-without `ORTHOGONAL` is not read, as the reference does not read it), and the
+without `ORTHOGONAL` is not read, as the reference does not read it),
+`LEF58_SPACING … WRONGDIRECTION` on a routing layer (`SPACING s WRONGDIRECTION [NONEOL w] [PRL p]`:
+two wrong-direction edges, vertical on a horizontal layer and horizontal on a vertical one, of any
+shapes, neither shorter than `w` when `NONEOL` is given, running parallel longer than `p` (0
+without `PRL`), and closer than `s`, are a marker named `Lef58SpacingWrongDir` as the reference
+names it, once per rule; checked only, as the reference only checks it; a rule with `LENGTH` or a
+negative `PRL` is skipped with the reference's warning, DRT-333 or DRT-334), and the
 orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
 and closer than `s` across that run, is marked; the marker names the pair as its victims, each
@@ -214,7 +220,8 @@ change. Sign-off DRC must cover these rules. The unpatched reference router read
 plain end-of-line rule with `WITHIN 0` (upstream OpenROAD issue #12174); this router follows the
 fixed reading instead, by decision. Skipped the same way: a `LEF58_MINIMUMCUT`
 rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
-reference warns and skips it). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
+reference warns and skips it), and a LEF58 wrong-direction spacing rule with `LENGTH` or a negative
+`PRL` (DRT-333, DRT-334, as the reference warns and skips it). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
 (`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`), or with a cut class but neither `CONCAVECORNER`
 nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`), with the warning the reference's own
 fix prints (DRT-353 with no class, DRT-354 with neither corner). The unpatched reference keeps

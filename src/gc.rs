@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech, WidthTblOrth};
+use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech, WidthTblOrth, WrongDirSpacing};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -148,6 +148,11 @@ pub enum Rule {
     /// Two concave corners of one polygon closer than the layer's LEF58_WIDTHTABLE ORTHOGONAL
     /// spacing in both x and y (`checkWidthTableOrth`, inside the corner spacing walk).
     WidthTableOrth,
+    /// Two wrong-direction edges (vertical on a horizontal layer, horizontal on a vertical one)
+    /// closer than a LEF58_SPACING … WRONGDIRECTION rule allows (`checkMetalSpacing_wrongDir`); the
+    /// rule's place among the layer's kept rules (the reference keeps a marker once per
+    /// constraint).
+    Lef58SpacingWrongDir(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -789,6 +794,43 @@ fn rects_prl(a: &Rect, b: &Rect) -> (i32, i32) {
         y = -y;
     }
     (x, y)
+}
+
+/// `gcSegment::isVertical`: both ends at one x.
+fn seg_vertical(e: &Seg) -> bool {
+    e.from.0 == e.to.0
+}
+
+/// The edge as a (degenerate) rectangle, low corner to high corner normalised.
+fn seg_rect(e: &Seg) -> Rect {
+    Rect::new(e.from.0.min(e.to.0), e.from.1.min(e.to.1), e.from.0.max(e.to.0), e.from.1.max(e.to.1))
+}
+
+/// `checkMetalSpacing_wrongDir_getQueryBox`: the edge grown by `space` away from its polygon (the
+/// polygon lies on an edge's left: a north edge looks east, a west edge north).
+fn wrong_dir_query_box(e: &Seg, space: i32) -> Rect {
+    let r = seg_rect(e);
+    match e.dir() {
+        EdgeDir::W => Rect::new(r.xl, r.yl, r.xh, r.yh + space),
+        EdgeDir::E => Rect::new(r.xl, r.yl - space, r.xh, r.yh),
+        EdgeDir::S => Rect::new(r.xl - space, r.yl, r.xh, r.yh),
+        EdgeDir::N => Rect::new(r.xl, r.yl, r.xh + space, r.yh),
+    }
+}
+
+/// `getPrl(edge, ptr, edge->getOrientation())`: the overlap of the two edges' spans along the first
+/// edge's axis (negative when apart).
+fn wrong_dir_prl(a: &Seg, b: &Seg) -> i32 {
+    let span = |e: &Seg| if seg_vertical(a) { (e.from.1.min(e.to.1), e.from.1.max(e.to.1)) } else { (e.from.0.min(e.to.0), e.from.0.max(e.to.0)) };
+    let ((a0, a1), (b0, b1)) = (span(a), span(b));
+    a1.min(b1) - a0.max(b0)
+}
+
+/// `gtl::euclidean_distance` of two rectangles, stored in an frCoord (truncated).
+fn rect_distance(a: &Rect, b: &Rect) -> i32 {
+    let gap = |al: i32, ah: i32, bl: i32, bh: i32| i64::from((bl - ah).max(al - bh).max(0));
+    let (gx, gy) = (gap(a.xl, a.xh, b.xl, b.xh), gap(a.yl, a.yh, b.yl, b.yh));
+    ((gx * gx + gy * gy) as f64).sqrt() as i32
 }
 
 fn generalized_intersect(a: &Rect, b: &Rect) -> Rect {
@@ -1760,7 +1802,14 @@ impl<'a> Worker<'a> {
     /// ring, then the holes, each edge (from, to, fixed) in ring order.
     fn pin_rings(&self, layer: usize, net: usize, k: usize) -> Vec<Vec<RingEdge>> {
         let segs = &self.segs[layer];
-        let mut rings: Vec<Vec<RingEdge>> = Vec::new();
+        self.pin_ring_segs(layer, net, k).into_iter().map(|ring| ring.into_iter().map(|i| (segs[i].from, segs[i].to, segs[i].fixed)).collect()).collect()
+    }
+
+    /// [`Self::pin_rings`] as edge indices into the layer's list: the outer ring, then the holes,
+    /// each in ring order.
+    fn pin_ring_segs(&self, layer: usize, net: usize, k: usize) -> Vec<Vec<usize>> {
+        let segs = &self.segs[layer];
+        let mut rings: Vec<Vec<usize>> = Vec::new();
         let mut seen = vec![false; segs.len()];
         for s in 0..segs.len() {
             if seen[s] || segs[s].net != net || segs[s].pin != k {
@@ -1770,7 +1819,7 @@ impl<'a> Worker<'a> {
             let mut i = s;
             while !seen[i] {
                 seen[i] = true;
-                ring.push((segs[i].from, segs[i].to, segs[i].fixed));
+                ring.push(i);
                 i = segs[i].next;
             }
             rings.push(ring);
@@ -2352,7 +2401,9 @@ impl<'a> Worker<'a> {
     // ---- metal spacing ----
 
     /// Per routing layer, per owner, per maximal rectangle: every shape within the layer's largest
-    /// spacing.
+    /// spacing. Each pin's LEF58_SPACING … WRONGDIRECTION rules first
+    /// ([`Self::check_metal_spacing_wrong_dir`]; the reference checks them per pin before the pin's
+    /// maximal rectangles, and keeps their markers apart from these by constraint).
     fn check_metal_spacing(&mut self) {
         for layer in 0..self.tech.layers.len() {
             if self.tech.layers[layer].kind != LayerKind::Routing {
@@ -2361,6 +2412,11 @@ impl<'a> Worker<'a> {
             for net in 0..self.nets.len() {
                 if !self.checks_from(net) {
                     continue;
+                }
+                if !self.tech.layers[layer].lef58_wrong_dir_spacing.is_empty() && self.nets[net].pins.len() > layer {
+                    for k in 0..self.nets[net].pins[layer].len() {
+                        self.check_metal_spacing_wrong_dir(layer, net, k);
+                    }
                 }
                 let mine: Vec<usize> = (0..self.shapes[layer].len()).filter(|&k| self.alive[layer][k] && self.shapes[layer][k].net == net).collect();
                 for k in mine {
@@ -2377,6 +2433,50 @@ impl<'a> Worker<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// `checkMetalSpacing_wrongDir` on the owner's pin `k`: per kept rule in order, per edge of the
+    /// pin in ring order (outer ring, then holes), [`Self::check_metal_spacing_wrong_dir_edge`].
+    fn check_metal_spacing_wrong_dir(&mut self, layer: usize, net: usize, k: usize) {
+        let tech = self.tech;
+        let l = &tech.layers[layer];
+        let layer_vertical = l.dir == crate::tech::Dir::Vertical;
+        let edges: Vec<usize> = self.pin_ring_segs(layer, net, k).into_iter().flatten().collect();
+        for (i, con) in l.lef58_wrong_dir_spacing.iter().enumerate() {
+            let rule = Rule::Lef58SpacingWrongDir(u16::try_from(i).unwrap_or(u16::MAX));
+            for &e in &edges {
+                self.check_metal_spacing_wrong_dir_edge(layer, layer_vertical, e, rule, con);
+            }
+        }
+    }
+
+    /// The body of `checkMetalSpacing_wrongDir`'s edge loop. Edge `e` in the wrong direction (its
+    /// verticality not the layer's) and not shorter than NONEOL: every polygon edge of any owner
+    /// touching the box grown outward from `e` by the space ([`wrong_dir_query_box`]), in the edge
+    /// tree's order, that is in the wrong direction, not `e`, not fixed when `e` is, running
+    /// parallel to `e` longer than PRL ([`wrong_dir_prl`], measured along `e`), not shorter than
+    /// NONEOL, and closer than the space ([`rect_distance`]): a marker on the box between the two,
+    /// `e` the victim, the other the aggressor, each its edge's box and fixed flag.
+    fn check_metal_spacing_wrong_dir_edge(&mut self, layer: usize, layer_vertical: bool, e: usize, rule: Rule, con: &WrongDirSpacing) {
+        let edge = self.segs[layer][e];
+        if seg_vertical(&edge) == layer_vertical || con.noneol.is_some_and(|w| edge.len() < w) {
+            return;
+        }
+        let r1 = seg_rect(&edge);
+        for s in self.query_segs(layer, &wrong_dir_query_box(&edge, con.space)) {
+            let other = self.segs[layer][s];
+            if seg_vertical(&other) == layer_vertical || s == e || (edge.fixed && other.fixed) {
+                continue;
+            }
+            if wrong_dir_prl(&edge, &other) <= con.prl || con.noneol.is_some_and(|w| other.len() < w) {
+                continue;
+            }
+            let r2 = seg_rect(&other);
+            if rect_distance(&r1, &r2) >= con.space {
+                continue;
+            }
+            self.add_marker_of(rule, layer, generalized_intersect(&r1, &r2), (edge.net, r1, edge.fixed), (other.net, r2, other.fixed));
         }
     }
 
@@ -3393,9 +3493,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None, lef58_wrong_dir_spacing: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None, lef58_wrong_dir_spacing: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -5489,5 +5589,114 @@ mod width_tbl_orth_tests {
         assert_eq!(width_tbl_orth_of(50, 0, true), Some(WidthTblOrth { horz_spc: 50, vert_spc: 50 }));
         assert_eq!(width_tbl_orth_of(0, 60, true), Some(WidthTblOrth { horz_spc: 60, vert_spc: 0 }));
         assert_eq!(width_tbl_orth_of(0, 0, true), None);
+    }
+}
+
+#[cfg(test)]
+mod wrong_dir_spacing_tests {
+    //! LEF58_SPACING … WRONGDIRECTION on constructed geometry: layer 4 of `tests::tech()` is
+    //! horizontal, so its wrong-direction shapes are vertical and their wrong-direction edges are
+    //! their long vertical sides; layer 2 is vertical.
+    use super::*;
+
+    const K: WrongDirSpacing = WrongDirSpacing { space: 60, noneol: Some(50), prl: 0 };
+
+    fn run(layer: usize, rules: Vec<WrongDirSpacing>, shapes: &[(&str, Rect, bool)]) -> Vec<Marker> {
+        let mut t = tests::tech();
+        t.layers[layer].lef58_wrong_dir_spacing = rules;
+        let mut w = Worker::new(&t);
+        for (net, r, fixed) in shapes {
+            w.add(&Owner::Net((*net).into()), layer, *r, *fixed);
+        }
+        w.init();
+        w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58SpacingWrongDir(_))).cloned().collect()
+    }
+
+    /// Two vertical wires on layer 4, `d` apart: a at x 0–40, b at x 40 + d – 80 + d, y 0–240.
+    fn pair(d: i32) -> [(&'static str, Rect, bool); 2] {
+        [("a", Rect::new(0, 0, 40, 240), false), ("b", Rect::new(40 + d, 0, 80 + d, 240), false)]
+    }
+
+    fn boxes(m: &[Marker]) -> BTreeSet<(i32, i32, i32, i32)> {
+        m.iter().map(|m| (m.bbox.xl, m.bbox.yl, m.bbox.xh, m.bbox.yh)).collect()
+    }
+
+    // Rule (`checkMetalSpacing_wrongDir`): from each wrong-direction edge, every wrong-direction
+    // edge in the box grown outward by the space, closer than the space with a positive parallel
+    // run, is a marker on the box between the two edges; found from both sides, kept once. No
+    // facing test: a thin neighbour's far edge counts too, and so does a far edge behind the
+    // checked one (p10 of the witness: three boxes).
+    #[test]
+    fn wrong_direction_edges_closer_than_the_space_are_marked_far_edges_included() {
+        let m = run(4, vec![K], &pair(50));
+        assert_eq!(boxes(&m), BTreeSet::from([(40, 0, 90, 240)]));
+        let (v, g) = (m[0].victim.as_ref().expect("victim"), m[0].aggressor.as_ref().expect("aggressor"));
+        assert_eq!((v.2, g.2), (Rect::new(40, 0, 40, 240), Rect::new(90, 0, 90, 240)), "edge boxes, the first net's edge the victim");
+        assert!(run(4, vec![K], &pair(60)).is_empty(), "60 is not below 60");
+        assert_eq!(run(4, vec![K], &pair(59)).len(), 1);
+        assert_eq!(boxes(&run(4, vec![K], &pair(10))), BTreeSet::from([(40, 0, 50, 240), (40, 0, 90, 240), (0, 0, 50, 240)]));
+    }
+
+    // Rule: the parallel run is measured along the checked edge and must EXCEED PRL (0 when not
+    // given: touching ends do not count); an edge shorter than NONEOL is neither checked nor
+    // checked against; without NONEOL every wrong-direction edge counts, line ends included.
+    #[test]
+    fn the_run_must_exceed_prl_and_no_edge_be_shorter_than_noneol() {
+        let shifted = |o: i32| [("a", Rect::new(0, 0, 40, 240), false), ("b", Rect::new(90, 240 - o, 130, 480 - o), false)];
+        assert!(run(4, vec![K], &shifted(0)).is_empty(), "a run of 0 is not above PRL 0");
+        assert_eq!(run(4, vec![K], &shifted(20)).len(), 1);
+        let p20 = WrongDirSpacing { prl: 20, ..K };
+        assert!(run(4, vec![p20], &shifted(20)).is_empty(), "20 is not above PRL 20");
+        assert_eq!(run(4, vec![p20], &shifted(25)).len(), 1);
+        let short = [("a", Rect::new(0, 0, 40, 240), false), ("b", Rect::new(90, 0, 130, 45), false)];
+        assert!(run(4, vec![K], &short).is_empty(), "b's sides (45) are below NONEOL 50");
+        assert_eq!(run(4, vec![WrongDirSpacing { noneol: None, ..K }], &short).len(), 1);
+        // Two right-way wires end to end: their line ends (40) are wrong-direction edges.
+        let ends = [("a", Rect::new(0, 0, 500, 40), false), ("b", Rect::new(550, 0, 1000, 40), false)];
+        assert!(run(4, vec![K], &ends).is_empty());
+        assert_eq!(boxes(&run(4, vec![WrongDirSpacing { noneol: None, ..K }], &ends)), BTreeSet::from([(500, 0, 550, 40)]));
+    }
+
+    // Rule: only wrong-direction edges (`edge->isVertical() != layer->isVertical()`): right-way
+    // wires side by side are not read; on a vertical layer the wrong-direction edges are the
+    // horizontal ones. No same-owner or same-polygon test: a notch of one polygon counts.
+    #[test]
+    fn only_wrong_direction_edges_and_a_notch_of_one_polygon_counts() {
+        let side = [("a", Rect::new(0, 0, 500, 40), false), ("b", Rect::new(0, 90, 500, 130), false)];
+        assert!(run(4, vec![K], &side).is_empty());
+        assert_eq!(boxes(&run(2, vec![K], &side)), BTreeSet::from([(0, 40, 500, 90)]), "the same pair on a vertical layer");
+        let u = [("a", Rect::new(0, 0, 1000, 40), false), ("a", Rect::new(380, 0, 420, 140), false), ("a", Rect::new(450, 0, 490, 140), false)];
+        let m = run(4, vec![K], &u);
+        assert_eq!(boxes(&m), BTreeSet::from([(420, 40, 450, 140)]));
+        assert_eq!(m[0].owners, [Owner::Net("a".into())]);
+        // The pin's holes are walked too: a ring whose hole's sides (100 long) are 30 apart.
+        let ring = [("a", Rect::new(0, 0, 300, 100), false), ("a", Rect::new(0, 200, 300, 300), false), ("a", Rect::new(0, 100, 120, 200), false), ("a", Rect::new(150, 100, 300, 200), false)];
+        assert_eq!(boxes(&run(4, vec![K], &ring)), BTreeSet::from([(120, 100, 150, 200)]));
+    }
+
+    // Rule: no marker when both edges are fixed; one fixed edge is enough to check, and each side
+    // carries its edge's fixed flag.
+    #[test]
+    fn not_both_fixed() {
+        let fx = |a: bool, b: bool| {
+            let [(n1, r1, _), (n2, r2, _)] = pair(50);
+            run(4, vec![K], &[(n1, r1, a), (n2, r2, b)])
+        };
+        assert!(fx(true, true).is_empty());
+        for (a, b) in [(true, false), (false, true)] {
+            let m = fx(a, b);
+            assert_eq!(m.len(), 1, "{a} {b}");
+            assert_eq!((m[0].victim.as_ref().map(|v| v.3), m[0].aggressor.as_ref().map(|g| g.3)), (Some(a), Some(b)));
+        }
+    }
+
+    // Rule: one constraint per kept rule, markers kept once per CONSTRAINT: two rules marking the
+    // same box give two markers, each naming its rule.
+    #[test]
+    fn each_rule_marks_its_own_constraint() {
+        let rules = vec![WrongDirSpacing { noneol: None, ..K }, WrongDirSpacing { space: 80, ..K }];
+        let m = run(4, rules.clone(), &pair(50));
+        assert_eq!(m.iter().map(|m| (m.rule, m.bbox)).collect::<BTreeSet<_>>(), BTreeSet::from([(Rule::Lef58SpacingWrongDir(0), Rect::new(40, 0, 90, 240)), (Rule::Lef58SpacingWrongDir(1), Rect::new(40, 0, 90, 240))]));
+        assert_eq!(run(4, rules, &pair(60)).iter().map(|m| m.rule).collect::<Vec<_>>(), [Rule::Lef58SpacingWrongDir(1)]);
     }
 }

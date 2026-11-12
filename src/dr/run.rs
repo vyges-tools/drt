@@ -268,8 +268,9 @@ pub fn init_design_io(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<De
     let resolved = with_resolved_min_cuts(db, tech, &t, &defaults)?;
     let tech = &resolved;
     // setLayers' io warnings, layer by layer in the technology's order: on a routing layer the
-    // LEF58 end-of-line rules it skips, then its skipped LEF58_MINSTEP rules (MAXEDGES above 1,
-    // DRT-335) (`setRoutingLayerProperties`); on a cut layer its skipped
+    // LEF58 end-of-line rules it skips, then its skipped LEF58_SPACING … WRONGDIRECTION rules
+    // (LENGTH DRT-333, negative PRL DRT-334), then its skipped LEF58_MINSTEP rules (MAXEDGES above
+    // 1, DRT-335) (`setRoutingLayerProperties`); on a cut layer its skipped
     // LEF58 cut spacing rules (two WITHIN values DRT-359, unchecked LAYER rules DRT-353 / 354, in
     // rule order), then its skipped LEF58_ENCLOSURE
     // rules, then its skipped LEF58_MAXSPACING rules (no CUTCLASS, DRT-350)
@@ -277,6 +278,7 @@ pub fn init_design_io(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<De
     let skipped: Vec<(u16, String)> = t.layers.iter()
         .flat_map(|l| match l.kind {
             LayerKind::Routing => crate::tech::read::lef58_eol_skip_warnings(db, &l.name).into_iter()
+                .chain(crate::tech::read::lef58_wrong_dir_spacing_skip_warnings(db, &l.name))
                 .chain(crate::tech::read::lef58_min_step_skip_warnings(db, &l.name))
                 .collect::<Vec<_>>(),
             LayerKind::Cut => crate::tech::read::lef58_cut_spacing_skip_warnings(db, &l.name, &l.cut_classes).into_iter()
