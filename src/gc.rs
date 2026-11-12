@@ -79,8 +79,9 @@ pub enum Rule {
     SpacingTableTw,
     /// Closer than the cut layer's spacing.
     CutSpacing,
-    /// A line end closer than its end-of-line spacing to a facing edge.
-    EolSpacing,
+    /// A line end closer than its end-of-line spacing to a facing edge; the rule's place among
+    /// the layer's end-of-line rules (the reference keeps a marker once per constraint).
+    EolSpacing(u16),
     /// Left by the connectivity check between iterations where it removed or changed a net's
     /// shape: the next iteration re-checks the worker it falls in (it is not itself a violation).
     Recheck,
@@ -104,8 +105,10 @@ pub enum Rule {
     /// Other metal inside a LEF58 end-of-line keep-out box (`checkMetalEOLkeepout_main`).
     Lef58EolKeepOut,
     /// A line end closer than a LEF58 end-of-line spacing rule allows (`checkMetalEndOfLine_eol`
-    /// with an `frLef58SpacingEndOfLineConstraint`).
-    Lef58SpacingEndOfLine,
+    /// with an `frLef58SpacingEndOfLineConstraint`); the rule's place among the layer's kept LEF58
+    /// end-of-line rules (the reference keeps a marker once per constraint: three rules firing on
+    /// one line end are three markers, each costing the router).
+    Lef58SpacingEndOfLine(u16),
     /// A convex corner closer to another owner's corner than a LEF58 corner spacing rule allows
     /// (`checkMetalCornerSpacing`).
     CornerSpacing,
@@ -174,7 +177,8 @@ pub struct Marker {
 
 /// The markers' final order: each run of consecutive markers alike in layer, rule, x extent and
 /// owners is stably sorted by bottom (ascending), then top (descending), then area (descending).
-/// (⚠️ A rule is its kind here: two end-of-line rules on one layer would share a run.)
+/// (A rule carries its constraint's place where a layer can hold several, as the reference's run
+/// compares constraint ids.)
 pub fn normalize_marker_order(markers: &mut [Marker]) {
     let same_run = |a: &Marker, b: &Marker| a.layer == b.layer && a.rule == b.rule && a.bbox.xl == b.bbox.xl && a.bbox.xh == b.bbox.xh && a.owners == b.owners;
     let area = |r: &Rect| i64::from(r.xh - r.xl) * i64::from(r.yh - r.yl);
@@ -1746,11 +1750,11 @@ impl<'a> Worker<'a> {
                     }
                     // checkMetalEndOfLine_main: the EOL rules, the LEF58 EOL spacing rules, then the
                     // keep-out rules, per edge.
-                    for r in &rules {
-                        self.check_eol(layer, k, r, Rule::EolSpacing);
+                    for (i, r) in rules.iter().enumerate() {
+                        self.check_eol(layer, k, r, Rule::EolSpacing(u16::try_from(i).unwrap_or(u16::MAX)));
                     }
-                    for r in &lef58 {
-                        self.check_eol(layer, k, r, Rule::Lef58SpacingEndOfLine);
+                    for (i, r) in lef58.iter().enumerate() {
+                        self.check_eol(layer, k, r, Rule::Lef58SpacingEndOfLine(u16::try_from(i).unwrap_or(u16::MAX)));
                     }
                     for ko in &keepouts {
                         self.check_eol_keepout(layer, k, ko);
@@ -2029,7 +2033,7 @@ impl<'a> Worker<'a> {
         if !has_route {
             return;
         }
-        if rule == Rule::Lef58SpacingEndOfLine && !self.eol_end_to_end(layer, (k, i), r) {
+        if matches!(rule, Rule::Lef58SpacingEndOfLine(_)) && !self.eol_end_to_end(layer, (k, i), r) {
             return;
         }
         self.eol_has_eol_helper(layer, &e, &ptr, rule);
@@ -4684,7 +4688,7 @@ mod eol_tests {
             w.add(&net("b"), 4, Rect::new(1150, -500, 1500, 640), false);
             w.init();
             w.target = target.map(net);
-            w.run().iter().filter(|m| m.rule == Rule::EolSpacing).map(|m| (m.victim.clone(), m.aggressor.clone())).collect::<Vec<_>>()
+            w.run().iter().filter(|m| matches!(m.rule, Rule::EolSpacing(_))).map(|m| (m.victim.clone(), m.aggressor.clone())).collect::<Vec<_>>()
         };
         let want = vec![(Some((net("a"), 4, Rect::new(1000, 0, 1000, 140), false)), Some((net("b"), 4, Rect::new(1150, -500, 1150, 640), false)))];
         assert_eq!(run(None), want);
@@ -4701,7 +4705,7 @@ mod eol_tests {
             w.add(&net("a"), 4, Rect::new(0, 0, 1000, 140), false);
             w.add(&b, 4, Rect::new(1150, -500, 1500, 640), true);
             w.init();
-            w.run().iter().filter(|m| m.rule == Rule::EolSpacing).count()
+            w.run().iter().filter(|m| matches!(m.rule, Rule::EolSpacing(_))).count()
         };
         assert_eq!(count(Owner::Inst("u".into())), 1);
         assert_eq!(count(Owner::InstBlockage("u".into(), 0, -1, 100)), 0);
@@ -4716,7 +4720,7 @@ mod eol_tests {
             w.add(&net(o), 4, *r, *f);
         }
         w.init();
-        w.run().iter().filter(|m| m.rule == Rule::EolSpacing).map(|m| m.bbox).collect()
+        w.run().iter().filter(|m| matches!(m.rule, Rule::EolSpacing(_))).map(|m| m.bbox).collect()
     }
 
     /// A layer-4 technology with one LEF58 end-of-line keep-out rule.
@@ -4767,9 +4771,29 @@ mod eol_tests {
             w.add(&net(o), 4, *r, *f);
         }
         w.init();
-        let mut v: Vec<Rect> = w.run().iter().filter(|m| m.rule == Rule::Lef58SpacingEndOfLine).map(|m| m.bbox).collect();
+        let mut v: Vec<Rect> = w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58SpacingEndOfLine(_))).map(|m| m.bbox).collect();
         v.dedup();
         v
+    }
+
+    // Rule (`FlexGCWorker::Impl::addMarker`): a marker is kept once per (box, layer, CONSTRAINT,
+    // sources), and `checkMetalEndOfLine_main` checks every LEF58 end-of-line rule of the layer on
+    // each edge, with no early exit: two rules that both fire on one line end are TWO markers (each
+    // costs the router), and one rule found twice is one. The constraint is the rule's place in the
+    // layer's list, as for the other per-constraint rules.
+    #[test]
+    fn two_end_of_line_rules_firing_on_one_line_end_are_two_markers() {
+        let markers = |rules: Vec<EolRule>| {
+            let mut t = tests::tech();
+            t.layers[4].lef58_eol = rules;
+            let mut w = Worker::new(&t);
+            w.add(&net("a"), 4, WIRE, false);
+            w.add(&net("b"), 4, BLOCK, true);
+            w.init();
+            w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58SpacingEndOfLine(_))).map(|m| (m.rule, m.bbox)).collect::<Vec<_>>()
+        };
+        assert_eq!(markers(vec![rule()]), [(Rule::Lef58SpacingEndOfLine(0), GAP)]);
+        assert_eq!(markers(vec![rule(), rule()]), [(Rule::Lef58SpacingEndOfLine(0), GAP), (Rule::Lef58SpacingEndOfLine(1), GAP)]);
     }
 
     // Rule (LEF/DEF reference, LEF58_SPACING ENDOFLINE ... OPPOSITEWIDTH ow): the rule applies only
@@ -4938,7 +4962,7 @@ mod eol_tests {
         let t = tech_with(rule());
         let target = vec![(net("b"), 4, Rect::new(-500, 640, 500, 900))];
         let m = crate::pa::verdict::planar_markers(&t, &target, &net("a"), (0, 0), 4, (0, 420));
-        assert!(m.iter().any(|m| m.rule == Rule::EolSpacing), "{m:?}");
+        assert!(m.iter().any(|m| matches!(m.rule, Rule::EolSpacing(_))), "{m:?}");
     }
 
     fn parallel(two_edges: bool) -> EolRule {
