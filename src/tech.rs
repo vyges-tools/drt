@@ -1226,9 +1226,25 @@ pub mod read {
                 Ok(Lef58CutRule::Skipped(c)) if c == ADJ_TWO_WITHIN => Some((359, format!("Unsupported branch WITHIN with two values in LEF58_SPACING ADJACENTCUTS for layer {layer}, skipping rule."))),
                 Ok(Lef58CutRule::Skipped(c)) if c == LAYER_NO_CLASS || c == LAYER_NO_CLASS_SAME_NET => Some((353, format!("Unsupported LEF58_SPACING LAYER rule without CUTCLASS for layer {layer}, skipping rule."))),
                 Ok(Lef58CutRule::Skipped(c)) if c == LAYER_NO_CORNER || c == LAYER_NO_CORNER_SAME_NET => Some((354, format!("Unsupported LEF58_SPACING LAYER CUTCLASS rule without CONCAVECORNER or NONEOLCONVEXCORNER for layer {layer}, skipping rule."))),
+                Ok(Lef58CutRule::Skipped(c)) => adjacent_cuts_skip_code(c)
+                    .map(|(id, branch)| (id, format!("Unsupported branch {branch} in LEF58_SPACING ADJACENTCUTS for layer {layer}, skipping rule."))),
                 _ => None,
             })
             .collect()
+    }
+
+    /// io's code and branch name for an ADJACENTCUTS clause it skips ([`adjacent_cuts_rule`]):
+    /// EXACTALIGNED DRT-45, EXCEPTSAMEPGNET DRT-46, CUTCLASS … TO ALL DRT-48 (named "TO ALL"),
+    /// SIDEPARALLELOVERLAP DRT-51, SAMEMASK DRT-52. None for any other clause.
+    pub fn adjacent_cuts_skip_code(clause: &str) -> Option<(u16, &'static str)> {
+        match clause {
+            "ADJACENTCUTS EXACTALIGNED" => Some((45, "EXACTALIGNED")),
+            "ADJACENTCUTS EXCEPTSAMEPGNET" => Some((46, "EXCEPTSAMEPGNET")),
+            "ADJACENTCUTS CUTCLASS TO ALL" => Some((48, "TO ALL")),
+            "ADJACENTCUTS SIDEPARALLELOVERLAP" => Some((51, "SIDEPARALLELOVERLAP")),
+            "ADJACENTCUTS SAMEMASK" => Some((52, "SAMEMASK")),
+            _ => None,
+        }
     }
 
     /// io's ADJACENTCUTS branch for LEF58 cut spacing rule `k` of cut layer `layer`: EXACTALIGNED,
@@ -1304,7 +1320,24 @@ pub mod read {
     /// Whether the reference's io DROPS LEF58 end-of-line rule `k` of `layer` with a warning
     /// (EXCEPTEXACTWIDTH, FILLCONCAVECORNER, EQUALRECTWIDTH). It tests these before any other clause.
     pub fn lef58_eol_dropped_by_reference(db: &Db, layer: &str, k: usize) -> bool {
-        db.spacingeolrule_is_except_exact_width_valid(layer, k) || db.spacingeolrule_is_fill_concave_corner_valid(layer, k) || db.spacingeolrule_is_equal_rect_width_valid(layer, k)
+        lef58_eol_reference_drop_warning(db, layer, k).is_some()
+    }
+
+    /// io's warning for LEF58 end-of-line rule `k` of `layer` when it DROPS the rule
+    /// (`setRoutingLayerProperties`, the first test of its end-of-line loop): EXCEPTEXACTWIDTH
+    /// DRT-400, FILLCONCAVECORNER DRT-401, EQUALRECTWIDTH DRT-403, tested in that order, the first
+    /// that holds warns and skips the rule.
+    pub fn lef58_eol_reference_drop_warning(db: &Db, layer: &str, k: usize) -> Option<(u16, String)> {
+        let clause = if db.spacingeolrule_is_except_exact_width_valid(layer, k) {
+            (400, "EXCEPTEXACTWIDTH")
+        } else if db.spacingeolrule_is_fill_concave_corner_valid(layer, k) {
+            (401, "FILLCONCAVECORNER")
+        } else if db.spacingeolrule_is_equal_rect_width_valid(layer, k) {
+            (403, "EQUALRECTWIDTH")
+        } else {
+            return None;
+        };
+        Some((clause.0, format!("Unsupported LEF58_SPACING rule with option {} for layer {layer}.", clause.1)))
     }
 
     /// The clause that makes this engine skip LEF58 end-of-line rule `k` of `layer` with a
@@ -1334,15 +1367,20 @@ pub mod read {
         }
     }
 
-    /// The patched reference's io warnings (upstream-fix 0010) for the LEF58 end-of-line rules of
-    /// routing layer `layer` that it skips ([`lef58_eol_skipped_clause`]), in the rules' order:
-    /// DRT-357 for TOCONCAVECORNER, DRT-358 for TONOTCHLENGTH. ⛔ Divergence D10 (upstream OpenROAD
-    /// issue #12174): the unpatched reference says nothing and checks the rule as WITHIN 0.
+    /// The patched reference's io warnings for the LEF58 end-of-line rules of routing layer
+    /// `layer` that it drops or skips, one per rule, in the rules' order: the reference's own drop
+    /// ([`lef58_eol_reference_drop_warning`]: DRT-400 / 401 / 403) first, then upstream-fix 0010's
+    /// skips ([`lef58_eol_skipped_clause`]): DRT-357 for TOCONCAVECORNER, DRT-358 for
+    /// TONOTCHLENGTH. ⛔ Divergence D10 (upstream OpenROAD issue #12174): the unpatched reference
+    /// says nothing for those two and checks the rule as WITHIN 0.
     pub fn lef58_eol_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
         (0..db.num_layer_get_tech_layer_spacing_eol_rules(layer))
-            .filter_map(|k| match lef58_eol_skipped_clause(db, layer, k)? {
-                "TOCONCAVECORNER" => Some((357, format!("Unsupported LEF58_SPACING rule with option TOCONCAVECORNER for layer {layer}."))),
-                _ => Some((358, format!("Unsupported LEF58_SPACING rule with option TONOTCHLENGTH for layer {layer}."))),
+            .filter_map(|k| match lef58_eol_reference_drop_warning(db, layer, k) {
+                Some(w) => Some(w),
+                None => match lef58_eol_skipped_clause(db, layer, k)? {
+                    "TOCONCAVECORNER" => Some((357, format!("Unsupported LEF58_SPACING rule with option TOCONCAVECORNER for layer {layer}."))),
+                    _ => Some((358, format!("Unsupported LEF58_SPACING rule with option TONOTCHLENGTH for layer {layer}."))),
+                },
             })
             .collect()
     }
@@ -1677,6 +1715,24 @@ pub mod read {
         }
     }
 
+    /// io's warnings for the LEF58_MINIMUMCUT rules of routing layer `layer` it skips
+    /// ([`lef58_min_cut_skipped_clause`]), in the rules' order: AREA DRT-317, SAMEMETALOVERLAP
+    /// DRT-318, FULLYENCLOSED DRT-319 (`addRoutingLayer`, after `setRoutingLayerProperties` and the
+    /// v5.4/v5.5 rules).
+    pub fn lef58_min_cut_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_min_cut_rules(layer))
+            .filter_map(|k| {
+                let clause = lef58_min_cut_skipped_clause(db, layer, k)?;
+                let id = match clause {
+                    "AREA" => 317,
+                    "SAMEMETALOVERLAP" => 318,
+                    _ => 319,
+                };
+                Some((id, format!("LEF58_MINIMUMCUT {clause} is not supported. Skipping for layer {layer}")))
+            })
+            .collect()
+    }
+
     /// A cut layer's SPACINGTABLE ORTHOGONAL as io reads it (`getOrthSpacingTable`): its
     /// (WITHIN, SPACING) rows in the database's order, none without a table.
     pub fn orth_spacing_table(db: &Db, layer: &str) -> Vec<(i32, i32)> {
@@ -1886,6 +1942,26 @@ pub mod read {
         } else {
             None
         }
+    }
+
+    /// io's warnings for the LEF58_AREA rules of routing layer `layer` it skips
+    /// ([`lef58_area_skipped_clause`]), in the rules' order: EXCEPTMINWIDTH DRT-311,
+    /// EXCEPTEDGELENGTH 312, EXCEPTMINSIZE 313, EXCEPTSTEP 314, MASK 315, LAYER 316.
+    pub fn lef58_area_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
+        (0..db.num_layer_get_tech_layer_area_rules(layer))
+            .filter_map(|k| {
+                let clause = lef58_area_skipped_clause(db, layer, k)?;
+                let id = match clause {
+                    "EXCEPTMINWIDTH" => 311,
+                    "EXCEPTEDGELENGTH" => 312,
+                    "EXCEPTMINSIZE" => 313,
+                    "EXCEPTSTEP" => 314,
+                    "MASK" => 315,
+                    _ => 316,
+                };
+                Some((id, format!("Unsupported branch {clause} in PROPERTY LEF58_AREA for layer {layer}, skipping rule.")))
+            })
+            .collect()
     }
 
     /// io's LEF58_AREA loop for a routing layer: each rule not skipped

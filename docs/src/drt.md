@@ -221,7 +221,20 @@ plain end-of-line rule with `WITHIN 0` (upstream OpenROAD issue #12174); this ro
 fixed reading instead, by decision. Skipped the same way: a `LEF58_MINIMUMCUT`
 rule the reference routes without, one with `AREA`, `SAMEMETALOVERLAP` or `FULLYENCLOSED` (the
 reference warns and skips it), and a LEF58 wrong-direction spacing rule with `LENGTH` or a negative
-`PRL` (DRT-333, DRT-334, as the reference warns and skips it). Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
+`PRL` (DRT-333, DRT-334, as the reference warns and skips it).
+
+Every rule the reference itself skips at tech load is skipped here too, and the log carries the
+reference's own coded warning for it, line for line and in the reference's order (layer by layer;
+on a routing layer the end-of-line rules, then wrong-direction spacing, minimum step, `LEF58_AREA`
+and `LEF58_MINIMUMCUT`): DRT-400, DRT-401 and DRT-403 for an end-of-line rule with
+`EXCEPTEXACTWIDTH`, `FILLCONCAVECORNER` or `EQUALRECTWIDTH`; DRT-311 to DRT-316 for a `LEF58_AREA`
+rule with `EXCEPTMINWIDTH`, `EXCEPTEDGELENGTH`, `EXCEPTMINSIZE`, `EXCEPTSTEP`, `MASK` or `LAYER`;
+DRT-317 to DRT-319 for a `LEF58_MINIMUMCUT` rule with `AREA`, `SAMEMETALOVERLAP` or
+`FULLYENCLOSED`; DRT-45, DRT-46, DRT-48, DRT-51 and DRT-52 for an `ADJACENTCUTS` rule with
+`EXACTALIGNED`, `EXCEPTSAMEPGNET`, `TO ALL`, `SIDEPARALLELOVERLAP` or `SAMEMASK`. A rule with two of
+these clauses gets one line, for the first the reference tests.
+
+Skipped the same way: a LEF58 cut spacing `LAYER` rule with no cut class
 (`SPACING s [CENTERTOCENTER] [SAMENET] LAYER l`), or with a cut class but neither `CONCAVECORNER`
 nor `NONEOLCONVEXCORNER` (`SPACING s … LAYER l CUTCLASS c`), with the warning the reference's own
 fix prints (DRT-353 with no class, DRT-354 with neither corner). The unpatched reference keeps

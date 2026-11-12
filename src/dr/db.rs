@@ -829,6 +829,79 @@ mod skipped_rule_tests {
         assert!(crate::tech::read::lef58_eol_skip_warnings(&d, "M2").is_empty());
     }
 
+    /// Rule (io `setRoutingLayerProperties`, pin 4155ac31): the end-of-line loop tests
+    /// EXCEPTEXACTWIDTH (DRT-400), FILLCONCAVECORNER (DRT-401), EQUALRECTWIDTH (DRT-403) first,
+    /// in that order; the first that holds warns once and drops the rule, so a rule with two of
+    /// them warns only the first. The 0010 skips (357 / 358) come in the same per-rule order.
+    /// Witnessed by reading-skip-log-witness (cases e400 … e400f, order).
+    #[test]
+    fn the_end_of_line_rules_the_reference_drops_are_warned_per_rule_in_its_order() {
+        let rules = format!(
+            "{}{}{}{}{}",
+            eol("SPACING 0.05 ENDOFLINE 0.05 WITHIN 0.01 EQUALRECTWIDTH ;"),
+            eol("SPACING 0.09 ENDOFLINE 0.07 TONOTCHLENGTH 0.1 ;"),
+            eol("SPACING 0.05 ENDOFLINE 0.05 WITHIN 0.01 EXCEPTEXACTWIDTH 0.04 0.06 FILLCONCAVECORNER 0.02 ;"),
+            eol("SPACING 0.05 ENDOFLINE 0.05 WITHIN 0.01 FILLCONCAVECORNER 0.02 ;"),
+            eol("SPACING 0.05 ENDOFLINE 0.05 WITHIN 0.01 ;")
+        );
+        let d = db("w400", &rules, "");
+        let w = |id: u16, o: &str| (id, format!("Unsupported LEF58_SPACING rule with option {o} for layer M1."));
+        assert_eq!(
+            crate::tech::read::lef58_eol_skip_warnings(&d, "M1"),
+            [w(403, "EQUALRECTWIDTH"), w(358, "TONOTCHLENGTH"), w(400, "EXCEPTEXACTWIDTH"), w(401, "FILLCONCAVECORNER")]
+        );
+    }
+
+    /// Rule (io `setRoutingLayerProperties`, its LEF58_AREA loop): per rule, in the layer's order,
+    /// EXCEPTMINWIDTH DRT-311, EXCEPTEDGELENGTH (one value or two) 312, EXCEPTMINSIZE 313,
+    /// EXCEPTSTEP 314, MASK 315, LAYER 316 — "Unsupported branch X in PROPERTY LEF58_AREA for layer
+    /// L, skipping rule."; a plain AREA warns nothing. Witnessed by reading-skip-log-witness
+    /// (a311 … a316, a2).
+    #[test]
+    fn the_skipped_lef58_area_rules_are_warned_as_the_reference_warns() {
+        let d = db("w311", "  PROPERTY LEF58_AREA \"AREA 0.02 MASK 2 ; AREA 0.02 ; AREA 0.02 EXCEPTSTEP 0.05 0.1 ; AREA 0.02 EXCEPTEDGELENGTH 0.05 0.1 ;\" ;\n", "");
+        let w = |id: u16, b: &str| (id, format!("Unsupported branch {b} in PROPERTY LEF58_AREA for layer M1, skipping rule."));
+        assert_eq!(crate::tech::read::lef58_area_skip_warnings(&d, "M1"), [w(315, "MASK"), w(314, "EXCEPTSTEP"), w(312, "EXCEPTEDGELENGTH")]);
+        assert!(crate::tech::read::lef58_area_skip_warnings(&d, "M2").is_empty());
+    }
+
+    /// Rule (io `addRoutingLayer`, its LEF58_MINIMUMCUT loop, after `setRoutingLayerProperties`):
+    /// per rule, AREA DRT-317, SAMEMETALOVERLAP 318, FULLYENCLOSED 319 — "LEF58_MINIMUMCUT X is not
+    /// supported. Skipping for layer L" (no full stop); a plain rule warns nothing. Witnessed by
+    /// reading-skip-log-witness (m317 … m319, order).
+    #[test]
+    fn the_skipped_lef58_minimum_cut_rules_are_warned_as_the_reference_warns() {
+        let d = db("w317", "  PROPERTY LEF58_MINIMUMCUT \"MINIMUMCUT 2 WIDTH 0.1 FULLYENCLOSED ; MINIMUMCUT 2 WIDTH 0.1 ; MINIMUMCUT 2 WIDTH 0.1 AREA 0.01 ;\" ;\n", "");
+        let w = |id: u16, c: &str| (id, format!("LEF58_MINIMUMCUT {c} is not supported. Skipping for layer M1"));
+        assert_eq!(crate::tech::read::lef58_min_cut_skip_warnings(&d, "M1"), [w(319, "FULLYENCLOSED"), w(317, "AREA")]);
+    }
+
+    /// Rule (io `setCutLayerProperties`, ADJACENTCUTS branch): EXACTALIGNED DRT-45,
+    /// EXCEPTSAMEPGNET 46, CUTCLASS … TO ALL 48 (named "TO ALL"), SIDEPARALLELOVERLAP 51, SAMEMASK
+    /// 52, tested in that order, the first that holds warns "Unsupported branch X in LEF58_SPACING
+    /// ADJACENTCUTS for layer L, skipping rule." once per rule. Witnessed by
+    /// reading-skip-log-witness (c45 … c52, c4552, c5246).
+    #[test]
+    fn the_skipped_adjacent_cuts_rules_are_warned_as_the_reference_warns() {
+        let p = |r: &str| format!("  PROPERTY LEF58_SPACING \"SPACING 0.10 ADJACENTCUTS 2 {r} ;\" ;\n");
+        let v1 = [
+            p("WITHIN 0.12 CUTCLASS CA SAMEMASK"),
+            p("EXACTALIGNED 1 WITHIN 0.12 CUTCLASS CA SAMEMASK"),
+            p("WITHIN 0.12 EXCEPTSAMEPGNET CUTCLASS CA"),
+            p("WITHIN 0.12 CUTCLASS CA TO ALL"),
+            p("WITHIN 0.12 CUTCLASS CA SIDEPARALLELOVERLAP"),
+            p("WITHIN 0.12 CUTCLASS CA"),
+        ]
+        .concat();
+        let d = db("w45", "", &v1);
+        let classes = [crate::tech::CutClass { name: "CA".into(), width: 40, length: 40 }];
+        let w = |id: u16, b: &str| (id, format!("Unsupported branch {b} in LEF58_SPACING ADJACENTCUTS for layer V1, skipping rule."));
+        assert_eq!(
+            crate::tech::read::lef58_cut_spacing_skip_warnings(&d, "V1", &classes),
+            [w(52, "SAMEMASK"), w(45, "EXACTALIGNED"), w(46, "EXCEPTSAMEPGNET"), w(48, "TO ALL"), w(51, "SIDEPARALLELOVERLAP")]
+        );
+    }
+
     #[test]
     fn a_to_notch_length_rule_is_skipped_too() {
         let d = db("tnl", &eol("SPACING 0.09 ENDOFLINE 0.07 TONOTCHLENGTH 0.1 ;"), "");
