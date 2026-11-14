@@ -2899,8 +2899,7 @@ impl<'a> Worker<'a> {
     /// in order, every result in the tree's order (one cut may come back from several). A third
     /// cut, not all three fixed, whose interior meets a query rectangle marks: the box between
     /// the gap and the third cut, aggressor the third cut, victims the pair, sources all three.
-    /// Upstream rule: each victim's box takes its RIGHT edge for its top (`ury = gtl::xh(...)`),
-    /// an odb box then normalised; copied as written.
+    /// Each victim's box is its cut: divergence D5, below.
     fn cut_spacing_table_orthogonal_helper(&mut self, layer: usize, k1: usize, k2: usize, spacing: i32) {
         let (s1, s2) = (self.shapes[layer][k1], self.shapes[layer][k2]);
         let (r1, r2) = (s1.rect, s2.rect);
@@ -2934,9 +2933,9 @@ impl<'a> Worker<'a> {
             owners.dedup();
             if self.seen.insert((bbox, layer, Rule::SpacingTableOrth, owners.clone())) {
                 // ⛔ Divergence D5 (register; OpenROAD issue #12198): each victim box is its cut,
-                // as the reference patched with vyges-openroad-patches upstream-fix 0011 records
-                // it; the unpatched reference takes the top from the cut's RIGHT edge
-                // (`ury = gtl::xh`, a typo).
+                // as upstream's fix (5d045c6ce, after our pin; vyges-openroad-patches
+                // upstream-fix 0011 backports it) records it; the reference at our pin takes the
+                // top from the cut's RIGHT edge (`ury = gtl::xh`, a typo).
                 let side = |s: &Shape| (self.owner(s.net).clone(), layer, s.rect, s.fixed);
                 let (victim, second_victim) = (side(&s1), side(&s2));
                 let aggressor = (self.owner(s3.net).clone(), layer, s3.rect, s3.fixed);
@@ -3202,9 +3201,9 @@ impl<'a> Worker<'a> {
 
     /// `checkLef58Enclosure_main(via, enc)`: the cut's overhangs inside the metal (end along the
     /// cut's longer side), against the rules of the widest WIDTH not above the metal's width, in
-    /// order; none satisfied gives a marker on the metal's layer, the cut's box. ⚠️ The source's
-    /// sides record their boxes with the top at the RIGHT edge (`ury = xh`), kept. A cut with no
-    /// enclosing metal, or no rule for the width, is skipped (the source reads a null there).
+    /// order; none satisfied gives a marker on the metal's layer, the cut's box, the cut its
+    /// victim and the metal its aggressor. A cut with no enclosing metal, or no rule for the
+    /// width, is skipped (the source reads a null there).
     fn lef58_enclosure_main(&mut self, layer: usize, v: &Shape, el: usize, e: &Shape, rules: &[crate::tech::CutEnclosure]) {
         let (vr, er) = (v.rect, e.rect);
         let mut side = (er.xh - vr.xh).min(vr.xl - er.xl);
@@ -3219,8 +3218,12 @@ impl<'a> Worker<'a> {
         }
         let owners = vec![self.owner(v.net).clone()];
         if self.seen.insert((vr, el, Rule::Lef58Enclosure, owners.clone())) {
-            let victim = (self.owner(v.net).clone(), layer, Rect::new(vr.xl, vr.yl, vr.xh, vr.xh), v.fixed);
-            let aggressor = (self.owner(e.net).clone(), el, Rect::new(er.xl, er.yl, er.xh, er.xh), e.fixed);
+            // ⛔ Divergence D5 (register; OpenROAD issue #12198): the victim box is the cut and
+            // the aggressor box the metal, as upstream's fix (5d045c6ce, after our pin;
+            // vyges-openroad-patches upstream-fix 0011 backports it) records them; the reference
+            // at our pin takes each top from the RIGHT edge (`ury = gtl::xh`, a typo).
+            let victim = (self.owner(v.net).clone(), layer, vr, v.fixed);
+            let aggressor = (self.owner(e.net).clone(), el, er, e.fixed);
             self.markers.push(Marker { rule: Rule::Lef58Enclosure, layer: el, bbox: vr, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
         }
     }
@@ -3317,12 +3320,15 @@ impl<'a> Worker<'a> {
             viol = self.cut_table_helper(l2, (&r1, &r2), (c1, c2), if right { EdgeDir::E } else { EdgeDir::W }, (dist2, c2c2), (prl_valid, prl), t, inter);
         }
         if viol {
-            // ⚠️ The reference records each side's rectangle with its x-high as its y-high too.
-            let side = |r: &Rect| Rect::new(r.xl, r.yl, r.xh, r.xh);
+            // ⛔ Divergence D5 (register; OpenROAD issue #12198): the victim box is the first cut
+            // and the aggressor box the second, on one layer and on two, as upstream's fix
+            // (5d045c6ce, after our pin; vyges-openroad-patches upstream-fix 0011 backports it)
+            // records them; the reference at our pin takes each top from the RIGHT edge
+            // (`ury = gtl::xh`, a typo).
             if inter {
-                self.add_marker_two_layers(Rule::Lef58CutSpacingTableInter, marker, (v1.net, l1, side(&r1), v1.fixed), (v2.net, l2, side(&r2), v2.fixed));
+                self.add_marker_two_layers(Rule::Lef58CutSpacingTableInter, marker, (v1.net, l1, r1, v1.fixed), (v2.net, l2, r2, v2.fixed));
             } else {
-                self.add_marker_of(Rule::Lef58CutSpacingTable, l1, marker, (v1.net, side(&r1), v1.fixed), (v2.net, side(&r2), v2.fixed));
+                self.add_marker_of(Rule::Lef58CutSpacingTable, l1, marker, (v1.net, r1, v1.fixed), (v2.net, r2, v2.fixed));
             }
         }
     }
@@ -4201,6 +4207,31 @@ mod cut_table_tests {
         assert!(!same_net_table_skips(false, false, true));
     }
 
+    /// ⛔ Divergence D5 (register; OpenROAD issue #12198). Upstream rule
+    /// (`checkLef58CutSpacingTbl_main`, the marker's victim and aggressor): the first cut and the
+    /// second, each box at our pin taking its RIGHT edge for its top — `ury = gtl::xh(...)`, a
+    /// typo — then normalised (here a (0,0)-(18,24) would be recorded as (0,0)-(18,18), b
+    /// (38,0)-(56,24) as (38,0)-(56,56)). Our rule, upstream's fix 5d045c6ce (after our pin;
+    /// vyges-openroad-patches upstream-fix 0011 backports it): each box is its cut. Probe of the
+    /// pin and of the patched reference: marker-box-yh-witness.
+    #[test]
+    fn the_victim_and_aggressor_boxes_are_the_cuts() {
+        let (a, b) = (Rect::new(0, 0, 18, 24), Rect::new(38, 0, 56, 24));
+        let mut t = tests::tech();
+        t.layers[3].cut_spacing = None;
+        t.layers[3].cut_table = Some(table(0));
+        let mut w = Worker::new(&t);
+        w.add(&Owner::Net("a".into()), 3, a, false);
+        w.add(&Owner::Net("b".into()), 3, b, false);
+        w.init();
+        let m: Vec<Marker> = w.run().iter().filter(|m| m.rule == Rule::Lef58CutSpacingTable).cloned().collect();
+        assert_eq!(m.len(), 1, "{m:?}");
+        let (v, g) = (m[0].victim.as_ref().expect("victim"), m[0].aggressor.as_ref().expect("aggressor"));
+        let mut sides = vec![(v.1, v.2), (g.1, g.2)];
+        sides.sort();
+        assert_eq!(sides, vec![(3, a), (3, b)]);
+    }
+
     // Rule (`getCutClassIdx`): the LAST class of exactly the cut's size — width the shorter side.
     #[test]
     fn a_cut_takes_the_last_class_of_its_size() {
@@ -4268,6 +4299,28 @@ mod inter_cut_table_tests {
     #[test]
     fn one_net_is_not_judged() {
         assert!(markers(&tech(false), ("a", Rect::new(85, 0, 125, 40)), None, None).is_empty());
+    }
+
+    /// ⛔ Divergence D5 (register; OpenROAD issue #12198). Upstream rule
+    /// (`checkLef58CutSpacingTbl_main`, LAYER branch): the victim is the cut on the table's layer
+    /// and the aggressor the second layer's, each box at our pin taking its RIGHT edge for its top
+    /// — `ury = gtl::xh(...)`, a typo — then normalised (here a (0,100)-(40,140) on c5 would be
+    /// recorded as (0,40)-(40,100), b (85,100)-(125,140) on c3 as (85,100)-(125,125)). Our rule,
+    /// upstream's fix 5d045c6ce (after our pin; vyges-openroad-patches upstream-fix 0011 backports
+    /// it): each box is its cut. Probe of the pin and of the patched reference:
+    /// marker-box-yh-witness.
+    #[test]
+    fn the_victim_and_aggressor_boxes_are_the_cuts_on_their_layers() {
+        let t = tech(false);
+        let (a, b) = (Rect::new(0, 100, 40, 140), Rect::new(85, 100, 125, 140));
+        let mut w = Worker::new(&t);
+        w.add(&Owner::Net("a".into()), 5, a, false);
+        w.add(&Owner::Net("b".into()), 3, b, false);
+        w.init();
+        let m: Vec<Marker> = w.run().iter().filter(|m| m.rule == Rule::Lef58CutSpacingTableInter).cloned().collect();
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].victim.as_ref().map(|v| (v.1, v.2)), Some((5, a)));
+        assert_eq!(m[0].aggressor.as_ref().map(|g| (g.1, g.2)), Some((3, b)));
     }
 
     // Rule (`checkLef58CutSpacingTbl_main`, overlapping cuts of the two layers): without NOSTACK a
@@ -4587,6 +4640,29 @@ mod enclosure_range_tests {
         assert_eq!(run(vec![rule(30, 10, 0, false), rule(50, 50, 70, false)], metal).len(), 1);
         // BELOW-only rules are not checked above.
         assert!(run(vec![CutEnclosure { above_only: false, below_only: true, ..rule(50, 50, 0, false) }], metal).is_empty());
+    }
+
+    /// ⛔ Divergence D5 (register; OpenROAD issue #12198). Upstream rule
+    /// (`checkLef58Enclosure_main(via, enc)`): the marker's victim is the cut and its aggressor the
+    /// enclosing metal, each box at our pin taking its RIGHT edge for its top — `ury =
+    /// gtl::xh(...)`, a typo — then normalised (here the cut (100,200)-(150,250) would be recorded
+    /// as (100,150)-(150,200), the metal (90,170)-(160,280) as (90,160)-(160,170)). Our rule,
+    /// upstream's fix 5d045c6ce (after our pin; vyges-openroad-patches upstream-fix 0011 backports
+    /// it): the boxes are the cut and the metal. Probe of the pin and of the patched reference:
+    /// marker-box-yh-witness.
+    #[test]
+    fn the_victim_and_aggressor_boxes_are_the_cut_and_its_metal() {
+        let (cut, metal) = (Rect::new(100, 200, 150, 250), Rect::new(90, 170, 160, 280));
+        let mut t = tests::tech();
+        t.layers[3].cut_enclosures = vec![CutEnclosure { class: 0, above_only: true, below_only: false, eol: false, endside: false, first: 30, second: 30, min_width: 0 }];
+        let mut w = Worker::new(&t);
+        w.add(&Owner::Net("a".into()), 3, cut, false);
+        w.add(&Owner::Net("a".into()), 4, metal, false);
+        w.init();
+        let m: Vec<Marker> = w.run().iter().filter(|m| m.rule == Rule::Lef58Enclosure).cloned().collect();
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert_eq!(m[0].victim.as_ref().map(|v| (v.1, v.2)), Some((3, cut)));
+        assert_eq!(m[0].aggressor.as_ref().map(|g| (g.1, g.2)), Some((4, metal)));
     }
 
     // Rule (`checkMetalSpacing_prl_getReqSpcVal`): between two owners, a SPACING … RANGE rule

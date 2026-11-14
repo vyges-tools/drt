@@ -174,8 +174,9 @@ orthogonal spacing table of a cut layer (`SPACINGTABLE ORTHOGONAL
 WITHIN w SPACING s …`: per row, a cut within `w` of a pair of cuts that run parallel on one axis,
 and closer than `s` across that run, is marked; the marker names the pair as its victims, each
 box its cut, which the router reads when it picks the nets to rip up; the unpatched reference
-takes each box's top from the cut's right edge, upstream OpenROAD issue #12198, and this router
-follows the fixed reading, by decision). LEF58 max spacing (`LEF58_MAXSPACING max CUTCLASS c`) runs the router's repair pass as the reference
+takes each box's top from the cut's right edge, upstream OpenROAD issue #12198, fixed upstream
+after our pin, and this router follows the fixed reading, by decision, there and in the LEF58 cut
+spacing table and LEF58 enclosure markers' victim and aggressor boxes). LEF58 max spacing (`LEF58_MAXSPACING max CUTCLASS c`) runs the router's repair pass as the reference
 runs it, after an iteration that ends with no marker: its secondary via defs and its search for
 vias of the class with no other cut within `max`; a rule with no `CUTCLASS` is skipped with the
 reference's warning (DRT-350). Then, per such via, its marker, the three-by-three-gcell region
@@ -266,8 +267,10 @@ not reach the routes still match the unpatched reference.
   corner, the reference keeps the rule, never checks it, and a `SAMENET` one makes every other
   LEF58 cut spacing rule of the layer judge one net only (upstream OpenROAD issues #12187 and
   #12188). This router skips it with the fixed reference's warning (DRT-353, DRT-354).
-- **Orthogonal spacing table victims.** The reference builds each victim box with its top taken
-  from the cut's right edge (upstream OpenROAD issue #12198). This router's victims are the cuts.
+- **Marker victim and aggressor boxes.** In the orthogonal spacing table, LEF58 cut spacing table
+  and LEF58 enclosure checks the reference at our pin builds each victim and aggressor box with
+  its top taken from its right edge (upstream OpenROAD issue #12198, fixed upstream after our pin).
+  This router's boxes are the cuts and metal the marker names, as the fix gives them.
 - **Area patch owner.** See below (upstream OpenROAD issue #12191).
 - **Per-cut-class `MINIMUMCUT`.** The reference's database keeps such a rule with a cut count of 0
   and drops it (upstream OpenROAD issue #12176). This router converts it as the fixed reference
