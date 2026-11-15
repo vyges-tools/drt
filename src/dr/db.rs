@@ -742,7 +742,7 @@ mod skipped_rule_tests {
     //! TONOTCHLENGTH is never tested for either branch and is checked as a plain end-of-line rule
     //! with WITHIN 0 (MINADJACENTLENGTH dropped), flagging line ends that face straight edges
     //! (upstream OpenROAD issue #12174). Our rule, the reference patched with
-    //! vyges-openroad-patches upstream-fix 0010: the rule is SKIPPED with a warning (DRT-357 /
+    //! internal patch 0010: the rule is SKIPPED with a warning (DRT-357 /
     //! DRT-358 in the log, an entry in skipped_rules) — not enforced, not emulated, not refused;
     //! the rule as written has no oracle, so it is left to sign-off DRC. Every other refusal stands.
     use super::{skipped_rules, unmodelled_rules};
@@ -806,7 +806,7 @@ mod skipped_rule_tests {
         }
     }
 
-    /// Rule (the reference patched with upstream-fix 0010, io `setRoutingLayerProperties`, after
+    /// Rule (the reference patched with internal patch 0010, io `setRoutingLayerProperties`, after
     /// the DRT-400/401/403 skips): one warning per skipped rule, in the layer's rule order —
     /// DRT-357 for TOCONCAVECORNER, DRT-358 for TONOTCHLENGTH; a plain rule warns nothing. The
     /// unpatched reference warns nothing and checks both as WITHIN 0 (upstream OpenROAD #12174).
@@ -912,7 +912,7 @@ mod skipped_rule_tests {
     }
 
     /// ⛔ DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue #12181,
-    /// vyges-openroad-patches upstream-fix 0001). Upstream rule (io `setRoutingLayerProperties`):
+    /// internal patch 0001). Upstream rule (io `setRoutingLayerProperties`):
     /// MINLENGTH / MAXLENGTH is kept with `isTwoEdgesValid()` (PARALLELEDGE's TWOEDGES) as its
     /// TWOSIDES. Our rule (the patched reference's): TWOSIDES as written (`isTwoSidesValid()`).
     /// The rule is checked, not refused; MINLENGTH wins when the database holds both.
@@ -934,7 +934,7 @@ mod skipped_rule_tests {
     }
 
     /// ⛔ DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue #12182,
-    /// vyges-openroad-patches upstream-fix 0002). Upstream rule (`getEolWithin`): a SAMEMASK
+    /// internal patch 0002). Upstream rule (`getEolWithin`): a SAMEMASK
     /// end-of-line rule's WITHIN reads 0. Our rule (the patched reference's): WITHIN as written.
     /// The rule is checked (mask-blind, as the reference checks it), not refused.
     #[test]
@@ -962,7 +962,7 @@ mod skipped_rule_tests {
     /// Rule (LEF/DEF reference, LEF58_SPACING ENDOFLINE ... OPPOSITEWIDTH ow WITHIN ...): the rule
     /// applies only when the wire beyond the line end spans less than ow. ⛔ DIVERGENCE (register
     /// D13): the reference's io stores ow (`setOppositeWidth`) and nothing reads it; we keep it and
-    /// check it (upstream-fix 0015), so the rule is checked, neither refused nor skipped.
+    /// check it (internal patch 0015), so the rule is checked, neither refused nor skipped.
     #[test]
     fn an_opposite_width_is_modelled() {
         let d = db("ow", &eol("SPACING 0.09 ENDOFLINE 0.07 OPPOSITEWIDTH 0.03 WITHIN 0.025 ;"), "");
@@ -1131,7 +1131,7 @@ mod skipped_rule_tests {
     /// ⛔ Divergence D9 (register; upstream OpenROAD issue #12176). Upstream rule: the database's
     /// LEF reader fills a per-cut-class LEF58 MINIMUMCUT rule's class map but never sets its
     /// per-cut-class flag, so io `convertLef58MinCutConstraints` reads the count 0 and drops the
-    /// rule. Our rule, the reference patched with vyges-openroad-patches upstream-fix 0003 (the
+    /// rule. Our rule, the reference patched with internal patch 0003 (the
     /// flag set): after `initDefaultVias`, per (class, count) in map order (by class name), the
     /// default via of the cut layer below unless FROMABOVE, then the one above unless FROMBELOW;
     /// the first whose cut class matches gives the count; none matching drops the rule; one or
@@ -1187,7 +1187,7 @@ mod skipped_rule_tests {
         let d = db("mc", &m1, "");
         assert_eq!(d.num_layer_get_tech_layer_min_cut_rules("M1"), rules.len());
         // The database marks a per-cut-class rule as one (opendb-lib's LEF reader sets
-        // isPerCutClass, as the reference patched with upstream-fix 0003 does; the unpatched
+        // isPerCutClass, as the reference patched with internal patch 0003 does; the unpatched
         // odb parser never calls setPerCutClass, OpenROAD issue #12176), and keeps its single
         // cut count at 0: the count is per class, read at conversion (D9).
         assert!(d.mincutrule_is_per_cut_class("M1", 1) && d.mincutrule_get_num_cuts("M1", 1) == 0);
@@ -1438,7 +1438,7 @@ mod skipped_rule_tests {
     /// ⛔ Divergence D7 (register; upstream OpenROAD issue #12202). Upstream rule (io
     /// `setCutLayerProperties`, ADJACENTCUTS branch): only the first WITHIN is read, and GC uses
     /// it as the upper bound, so `WITHIN w1 w2` is checked as `WITHIN w1`. Our rule, the reference
-    /// patched with vyges-openroad-patches upstream-fix 0012: after the reference's own skips the
+    /// patched with internal patch 0012: after the reference's own skips the
     /// rule is SKIPPED with DRT-359 — not in the layer's list, not refused, not in the same-net
     /// list even with SAMENET — and a checked rule beside it is unaffected.
     #[test]
@@ -1479,7 +1479,7 @@ mod skipped_rule_tests {
     /// and ORTHOGONALSPACING, io KEEPS a LAYER rule with no CUTCLASS (spacing, CENTERTOCENTER,
     /// SAMENET, the second layer), a SAMENET one in the same-net list; but the check acts only
     /// under `hasCutClass()`, so the rule never marks and nothing warns. Our rule, the reference
-    /// patched with vyges-openroad-patches upstream-fix 0005: SKIPPED with DRT-353, not in the
+    /// patched with internal patch 0005: SKIPPED with DRT-353, not in the
     /// layer's list, and a checked rule beside a plain one is unaffected.
     #[test]
     fn a_layer_rule_without_a_cut_class_is_skipped() {
@@ -1508,7 +1508,7 @@ mod skipped_rule_tests {
     /// `checkLef58CutSpacing_spc_layer`): past the branches io drops, io KEEPS a LAYER rule with a
     /// defined CUTCLASS but neither CONCAVECORNER nor NONEOLCONVEXCORNER (CENTERTOCENTER and
     /// SAMENET kept too, a SAMENET one in the same-net list); past the class test the check has
-    /// only those two branches, so the rule never marks and nothing warns. Our rule (upstream-fix
+    /// only those two branches, so the rule never marks and nothing warns. Our rule (internal patch
     /// 0005): SKIPPED with DRT-354, not in the layer's list.
     #[test]
     fn a_layer_rule_with_a_class_but_neither_corner_is_skipped() {
@@ -1533,7 +1533,7 @@ mod skipped_rule_tests {
         assert_eq!(tech.layers[tech.layer_num("V1").expect("V1")].lef58_cut_spacing.len(), 1);
     }
 
-    /// ⛔ Divergence D6 (#12187, upstream-fix 0005). Upstream rule (GC `checkCutSpacing_main(rect)`):
+    /// ⛔ Divergence D6 (#12187, internal patch 0005). Upstream rule (GC `checkCutSpacing_main(rect)`):
     /// any rule in the layer's LEF58 SAME-NET list sets skipDiffNet, and every different-net LEF58
     /// rule then pairs a cut only with shapes of its own net (OpenROAD issue #12188), so the
     /// unpatched reference's SAMENET LAYER rule with no class silences a checked rule beside it on

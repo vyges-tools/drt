@@ -156,7 +156,7 @@ fn tiny_lef_with(name: &str, layer: &str, extra: &str) -> PathBuf {
 /// run is not refused, the rule is not checked (the access points are the base technology's),
 /// and the report lists it in `skipped_rules`. The unpatched reference checks it as a plain
 /// end-of-line rule with WITHIN 0 (upstream OpenROAD issue #12174); we follow the reference patched
-/// with upstream-fix 0010, which skips it with a warning (divergence by decision, register D10).
+/// with internal patch 0010, which skips it with a warning (divergence by decision, register D10).
 #[test]
 fn a_to_concave_corner_rule_is_skipped_loudly_and_listed_in_the_report() {
     let lef = tiny_lef_with("tcc.lef", "M1", "  PROPERTY LEF58_SPACING \"SPACING 0.09 ENDOFLINE 0.07 TOCONCAVECORNER MINADJACENTLENGTH 0.1 0.12 ;\" ;\n");

@@ -639,7 +639,7 @@ fn is_patch_valid(p: &PatchWire, rb: &Rect) -> bool {
 /// #12191). Upstream rule: that box is `patch->getOffsetBox()`, the box RELATIVE to the patch's
 /// origin, not where the patch is, and it must strictly overlap (`Rect::overlaps`), so a match
 /// needs a shape near the origin of the design; without one the patch is dropped silently. Our
-/// rule, the reference patched with vyges-openroad-patches upstream-fix 0007 v2: the patch's
+/// rule, the reference patched with internal patch 0007 v2: the patch's
 /// absolute box (`getBBox()`), touching included (`intersects`), since a patch abuts the shape
 /// it grows from. A patch still without a worker net is dropped and counted ([`own_area_patches`]).
 fn area_patch_owner(q: &QueueCtx<'_>, nets: &[DrNet], state: &[NetState], p: &crate::gc::AreaPatch) -> Option<usize> {
@@ -659,7 +659,7 @@ fn patch_box(p: &crate::gc::AreaPatch) -> Rect {
     Rect::new(p.offset.xl + o.0, p.offset.yl + o.1, p.offset.xh + o.0, p.offset.yh + o.1)
 }
 
-/// `checkMetalShape_patchOwner_helper` on the patch's absolute box (divergence D4, upstream-fix
+/// `checkMetalShape_patchOwner_helper` on the patch's absolute box (divergence D4, internal patch
 /// 0007 v2): the first candidate worker net, in order, whose pin box, then one of its shapes'
 /// boxes (boundary shapes, then route shapes, in order) meets it (`Rect::intersects`: closed
 /// boxes, so touching counts).
@@ -1365,7 +1365,7 @@ mod tests {
     /// net with several worker nets): the box compared is the patch's OFFSET box (relative to its
     /// origin — the reference's trace shows (-70, -300, 70, 0) for a patch at (87210, 68320)), and
     /// it must strictly overlap, so a worker net is found only when a shape of it reaches the
-    /// design's origin. Our rule, the reference patched with upstream-fix 0007 v2: the patch's
+    /// design's origin. Our rule, the reference patched with internal patch 0007 v2: the patch's
     /// ABSOLUTE box, and touching counts (a patch abuts the shape it grows from). First match in
     /// order; pin box before shapes.
     #[test]

@@ -1922,7 +1922,7 @@ impl<'a> Worker<'a> {
     /// most) that long — both with TWOSIDES, either without. ⛔ TWOSIDES is the rule's own flag
     /// here, a divergence by decision (drt divergence register D8): the reference's io hands it
     /// PARALLELEDGE's TWOEDGES instead (upstream OpenROAD issue #12181); we follow the patched
-    /// reference (vyges-openroad-patches upstream-fix 0001).
+    /// reference (internal patch 0001).
     fn eol_has_min_max_length(&self, layer: usize, k: usize, r: &EolRule) -> bool {
         let Some(m) = r.length else { return true };
         let segs = &self.segs[layer];
@@ -2044,7 +2044,7 @@ impl<'a> Worker<'a> {
     /// side on `ptr`'s line overlapping `ptr` with positive length. The rule applies only when this
     /// is below OPPOSITEWIDTH (LEF definition). ⛔ DIVERGENCE by decision (drt divergence register
     /// D13, upstream OpenROAD issue #12226): the reference stores OPPOSITEWIDTH and never reads it;
-    /// vyges-openroad-patches upstream-fix 0015 adds the same test (`getOppositeWireSpan`).
+    /// internal patch 0015 adds the same test (`getOppositeWireSpan`).
     fn eol_opposite_wire_span(&self, layer: usize, ptr: &Seg) -> i32 {
         let b = seg_box(ptr);
         let horizontal = ptr.from.1 == ptr.to.1;
@@ -2933,8 +2933,8 @@ impl<'a> Worker<'a> {
             owners.dedup();
             if self.seen.insert((bbox, layer, Rule::SpacingTableOrth, owners.clone())) {
                 // ⛔ Divergence D5 (register; OpenROAD issue #12198): each victim box is its cut,
-                // as upstream's fix (5d045c6ce, after our pin; vyges-openroad-patches
-                // upstream-fix 0011 backports it) records it; the reference at our pin takes the
+                // as upstream's fix (5d045c6ce, after our pin; internal
+                // patch 0011 backports it) records it; the reference at our pin takes the
                 // top from the cut's RIGHT edge (`ury = gtl::xh`, a typo).
                 let side = |s: &Shape| (self.owner(s.net).clone(), layer, s.rect, s.fixed);
                 let (victim, second_victim) = (side(&s1), side(&s2));
@@ -3220,7 +3220,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((vr, el, Rule::Lef58Enclosure, owners.clone())) {
             // ⛔ Divergence D5 (register; OpenROAD issue #12198): the victim box is the cut and
             // the aggressor box the metal, as upstream's fix (5d045c6ce, after our pin;
-            // vyges-openroad-patches upstream-fix 0011 backports it) records them; the reference
+            // internal patch 0011 backports it) records them; the reference
             // at our pin takes each top from the RIGHT edge (`ury = gtl::xh`, a typo).
             let victim = (self.owner(v.net).clone(), layer, vr, v.fixed);
             let aggressor = (self.owner(e.net).clone(), el, er, e.fixed);
@@ -3322,7 +3322,7 @@ impl<'a> Worker<'a> {
         if viol {
             // ⛔ Divergence D5 (register; OpenROAD issue #12198): the victim box is the first cut
             // and the aggressor box the second, on one layer and on two, as upstream's fix
-            // (5d045c6ce, after our pin; vyges-openroad-patches upstream-fix 0011 backports it)
+            // (5d045c6ce, after our pin; internal patch 0011 backports it)
             // records them; the reference at our pin takes each top from the RIGHT edge
             // (`ury = gtl::xh`, a typo).
             if inter {
@@ -4212,7 +4212,7 @@ mod cut_table_tests {
     /// second, each box at our pin taking its RIGHT edge for its top — `ury = gtl::xh(...)`, a
     /// typo — then normalised (here a (0,0)-(18,24) would be recorded as (0,0)-(18,18), b
     /// (38,0)-(56,24) as (38,0)-(56,56)). Our rule, upstream's fix 5d045c6ce (after our pin;
-    /// vyges-openroad-patches upstream-fix 0011 backports it): each box is its cut. Probe of the
+    /// internal patch 0011 backports it): each box is its cut. Probe of the
     /// pin and of the patched reference: marker-box-yh-witness.
     #[test]
     fn the_victim_and_aggressor_boxes_are_the_cuts() {
@@ -4306,7 +4306,7 @@ mod inter_cut_table_tests {
     /// and the aggressor the second layer's, each box at our pin taking its RIGHT edge for its top
     /// — `ury = gtl::xh(...)`, a typo — then normalised (here a (0,100)-(40,140) on c5 would be
     /// recorded as (0,40)-(40,100), b (85,100)-(125,140) on c3 as (85,100)-(125,125)). Our rule,
-    /// upstream's fix 5d045c6ce (after our pin; vyges-openroad-patches upstream-fix 0011 backports
+    /// upstream's fix 5d045c6ce (after our pin; internal patch 0011 backports
     /// it): each box is its cut. Probe of the pin and of the patched reference:
     /// marker-box-yh-witness.
     #[test]
@@ -4647,7 +4647,7 @@ mod enclosure_range_tests {
     /// enclosing metal, each box at our pin taking its RIGHT edge for its top — `ury =
     /// gtl::xh(...)`, a typo — then normalised (here the cut (100,200)-(150,250) would be recorded
     /// as (100,150)-(150,200), the metal (90,170)-(160,280) as (90,160)-(160,170)). Our rule,
-    /// upstream's fix 5d045c6ce (after our pin; vyges-openroad-patches upstream-fix 0011 backports
+    /// upstream's fix 5d045c6ce (after our pin; internal patch 0011 backports
     /// it): the boxes are the cut and the metal. Probe of the pin and of the patched reference:
     /// marker-box-yh-witness.
     #[test]
@@ -4876,7 +4876,7 @@ mod eol_tests {
     // if the wire beyond the line end spans LESS than ow perpendicular to the line end. Span: the
     // largest extent, perpendicular to the facing edge, of a maximal rectangle of the facing
     // polygon with a side on the facing edge's line overlapping it. ⛔ DIVERGENCE (register D13):
-    // the reference (pin 4155ac31) never reads OPPOSITEWIDTH; upstream-fix 0015 applies this test.
+    // the reference (pin 4155ac31) never reads OPPOSITEWIDTH; internal patch 0015 adds this test.
     #[test]
     fn an_opposite_width_exempts_a_line_end_facing_a_wire_at_least_that_wide() {
         let ow = |w| EolRule { opposite_width: Some(w), ..rule() };
@@ -4942,7 +4942,7 @@ mod eol_tests {
     // Rule (`checkMetalEndOfLine_eol_hasMinMaxLength`, last in `qualifiesAsEol`): with MINLENGTH
     // (MAXLENGTH) a line end counts only when the edges before and after it are at least (at most)
     // the length: both with TWOSIDES, either without. ⛔ DIVERGENCE by decision (drt divergence
-    // register D8, upstream OpenROAD issue #12181, vyges-openroad-patches upstream-fix 0001): the
+    // register D8, upstream OpenROAD issue #12181, internal patch 0001): the
     // upstream rule takes TWOSIDES from PARALLELEDGE's TWOEDGES; ours (the patched reference's)
     // takes the rule's own TWOSIDES, which this check then reads unchanged.
     // Here `a`'s end at x 1000 has a 400-long edge below it (a step at x 600) and 1000 above.
@@ -5550,7 +5550,7 @@ mod orth_spacing_tests {
     /// (`checkCutSpacingTableOrthogonal_helper`, the marker's victims): the pair, each box taking
     /// its RIGHT edge for its top — `ury = gtl::xh(...)`, a typo — then normalised (pin probe: B
     /// (980,1070)-(1020,1110) recorded as (980,1020)-(1020,1070)). Our rule, the reference patched
-    /// with vyges-openroad-patches upstream-fix 0011: each victim box is its cut (fixed probe,
+    /// with internal patch 0011: each victim box is its cut (fixed probe,
     /// orth-spacing-witness o1 col and row: B recorded as (980,1070)-(1020,1110), and (1070,980)-
     /// (1110,1020) across). Marker boxes and counts are unchanged; the queue reads victim boxes
     /// when a marker lies off the route box.

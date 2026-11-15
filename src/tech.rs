@@ -341,7 +341,7 @@ pub struct EolRule {
 /// io passes PARALLELEDGE's TWOEDGES flag as TWOSIDES (`isTwoEdgesValid()`), so `MINLENGTH l
 /// TWOSIDES` is judged one-sided unless the rule also says TWOEDGES (upstream OpenROAD issue
 /// #12181). This router reads TWOSIDES as written, as the patched reference does
-/// (vyges-openroad-patches upstream-fix 0001).
+/// (internal patch 0001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EolLength {
     pub max: bool,
@@ -1136,7 +1136,7 @@ pub mod read {
         // second layer only; a SAMENET one in the same-net list, which then makes every
         // different-net rule skip other nets), but `checkLef58CutSpacing_spc_layer` acts only
         // under `hasCutClass()`, so the rule never marks, and nothing warns. Our rule, the
-        // reference patched with vyges-openroad-patches upstream-fix 0005: warn (DRT-353) and
+        // reference patched with internal patch 0005: warn (DRT-353) and
         // drop the rule, from both lists.
         if class.is_empty() {
             return Ok(Lef58CutRule::Skipped(if db.cutspacingrule_is_same_net(layer, k) { LAYER_NO_CLASS_SAME_NET } else { LAYER_NO_CLASS }));
@@ -1161,7 +1161,7 @@ pub mod read {
         // (with CENTERTOCENTER, SAMENET / SAMEMETAL / SAMEVIA, PRL; a SAMENET one in the same-net
         // list), but `checkLef58CutSpacing_spc_layer`, past the class test, has only the
         // CONCAVECORNER and NONEOLCONVEXCORNER branches, so the rule never marks, and nothing
-        // warns. Our rule, upstream-fix 0005: warn (DRT-354, after io's other CUTCLASS-branch
+        // warns. Our rule, internal patch 0005: warn (DRT-354, after io's other CUTCLASS-branch
         // skips) and drop the rule.
         if !concave && !convex {
             return Ok(Lef58CutRule::Skipped(if db.cutspacingrule_is_same_net(layer, k) { LAYER_NO_CORNER_SAME_NET } else { LAYER_NO_CORNER }));
@@ -1198,7 +1198,7 @@ pub mod read {
     /// Every clause of a LAYER rule io keeps but the reference's check never marks.
     pub const LAYER_UNCHECKED: [&str; 4] = [LAYER_NO_CLASS, LAYER_NO_CLASS_SAME_NET, LAYER_NO_CORNER, LAYER_NO_CORNER_SAME_NET];
 
-    // ⛔ No same-net list (divergence D6, upstream-fix 0005): the unpatched reference keeps a
+    // ⛔ No same-net list (divergence D6, internal patch 0005): the unpatched reference keeps a
     // SAMENET LAYER rule with no CUTCLASS, or a class but neither corner, in the layer's same-net
     // list, and `checkCutSpacing_main(rect)` then runs every different-net LEF58 rule with
     // skipDiffNet, pairing a cut only with shapes of its own net (OpenROAD issue #12188). The
@@ -1210,15 +1210,15 @@ pub mod read {
     /// ⛔ A DIVERGENCE from the reference by decision (drt divergence register D7). Upstream rule
     /// (io `setCutLayerProperties`): only the first WITHIN is read, and GC uses it as the upper
     /// bound, so `WITHIN w1 w2` is checked as `WITHIN w1` (upstream OpenROAD issue #12202). Our
-    /// rule, the reference patched with vyges-openroad-patches upstream-fix 0012: warn (DRT-359,
+    /// rule, the reference patched with internal patch 0012: warn (DRT-359,
     /// [`lef58_cut_spacing_skip_warnings`]) and skip the rule, after the reference's own skips.
     pub const ADJ_TWO_WITHIN: &str = "ADJACENTCUTS WITHIN with two values";
 
     /// The patched reference's io warnings for the LEF58 cut spacing rules of cut layer `layer`
     /// that only its fixes skip, in rule order (io's one loop over the rules): DRT-359 for an
-    /// ADJACENTCUTS rule with a second WITHIN value ([`ADJ_TWO_WITHIN`], upstream-fix 0012,
+    /// ADJACENTCUTS rule with a second WITHIN value ([`ADJ_TWO_WITHIN`], internal patch 0012,
     /// divergence D7, OpenROAD issue #12202), DRT-353 for a LAYER rule with no CUTCLASS and DRT-354
-    /// for one with a CUTCLASS but neither corner ([`LAYER_UNCHECKED`], upstream-fix 0005,
+    /// for one with a CUTCLASS but neither corner ([`LAYER_UNCHECKED`], internal patch 0005,
     /// divergence D6, #12187). The unpatched reference says nothing for any of them.
     pub fn lef58_cut_spacing_skip_warnings(db: &Db, layer: &str, classes: &[CutClass]) -> Vec<(u16, String)> {
         (0..db.num_layer_get_tech_layer_cut_spacing_rules(layer))
@@ -1250,7 +1250,7 @@ pub mod read {
     /// io's ADJACENTCUTS branch for LEF58 cut spacing rule `k` of cut layer `layer`: EXACTALIGNED,
     /// EXCEPTSAMEPGNET, CUTCLASS … TO ALL, SIDEPARALLELOVERLAP and SAMEMASK, tested in that order,
     /// skip the rule (io warns and drops it), then a second WITHIN value ([`ADJ_TWO_WITHIN`]:
-    /// skipped as the reference patched with upstream-fix 0012 skips it, divergence D7);
+    /// skipped as the reference patched with internal patch 0012 skips it, divergence D7);
     /// otherwise io keeps the spacing, CENTERTOCENTER, the adjacent-cut count, TWOCUTS, the WITHIN
     /// value, the class (none when the rule names none) and NOPRL. `Err` names a clause io keeps
     /// but this engine does not model: SAMENET (the rule would join the same-net list, which
@@ -1347,7 +1347,7 @@ pub mod read {
     /// (io `setRoutingLayerProperties`): neither branch is tested, so the rule is kept as a plain
     /// end-of-line rule whose WITHIN is the database default 0, MINADJACENTLENGTH dropped, and line
     /// ends that face straight edges are flagged (upstream OpenROAD issue #12174). Our rule (the
-    /// reference patched with vyges-openroad-patches upstream-fix 0010): warn (DRT-357 / DRT-358,
+    /// reference patched with internal patch 0010): warn (DRT-357 / DRT-358,
     /// [`lef58_eol_skip_warnings`]) and skip the rule; it is not checked during routing and
     /// sign-off DRC must cover it. A rule the reference drops itself
     /// ([`lef58_eol_dropped_by_reference`]) is not one of these.
@@ -1369,8 +1369,8 @@ pub mod read {
 
     /// The patched reference's io warnings for the LEF58 end-of-line rules of routing layer
     /// `layer` that it drops or skips, one per rule, in the rules' order: the reference's own drop
-    /// ([`lef58_eol_reference_drop_warning`]: DRT-400 / 401 / 403) first, then upstream-fix 0010's
-    /// skips ([`lef58_eol_skipped_clause`]): DRT-357 for TOCONCAVECORNER, DRT-358 for
+    /// ([`lef58_eol_reference_drop_warning`]: DRT-400 / 401 / 403) first, then internal patch
+    /// 0010's skips ([`lef58_eol_skipped_clause`]): DRT-357 for TOCONCAVECORNER, DRT-358 for
     /// TONOTCHLENGTH. ⛔ Divergence D10 (upstream OpenROAD issue #12174): the unpatched reference
     /// says nothing for those two and checks the rule as WITHIN 0.
     pub fn lef58_eol_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
@@ -1395,7 +1395,7 @@ pub mod read {
     /// with TWOSIDES read as written: [`lef58_eol_length`]; SAMEMASK with its WITHIN as written).
     ///
     /// ⛔ SAMEMASK is a DIVERGENCE by decision (drt divergence register D8, upstream OpenROAD issue
-    /// #12182, vyges-openroad-patches upstream-fix 0002). Upstream rule:
+    /// #12182, internal patch 0002). Upstream rule:
     /// `frLef58SpacingEndOfLineWithinConstraint::getEolWithin` returns 0 for a SAMEMASK rule,
     /// whatever WITHIN says, so the check and the via-to-via prep lose the lateral window. Our rule
     /// (the patched reference's): WITHIN as written (the foundry kit's SAMEMASK end-of-line rules
@@ -1457,7 +1457,7 @@ pub mod read {
     /// holds both), with TWOSIDES AS WRITTEN (`isTwoSidesValid()`). ⛔ Diverges from the
     /// reference by decision (register D8): its io passes PARALLELEDGE's TWOEDGES flag
     /// (`isTwoEdgesValid()`) here, upstream OpenROAD issue #12181; we follow the patched reference
-    /// (vyges-openroad-patches upstream-fix 0001).
+    /// (internal patch 0001).
     pub fn lef58_eol_length(db: &Db, layer: &str, k: usize) -> Option<EolLength> {
         let two_sides = db.spacingeolrule_is_two_sides_valid(layer, k);
         if db.spacingeolrule_is_min_length_valid(layer, k) {
@@ -1995,7 +1995,7 @@ pub mod read {
     /// ⛔ A DIVERGENCE from the reference by decision (drt divergence register D9; upstream
     /// OpenROAD issue #12176). Upstream rule: the database's LEF reader fills the class map but
     /// never sets the rule's per-cut-class flag, so io reads the count 0 and drops the rule. Our
-    /// rule, the reference patched with vyges-openroad-patches upstream-fix 0003, which sets the
+    /// rule, the reference patched with internal patch 0003, which sets the
     /// flag (read here from the class map itself, so a database written by either reader gives
     /// the same rules). ⛔ Refused (`Err`) where the patched reference would dereference a missing
     /// cut class: the default via looked at has none (a via generated by `initDefaultVias`, or one
