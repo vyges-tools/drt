@@ -166,6 +166,15 @@ impl IntervalSet {
     pub fn iter(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
         self.0.iter().map(|(&a, &b)| (a, b))
     }
+    /// The first interval whose lower end is above `lo` (the first of all for `None`): where an
+    /// iterator to the interval starting at `lo` lands on `++` after inserts that joined into it.
+    pub fn next_after(&self, lo: Option<i32>) -> Option<(i32, i32)> {
+        let mut it = match lo {
+            Some(lo) => self.0.range((std::ops::Bound::Excluded(lo), std::ops::Bound::Unbounded)),
+            None => self.0.range(..),
+        };
+        it.next().map(|(&a, &b)| (a, b))
+    }
     pub fn intersect(&self, other: &IntervalSet) -> IntervalSet {
         let mut out = IntervalSet::default();
         for (a, b) in self.iter() {
@@ -470,12 +479,17 @@ fn add_touching_guides_bridges(intvs: &mut TrackIntervals) {
         let mut prev: i32 = -2;
         for &t in &tracks {
             if t == prev + 1 {
-                // ⚠️ The reference inserts into these sets while iterating them; a snapshot is the
-                // reading that does not depend on the container's invalidation behaviour.
-                let cur: Vec<(i32, i32)> = intvs[l][&t].iter().collect();
-                let prv: Vec<(i32, i32)> = intvs[l][&prev].iter().collect();
-                for &(a1, b1) in &cur {
-                    for &(a2, b2) in &prv {
+                // The reference iterates these two sets LIVE while it inserts into them (the
+                // range-for walks the set's nodes; each loop variable is a copy). An insert hulls
+                // the visited interval in place and erases the intervals it joins, so those are
+                // never visited; the next one visited is the first that starts above the visited
+                // one. Both loops below walk the live sets that way.
+                let mut at1: Option<i32> = None;
+                while let Some((a1, b1)) = intvs[l][&t].next_after(at1) {
+                    at1 = Some(a1);
+                    let mut at2: Option<i32> = None;
+                    while let Some((a2, b2)) = intvs[l][&prev].next_after(at2) {
+                        at2 = Some(a2);
                         if a1.max(a2) <= b1.min(b2) {
                             continue;
                         }
@@ -1086,6 +1100,52 @@ mod tests {
         // Now side by side at gcell 4 with nothing below or above: a bridge on the layer below,
         // along that gcell, across both tracks.
         assert_eq!(intvs[0][&4].iter().collect::<Vec<_>>(), vec![(5, 6)]);
+    }
+
+    // Upstream rule (addTouchingGuidesBridges, corner-edge pass): the range-for walks the current
+    // track's interval set LIVE while it inserts into that set. Witnessed on CoralNPU (net335475,
+    // M2, instrumented reference): track 125 holds [126,126] [128,129] and the previous track
+    // [127,128] [130,131]. Visiting [126,126], the corner with [127,128] inserts [126,127], which
+    // joins all of track 125 into [126,129]; the iteration then ends, so [128,129] is never
+    // visited and never gets the [129,130] corner a snapshot of the set would give it.
+    #[test]
+    fn an_interval_joined_by_a_corner_insert_is_not_visited_again() {
+        let mut intvs: TrackIntervals = vec![BTreeMap::new(); 5];
+        intvs[4].entry(124).or_default().insert(127, 128);
+        intvs[4].entry(124).or_default().insert(130, 131);
+        intvs[4].entry(125).or_default().insert(126, 126);
+        intvs[4].entry(125).or_default().insert(128, 129);
+        add_touching_guides_bridges(&mut intvs);
+        assert_eq!(intvs[4][&125].iter().collect::<Vec<_>>(), vec![(126, 129)]);
+        assert_eq!(intvs[4][&124].iter().collect::<Vec<_>>(), vec![(127, 128), (130, 131)]);
+    }
+
+    // The inner loop over the PREVIOUS track's set is walked live too: visiting its [0,2] against
+    // the current [3,3], the corner inserts [2,3], joining it into [0,5], and [4,5] is not visited.
+    // Unlike the outer loop this is not observable: an interval it skips lies inside the joined
+    // interval that covers the current interval's end, so the own-layer gcellHasGuide check blocks
+    // both corner forms for it. (A snapshot of this set is an equivalent mutant; this pins the
+    // outcome.)
+    #[test]
+    fn a_previous_track_interval_joined_by_a_corner_insert_is_not_visited_again() {
+        let mut intvs: TrackIntervals = vec![BTreeMap::new(); 5];
+        intvs[4].entry(5).or_default().insert(0, 2);
+        intvs[4].entry(5).or_default().insert(4, 5);
+        intvs[4].entry(6).or_default().insert(3, 3);
+        add_touching_guides_bridges(&mut intvs);
+        assert_eq!(intvs[4][&5].iter().collect::<Vec<_>>(), vec![(0, 5)]);
+        assert_eq!(intvs[4][&6].iter().collect::<Vec<_>>(), vec![(3, 3)]);
+    }
+
+    #[test]
+    fn next_after_walks_from_above_a_lower_end() {
+        let mut s = IntervalSet::default();
+        s.insert(1, 2);
+        s.insert(5, 6);
+        assert_eq!(s.next_after(None), Some((1, 2)));
+        assert_eq!(s.next_after(Some(1)), Some((5, 6)));
+        assert_eq!(s.next_after(Some(3)), Some((5, 6)));
+        assert_eq!(s.next_after(Some(5)), None);
     }
 
     /// Layers 0–1 placeholders, 2 horizontal routing, 3 cut, 4 vertical routing.
