@@ -594,6 +594,31 @@ pub fn net_terminals(insts: &[DesignInst], masters: &HashMap<String, Master>, po
     out
 }
 
+/// A net's terminals, each with its gr pin point when it has one (see [`net_terminals`]).
+pub type NetTerms = Vec<(String, Option<(i32, i32)>)>;
+
+/// [`net_terminals`] for every net at once, in one pass: each net's list in the same order (block
+/// pins in block order, then instance terminals in instance then master order). The reference
+/// reads a net's terminals off the net itself (`frNet` holds its terms); a scan of every instance
+/// per net costs instances × unguided nets.
+pub fn net_terminal_index<'d>(insts: &'d [DesignInst], masters: &HashMap<String, Master>, ports: &'d [DesignPort]) -> HashMap<&'d str, NetTerms> {
+    let mut out: HashMap<&str, NetTerms> = HashMap::new();
+    for p in ports {
+        if let Owner::Net(n) = &p.owner {
+            out.entry(n.as_str()).or_default().push((format!("PIN/{}", p.name), None));
+        }
+    }
+    for inst in insts {
+        let m = &masters[&inst.unique.master];
+        for (t, n) in inst.nets.iter().enumerate() {
+            if let Some(n) = n {
+                out.entry(n.as_str()).or_default().push((format!("{}/{}", inst.name, m.terms[t].name), None));
+            }
+        }
+    }
+    out
+}
+
 /// `frPin::hasPinAccess`: the pin carries a pin-access entry — one per unique class of its master,
 /// made for every pin of every terminal whether or not access points are found for it. So a pin
 /// with NO access point still has pin access, and still advances the worker's and track
@@ -640,6 +665,8 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
     let mut term_fixed: Vec<Fixed> = Vec::new();
     let mut term_of: HashMap<String, usize> = HashMap::new();
     let mut guides = Vec::new();
+    // Built on the first net without guides, and only then.
+    let mut unguided_terms: Option<HashMap<&str, NetTerms>> = None;
     let mut gr_pins = Vec::new();
     let ap_of = |a: &AccessPoint, shift: (i32, i32)| DrAp { point: (a.point.0 + shift.0, a.point.1 + shift.1), layer: a.layer, access: a.db_access_bits(), vias: a.vias.clone() };
     for (ni, net) in design.nets.iter().enumerate() {
@@ -653,7 +680,7 @@ pub fn ta(d: &DesignIn, g: &GuidesIn, p: &Prep, log: Sink) -> TaOut {
             // A net with no guides (routed before routing began) has no gr pin, but its
             // terminals are in the reference's region query all the same: the worker finds them
             // at its route ends (initNets_searchRepair_pin2epMap, initNets_segmentTerms).
-            None => net_terminals(insts, masters, ports, &net.name),
+            None => unguided_terms.get_or_insert_with(|| net_terminal_index(insts, masters, ports)).get(net.name.as_str()).cloned().unwrap_or_default(),
         };
         for (name, pt) in &named {
             let t = *term_of.entry(name.clone()).or_insert_with(|| {
@@ -1471,6 +1498,11 @@ mod tests {
         }).collect();
         assert_eq!(names, ["PIN/clk", "u0/B", "u1/A"]);
         assert!(net_terminals(&insts, &masters, &ports, "none").is_empty());
+        // The one-pass index gives every net the same list, in the same order, as the scan.
+        let index = net_terminal_index(&insts, &masters, &ports);
+        for net in ["clk", "other", "none"] {
+            assert_eq!(index.get(net).cloned().unwrap_or_default(), net_terminals(&insts, &masters, &ports, net), "{net}");
+        }
     }
 
     /// `TritonRoute::main` (pin 4155ac31), after `initDesign`: a net is routable when it has more
