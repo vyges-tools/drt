@@ -132,7 +132,8 @@ the extension, as the reference's check does; the router's costs do not read it,
 reference's), `OPPOSITEWIDTH` (the rule applies only when the wire beyond the line end spans
 less than the opposite width, as the LEF defines it, in the check only; the reference stores the
 clause and never reads it, upstream OpenROAD issue #12226) and `SAMEMASK`, the latter held on every pair whatever its masks, as the reference
-holds it), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207), cut classes, the
+holds it), corner spacing (convex corners, patched by the router whenever the technology has corner spacing; the reference patches them only when the technology also has a `MINSTEP` rule, and this engine follows the reference's own fix, upstream OpenROAD issue #12207; a `BLOCK` master's pin also
+costs the router a square at each of its corners, sized from the rule, as the reference costs it), cut classes, the
 different-net and `SAMENET` cut spacing tables of a cut layer, its default inter-layer table
 (`SPACINGTABLE … LAYER l`: cuts of two nets on the two layers, checked from either layer, and
 costed by the router around the other layer's vias, except where the other layer's vias fall
@@ -205,7 +206,7 @@ or `SPACING` is checked on its own, by that rule. A net the global router gave a
 kept to its guides: off them it costs ten times as much.
 Refused rather than approximated: any other rule family or clause a layer carries (named in the
 report's `reason`), among them LEF58 minimum step, `SPACINGTABLE INFLUENCE` and a
-metal-width via map; corner spacing in a design with a block master; a layer whose via pads break
+metal-width via map; a layer whose via pads break
 its minimum step; a non-default rule with hard spacing, via
 generate rules or wire extension; FIXED wiring, or a routed net on a non-default rule, already in
 the database; and congested input guides. Past iteration 7 the router widens the clip of

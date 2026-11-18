@@ -50,7 +50,6 @@ pub fn block_vias(db: &Db, tech: &Tech, held: &dyn Fn(&str) -> bool) -> Vec<crat
 /// the maze's pin feedthrough), and so is a multi-patterned layer, which io also gives it.
 pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
     let mut out = Vec::new();
-    let has_block_master = db.inst_names().iter().any(|i| db.master_get_type(&db.inst_get_master(i)).unwrap_or_default().starts_with("BLOCK"));
     for (num, l) in tech.layers.iter().enumerate() {
         if l.kind == LayerKind::Placeholder {
             continue;
@@ -85,15 +84,12 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 continue;
             }
             if family == "lef58_corner_spacing" {
-                // Modelled rule by rule (the first clause outside the subset names the refusal),
-                // with the router's patch pass (`patchMetalShape_cornerSpacing`). ⛔ Not modelled: a
-                // BLOCK master pin's corner-to-corner cost (`modCornerToCornerSpacing`, block masters
-                // only) — refused while the design instantiates a block master (conservatively,
-                // whether or not its pins reach this layer).
+                // Modelled rule by rule (the first clause outside the subset names the refusal):
+                // the check, the router's patch pass (`patchMetalShape_cornerSpacing`) and a BLOCK
+                // master pin's corner-to-corner maze cost (`modCornerToCornerSpacing`,
+                // `dr::cost::CostWorker::mod_corner_to_corner_spacing`).
                 if let Some(clause) = (0..n).find_map(|k| crate::tech::read::corner_spacing_rule(db, &l.name, k).err()) {
                     out.push(format!("{}: {family} ({n}, {clause})", l.name));
-                } else if has_block_master {
-                    out.push(format!("{}: {family} ({n}, a block master's pin corner cost)", l.name));
                 }
                 continue;
             }

@@ -74,6 +74,27 @@ pub enum ModCost {
     ResetBlocked,
 }
 
+/// A DIAGNOSTIC, inert unless `VYGC_C2C` is set: the block-pin corner cost prints each call
+/// (`c2t` / `c2m` / `c2c` lines, as the reference's instrument `c2c-trace.py` prints them).
+fn c2c_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VYGC_C2C").is_some())
+}
+
+/// The reference's `ModCostType` value for a kind, as the trace prints it.
+fn mod_cost_code(t: ModCost) -> u8 {
+    match t {
+        ModCost::SubRoute => 0,
+        ModCost::AddRoute => 1,
+        ModCost::SubFixed => 2,
+        ModCost::AddFixed => 3,
+        ModCost::ResetFixed => 4,
+        ModCost::SetFixed => 5,
+        ModCost::ResetBlocked => 6,
+        ModCost::SetBlocked => 7,
+    }
+}
+
 fn add8(v: &mut u8) {
     *v = v.saturating_add(1);
 }
@@ -157,6 +178,21 @@ impl GridGraph {
         }
         if self.ys.get(y1).is_some_and(|&c| c > b.yl) {
             y1 = y1.saturating_sub(1);
+        }
+        (x1, y1, x2, y2)
+    }
+
+    /// The index range ENCLOSED BY a box (`getIdxBox` with `isEnclosed`): as
+    /// [`GridGraph::idx_box`], the high end stepped back one when its coordinate lies past the
+    /// box's high side (only when the high end was clamped at 0, so a box wholly below the grid's
+    /// first coordinate still walks index 0, as the reference's does).
+    pub fn idx_box_is_enclosed(&self, b: &Rect) -> (usize, usize, usize, usize) {
+        let (x1, y1, mut x2, mut y2) = self.idx_box(b);
+        if self.xs.get(x2).is_some_and(|&c| c > b.xh) {
+            x2 = x2.saturating_sub(1);
+        }
+        if self.ys.get(y2).is_some_and(|&c| c > b.yh) {
+            y2 = y2.saturating_sub(1);
         }
         (x1, y1, x2, y2)
     }
@@ -396,6 +432,58 @@ impl CostWorker<'_, '_> {
                 self.g.set_blocked(i as i64, j as i64, z as i64, Dir6::D, set);
             }
         }
+    }
+
+    /// `modCornerToCornerSpacing`: a block master's routing-layer pin rect costs, per LEF58 corner
+    /// spacing rule of its layer (in the layer's order), a square at each of its four corners —
+    /// lower left, upper left, upper right, lower right — reaching `findMax + width / 2 - 1` out
+    /// from the corner (`findMax`: the larger of the rule's LAST row's two spacings; `width`: the
+    /// layer's default wire width), each walked by
+    /// [`CostWorker::mod_corner_to_corner_spacing_helper`]. The reference calls it a temporary
+    /// solution for one benchmark set; it is what its router does.
+    pub fn mod_corner_to_corner_spacing(&mut self, b: &Rect, z: usize, t: ModCost) {
+        let l = self.g.zs[z];
+        let half_width2 = self.cx.width(l) / 2;
+        for (k, r) in self.cx.tech.layers[l].corner_spacing.iter().enumerate() {
+            let (sx, sy) = r.find_max();
+            let bloat = sx.max(sy) + half_width2 - 1;
+            if c2c_trace() {
+                eprintln!("c2m|{}|{l}|{z}|{}|{},{},{},{}|{k}|{}|{bloat}", self.c2c_grid(), mod_cost_code(t), b.xl, b.yl, b.xh, b.yh, sx.max(sy));
+            }
+            let corners = [
+                Rect { xl: b.xl - bloat, yl: b.yl - bloat, xh: b.xl, yh: b.yl },
+                Rect { xl: b.xl - bloat, yl: b.yh, xh: b.xl, yh: b.yh + bloat },
+                Rect { xl: b.xh, yl: b.yh, xh: b.xh + bloat, yh: b.yh + bloat },
+                Rect { xl: b.xh, yl: b.yl - bloat, xh: b.xh + bloat, yh: b.yl },
+            ];
+            for bx in &corners {
+                self.mod_corner_to_corner_spacing_helper(bx, z, t);
+            }
+        }
+    }
+
+    /// `modCornerToCornerSpacing_helper`: every grid node the box encloses
+    /// ([`GridGraph::idx_box_is_enclosed`]) takes one planar shape cost — route or fixed, added or
+    /// removed as `t` says; any other kind changes nothing.
+    fn mod_corner_to_corner_spacing_helper(&mut self, b: &Rect, z: usize, t: ModCost) {
+        let (x1, y1, x2, y2) = self.g.idx_box_is_enclosed(b);
+        if c2c_trace() {
+            eprintln!("c2c|{}|{z}|{}|{},{},{},{}|{x1},{y1},{x2},{y2}", self.c2c_grid(), mod_cost_code(t), b.xl, b.yl, b.xh, b.yh);
+        }
+        if !matches!(t, ModCost::SubRoute | ModCost::AddRoute | ModCost::SubFixed | ModCost::AddFixed) {
+            return;
+        }
+        for i in x1..=x2 {
+            for j in y1..=y2 {
+                let k = self.g.idx(i, j, z);
+                self.g.mod_planar(k, t, false, true, true);
+            }
+        }
+    }
+
+    /// The worker's grid as the corner-cost trace names it: x and y dimensions, first x and y.
+    fn c2c_grid(&self) -> String {
+        format!("{},{},{},{}", self.g.xs.len(), self.g.ys.len(), self.g.xs.first().copied().unwrap_or(0), self.g.ys.first().copied().unwrap_or(0))
     }
 
     /// Planar spacing costs around a shape: once for the default wire, then once per
@@ -1230,10 +1318,15 @@ pub fn mod_term_cost(w: &mut CostWorker<'_, '_>, obj: &Fixed, add: bool, skip_vi
                 w.mod_min_spacing_cost_via(&b, z, t, true, false, false, None);
                 w.mod_min_spacing_cost_via(&b, z, t, false, false, false, None);
             }
-            // A block's pin: corner-to-corner spacing (a rule family the census refuses), its
-            // access edges blocked, and the spacing costs SET rather than added (reset, removed).
+            // A block's pin: corner-to-corner spacing (with the kind as given, before it turns
+            // into set / reset), its access edges blocked, and the spacing costs SET rather than
+            // added (reset, removed).
             let mut t2 = t;
             if block {
+                if c2c_trace() {
+                    eprintln!("c2t|{}|-/-|-|-|{l}|{},{},{},{}|{}|{}", w.c2c_grid(), b.xl, b.yl, b.xh, b.yh, u8::from(add), u8::from(skip_via));
+                }
+                w.mod_corner_to_corner_spacing(&b, z, t);
                 mod_blocked_edges_for_macro_pin(w, &aps, add);
                 t2 = if add { ModCost::SetFixed } else { ModCost::ResetFixed };
             }
@@ -1680,5 +1773,48 @@ mod tests {
         assert!(g.is_blocked(9, 5, 0, Dir6::E), "the W edge of index 10, corrected onto node 9");
         with(&t, &mut g, |w| mod_blocked_edges_for_macro_pin(w, &aps, false));
         assert!(!g.is_blocked(4, 3, 0, Dir6::E) && !g.is_blocked(4, 3, 0, Dir6::N) && !g.is_blocked(9, 5, 0, Dir6::E));
+    }
+
+    // Rule (`modCornerToCornerSpacing`, block master pins only): per corner spacing rule of the
+    // layer, a square reaching findMax + width/2 - 1 out from each of the pin rect's four corners
+    // (ll, ul, ur, lr) costs one planar fixed shape on every node it encloses; findMax is the
+    // larger spacing of the rule's LAST row, not the table's largest. Here width 100 and a last
+    // row of (40, 30) give 89: each corner square holds one node, the inside of the rect none.
+    #[test]
+    fn a_block_pin_costs_a_square_at_each_corner() {
+        use crate::tech::CornerSpacing;
+        let mut t = tech(0);
+        let rule = CornerSpacing { widths: vec![0, 100], spacings: vec![(200, 200), (40, 30)], same_xy: false, corner_to_corner: false };
+        t.layers[2].corner_spacing = vec![rule.clone()];
+        let mut g = grid();
+        let pin = Rect { xl: 300, yl: 300, xh: 600, yh: 600 };
+        with(&t, &mut g, |w| w.mod_corner_to_corner_spacing(&pin, 0, ModCost::AddFixed));
+        let cost = |g: &GridGraph, x, y| (g.nodes[g.idx(x, y, 0)].fixed_h, g.nodes[g.idx(x, y, 0)].fixed_v);
+        for (x, y) in [(3, 3), (3, 6), (6, 6), (6, 3)] {
+            assert_eq!(cost(&g, x, y), (1, 1), "corner node ({x}, {y})");
+        }
+        for (x, y) in [(4, 4), (2, 2), (7, 7), (3, 4), (2, 3)] {
+            assert_eq!(cost(&g, x, y), (0, 0), "node ({x}, {y}) outside every corner square");
+        }
+        // A second rule costs again; removing takes both off; the other layer is untouched.
+        t.layers[2].corner_spacing.push(rule);
+        with(&t, &mut g, |w| w.mod_corner_to_corner_spacing(&pin, 0, ModCost::AddFixed));
+        assert_eq!(cost(&g, 3, 3), (3, 3));
+        with(&t, &mut g, |w| w.mod_corner_to_corner_spacing(&pin, 0, ModCost::SubFixed));
+        assert_eq!(cost(&g, 6, 6), (1, 1));
+        assert!(g.nodes[g.idx(3, 3, 1)].fixed_h == 0 && g.nodes[g.idx(3, 3, 1)].fixed_v == 0);
+    }
+
+    // Rule (`getIdxBox` with isEnclosed): low ends from the first coordinate at or above the
+    // box, high ends from the last at or below it, CLAMPED at 0 — so a box wholly below the
+    // grid's first coordinate still walks node 0 (the step back cannot go below 0), and a box
+    // between two coordinates walks nothing.
+    #[test]
+    fn the_enclosed_index_box_clamps_at_zero() {
+        let g = grid();
+        assert_eq!(g.idx_box_is_enclosed(&Rect { xl: -200, yl: -200, xh: -50, yh: -50 }), (0, 0, 0, 0));
+        let (x1, _, x2, _) = g.idx_box_is_enclosed(&Rect { xl: 110, yl: 110, xh: 190, yh: 190 });
+        assert!(x1 > x2, "nothing enclosed: {x1} > {x2}");
+        assert_eq!(g.idx_box_is_enclosed(&Rect { xl: 100, yl: 150, xh: 300, yh: 350 }), (1, 2, 3, 3));
     }
 }
