@@ -1443,6 +1443,9 @@ impl<'s, 'a> Worker<'s, 'a> {
     }
 }
 
+/// One worker's result: its wire count, its routes to save (guide, wire) and its trace.
+type WorkerOut = (usize, Vec<(usize, (P, P))>, Vec<TaEvent>);
+
 /// The panels of one pass, direction `horizontal`, in batches.
 fn panels(grid: &GCellGrid, size: i32, offset: i32, horizontal: bool) -> Vec<Rect> {
     let (xn, yn) = (grid.x.1, grid.y.1);
@@ -1466,11 +1469,14 @@ fn run_pass(st: &mut TaState<'_>, iter: usize, horizontal: bool, trace: &mut Opt
     let bs = st.input.cfg.batch_size;
     let mut assigned = 0;
     for (b, chunk) in boxes.chunks(bs).enumerate() {
-        let mut saves: Vec<Vec<(usize, (P, P))>> = Vec::new();
-        let mut logs: Vec<Vec<TaEvent>> = Vec::new();
-        for (k, rb) in chunk.iter().enumerate() {
+        // FlexTA::initTA_helper: a batch's workers run in parallel (`omp parallel for`, at most
+        // eight threads); each reads the shared state only, and their routes are saved after the
+        // batch, in batch order (`worker->end()`), so the order they run in cannot change a result.
+        let tracing = trace.is_some();
+        let shared: &TaState<'_> = st;
+        let run_one = |(k, rb): (usize, &Rect)| -> WorkerOut {
             let mut w = Worker {
-                st,
+                st: shared,
                 route_box: *rb,
                 ext_box: bloat(rb, half),
                 horizontal,
@@ -1484,16 +1490,32 @@ fn run_pass(st: &mut TaState<'_>, iter: usize, horizontal: bool, trace: &mut Opt
                 via_costs: Vec::new(),
                 reassign: BTreeSet::new(),
                 num_assigned: 0,
-                trace: trace.as_ref().map(|_| vec![TaEvent::Worker { iter, horizontal, batch: b, index: k, route_box: *rb }]),
+                trace: tracing.then(|| vec![TaEvent::Worker { iter, horizontal, batch: b, index: k, route_box: *rb }]),
             };
             w.main_mt();
-            assigned += w.num_assigned;
             let s = w.save_to_guides();
             let mut log = w.trace.take().unwrap_or_default();
-            for &(g, (sb, se)) in &s {
-                log.push(TaEvent::Save { guide: g, begin: sb, end: se });
+            if tracing {
+                for &(g, (sb, se)) in &s {
+                    log.push(TaEvent::Save { guide: g, begin: sb, end: se });
+                }
+                log.push(TaEvent::EndWorker);
             }
-            log.push(TaEvent::EndWorker);
+            (w.num_assigned, s, log)
+        };
+        let done: Vec<WorkerOut> = {
+            use rayon::prelude::*;
+            let items: Vec<(usize, &Rect)> = chunk.iter().enumerate().collect();
+            if rayon::current_num_threads() > 1 {
+                items.into_par_iter().map(run_one).collect()
+            } else {
+                items.into_iter().map(run_one).collect()
+            }
+        };
+        let mut saves: Vec<Vec<(usize, (P, P))>> = Vec::with_capacity(done.len());
+        let mut logs: Vec<Vec<TaEvent>> = Vec::with_capacity(done.len());
+        for (n, s, log) in done {
+            assigned += n;
             saves.push(s);
             logs.push(log);
         }
