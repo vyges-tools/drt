@@ -1001,17 +1001,48 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         // The batch written back, worker by worker.
         for (w, routed, markers, wm, _) in &results {
             let best = in_check_box(markers, &w.drc).len();
-            if !written_back(iter, args.ripup, wm, best) {
+            let wb = written_back(iter, args.ripup, wm, best);
+            vygw_worker(cx, iter, w, routed.len(), wm.init_num, wb, &in_check_box(markers, &w.drc));
+            if !wb {
                 continue;
             }
             changed |= best != wm.init_num;
             end_worker(cx, routes, w, routed, markers, iter);
         }
+        vygw_line(&format!("VYGW|b|{iter}|{}", routes.markers().count()));
     }
     if flow == Flow::Guides {
         flow_state.last_effective = changed;
     }
     check_then_fix_max_spacing(cx, routes, flow_state, max_spacing, log)
+}
+
+// Debug option, write-only (outputs identical with it on and off): with VYGW_OUT set, one record per
+// worker at its batch's write-back, in batch order, and the design's marker count after each batch:
+//   VYGW|w|<iter>|<route box xl,yl,xh,yh>|<routed nets>|<starting markers>|<best markers>|<written>|<name@layer=n;...>
+//   VYGW|b|<iter>|<design markers>
+// The reference side writes the same record from its batch write-back (internal worker-record
+// instrument), so the first worker whose result differs can be found on a large design.
+fn vygw_line(l: &str) {
+    use std::io::Write;
+    static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let o = OUT.get_or_init(|| std::env::var_os("VYGW_OUT").map(|f| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f).expect("VYGW_OUT"))));
+    if let Some(m) = o {
+        writeln!(m.lock().expect("vygw"), "{l}").expect("vygw write");
+    }
+}
+
+fn vygw_worker(cx: &DrCtx<'_>, iter: usize, w: &WorkerBoxes, nets: usize, init: usize, written: bool, best: &[Marker]) {
+    if std::env::var_os("VYGW_OUT").is_none() {
+        return;
+    }
+    let mut h: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for m in best {
+        *h.entry((crate::dr::log::viol_name(m.rule).to_string(), cx.p.tech.layers[m.layer].name.clone())).or_default() += 1;
+    }
+    let hs: Vec<String> = h.iter().map(|((n, l), c)| format!("{n}@{l}={c}")).collect();
+    let r = &w.route;
+    vygw_line(&format!("VYGW|w|{iter}|{},{},{},{}|{nets}|{init}|{}|{}|{}", r.xl, r.yl, r.xh, r.yh, best.len(), written as u8, hs.join(";")));
 }
 
 /// The end of `searchRepair` after its flow: the connectivity check, the max-spacing flag
