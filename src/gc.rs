@@ -608,6 +608,9 @@ struct Net {
     pins: Vec<Vec<Polygon90Set>>,
 }
 
+/// `Worker::seg_at` for an edge no longer in its layer's list.
+const NO_SEG: usize = usize::MAX;
+
 pub struct Worker<'a> {
     tech: &'a Tech,
     nets: Vec<Net>,
@@ -619,9 +622,12 @@ pub struct Worker<'a> {
     /// Per layer, the polygon edges' query tree (`queryPolygonEdge`): each edge's box, by uid;
     /// bulk-loaded at `init` in the list's order (owner, pin, ring), updated per owner after.
     seg_rq: Vec<DynRTree<usize>>,
-    /// Per layer: uid → the edge's tree id and its place in the list.
+    /// Per layer: uid → the edge's tree id.
     seg_tree_id: Vec<HashMap<usize, usize>>,
-    seg_at: Vec<HashMap<usize, usize>>,
+    /// By uid (uids are dense and unique across layers): the edge's place in its layer's list;
+    /// `NO_SEG` once the edge is gone. Re-indexed per layer after every list change, so a plain
+    /// vector, not a hashed map, keeps that pass a linear write.
+    seg_at: Vec<usize>,
     next_uid: usize,
     /// Skip end-of-line checks on edges running along the layer's direction above the first metal
     /// layer (the long sides of a wire): set for via and pattern trials, not planar ones.
@@ -1108,7 +1114,7 @@ impl<'a> Worker<'a> {
         self.spc_rq = (0..n).map(|l| DynRTree::new(self.spc[l].iter().enumerate().map(|(k, s)| (s.rect, k)).collect())).collect();
         self.seg_rq = (0..n).map(|l| DynRTree::new(self.segs[l].iter().map(|e| (seg_box(e), e.uid)).collect())).collect();
         self.seg_tree_id = (0..n).map(|l| self.segs[l].iter().enumerate().map(|(k, e)| (e.uid, k)).collect()).collect();
-        self.seg_at = vec![HashMap::new(); n];
+        self.seg_at = Vec::new();
         for l in 0..n {
             self.index_segs(l);
         }
@@ -1116,7 +1122,12 @@ impl<'a> Worker<'a> {
 
     /// Where each edge of `layer` sits in the list now.
     fn index_segs(&mut self, layer: usize) {
-        self.seg_at[layer] = self.segs[layer].iter().enumerate().map(|(k, e)| (e.uid, k)).collect();
+        if self.seg_at.len() < self.next_uid {
+            self.seg_at.resize(self.next_uid, NO_SEG);
+        }
+        for (k, e) in self.segs[layer].iter().enumerate() {
+            self.seg_at[e.uid] = k;
+        }
     }
 
     /// One owner's pins, maximal rectangles, edges and special spacing rectangles, appended.
@@ -1220,6 +1231,9 @@ impl<'a> Worker<'a> {
             for e in self.segs[layer].iter().filter(|e| e.net == i) {
                 if let Some(id) = self.seg_tree_id[layer].remove(&e.uid) {
                     self.seg_rq[layer].remove(id);
+                }
+                if let Some(at) = self.seg_at.get_mut(e.uid) {
+                    *at = NO_SEG;
                 }
             }
             retain_segs(&mut self.segs[layer], i);
@@ -1938,7 +1952,16 @@ impl<'a> Worker<'a> {
 
     /// Every polygon edge on `layer` touching `q`.
     fn query_segs(&self, layer: usize, q: &Rect) -> Vec<usize> {
-        self.seg_rq.get(layer).map_or(Vec::new(), |t| t.query(q).into_iter().map(|(_, v)| self.seg_at[layer][&v.1]).collect())
+        self.seg_rq.get(layer).map_or(Vec::new(), |t| {
+            t.query(q)
+                .into_iter()
+                .map(|(_, v)| {
+                    let k = self.seg_at[v.1];
+                    assert!(k != NO_SEG, "a polygon edge in the query tree but not in the list");
+                    k
+                })
+                .collect()
+        })
     }
 
     fn eol_parallel_edge_one_dir(&self, layer: usize, k: usize, r: &EolRule, p: &ParallelEdge, is_low: bool, has_route: &mut bool) -> bool {
