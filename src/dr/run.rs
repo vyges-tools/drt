@@ -115,6 +115,8 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     drop(s);
     let s = crate::debug::stage("GuideProcessor::process");
     let g = init_guide(db, &d, log)?;
+    drop(s);
+    let s = crate::debug::stage("prep");
     let p = prep(&d);
     drop(s);
     let s = crate::debug::stage("FlexTA::main");
@@ -464,6 +466,7 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
         Ok(false)
     };
     // readGuides: nets in database order, each guide checked against the routing range.
+    let s = crate::debug::stage("GuideProcessor::readGuides");
     let mut raw: HashMap<String, Vec<(usize, Rect)>> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for net in db.net_names() {
@@ -499,6 +502,7 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
             raw.entry(net.clone()).or_default().push((l, r));
         }
     }
+    drop(s);
     let guide_count: usize = order.iter().map(|n| raw[n].len()).sum();
     crate::dr::log::guides_read(guide_count).into_iter().for_each(&mut *log);
     if !order.is_empty() {
@@ -518,7 +522,11 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
     let inst_index: HashMap<&str, usize> = d.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
     let port_index: HashMap<&str, usize> = d.ports.iter().enumerate().map(|(k, p)| (p.name.as_str(), k)).collect();
     let class_of = classes_of(d);
-    let mut by_net: HashMap<String, NetGuides> = HashMap::new();
+    let s = crate::debug::stage("GuideProcessor::genGuides");
+    // Each net's pins, from the database in net order; then `genGuides` per net, in parallel as
+    // the reference's `omp parallel for` over the nets (each reads only its own net's guides and
+    // pins); the results taken in net order, the first failure in that order returned.
+    let mut net_pins: Vec<Vec<GuidePin>> = Vec::with_capacity(order.len());
     for name in &order {
         let mut pins: Vec<GuidePin> = Vec::new();
         for it in db.net_iterms(name) {
@@ -537,12 +545,29 @@ pub fn init_guide(db: &Db, d: &DesignIn, log: Sink) -> Res<GuidesIn> {
             let aps = d.pa.port_aps[k].iter().flatten().map(|a| (a.point, a.layer)).collect();
             pins.push(GuidePin { name: format!("PIN/{bt}"), is_port: true, id: k, shapes: Vec::new(), aps });
         }
+        net_pins.push(pins);
+    }
+    let gen = |(name, pins): (&String, Vec<GuidePin>)| -> Option<NetGuides> {
         let net = GuideNet { tech, grid: &grid, cfg: &gcfg, pins };
-        let (guides, gr) = gen_guides(&net, &raw[name], &mut None).ok_or_else(|| format!("net {name}: guides do not connect its pins"))?;
+        let (guides, gr) = gen_guides(&net, &raw[name], &mut None)?;
         let gs = guides.iter().map(|g| (g.layer, g.begin, g.end)).collect();
         let gps = gr.iter().map(|&(p, pt)| (net.pins[p].name.clone(), pt)).collect();
-        by_net.insert(name.clone(), (gs, gps));
+        Some((gs, gps))
+    };
+    let per_net: Vec<Option<NetGuides>> = {
+        use rayon::prelude::*;
+        if rayon::current_num_threads() > 1 {
+            order.par_iter().zip(net_pins.into_par_iter()).map(gen).collect()
+        } else {
+            order.iter().zip(net_pins).map(gen).collect()
+        }
+    };
+    let mut by_net: HashMap<String, NetGuides> = HashMap::with_capacity(order.len());
+    for (name, r) in order.iter().zip(per_net) {
+        let r = r.ok_or_else(|| format!("net {name}: guides do not connect its pins"))?;
+        by_net.insert(name.clone(), r);
     }
+    drop(s);
     // The guide region query: per layer, the committed guides.
     let mut sizes = vec![0; tech.layers.len()];
     for (gs, _) in by_net.values() {
