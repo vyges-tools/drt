@@ -401,6 +401,47 @@ mod tests {
         crate::gc::tests::tech()
     }
 
+    fn checked_on(threads: usize, check: &(dyn Fn(usize, &mut NetShapes) -> Result<CheckLog, String> + Sync)) -> (Result<(), String>, String, String) {
+        let t = tech0();
+        let mut d = DesignRoutes::default();
+        for n in 0..8usize {
+            let y = 1000 * n as i32;
+            for (a, b) in [(0, 600), (400, 1000), (900, 1500)] {
+                d.add(&t, n, DrFig::Seg { layer: 4, begin: (a, y), end: (b, y), width: 140, begin_ext: 70, end_ext: 70, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false });
+            }
+            d.modified.insert(n);
+        }
+        let before = format!("{:?}", d.shapes);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let name = |n: usize| format!("n{n}");
+        let r = pool.install(|| connectivity_check(&mut d, &t, &name, check));
+        (r, before, format!("{:?}", d.shapes))
+    }
+
+    /// Rule (the reference's checker: per-net init and search under `omp parallel for`, merge and
+    /// write-back serial in net order): the design after the check does not depend on the thread
+    /// count, and the overlapping wires were merged (so the check did something).
+    #[test]
+    fn the_connectivity_check_is_the_same_at_any_thread_count() {
+        let t = tech0();
+        let check = |_: usize, sh: &mut NetShapes| crate::dr::conn::check_net(&t, sh, &|_, _| Vec::<usize>::new());
+        let (r1, before, one) = checked_on(1, &check);
+        let (r4, _, four) = checked_on(4, &check);
+        assert!(r1.is_ok() && r4.is_ok());
+        assert_eq!(one, four);
+        assert_ne!(one, before, "the check changed no wire");
+    }
+
+    /// Rule: a failed net check stops the run with the FIRST failure in net order, at any thread
+    /// count (the serial loop's error).
+    #[test]
+    fn a_connectivity_check_error_is_the_first_in_net_order() {
+        let check = |n: usize, _: &mut NetShapes| if n == 2 || n == 5 { Err(format!("net {n}")) } else { Ok(CheckLog::default()) };
+        for threads in [1, 4] {
+            assert_eq!(checked_on(threads, &check).0, Err("net 2".to_string()), "threads {threads}");
+        }
+    }
+
     /// Rule: a committed wire of a rerouted net lying ALONG a side of the route box stays whole in
     /// the first iteration; afterwards it is removed (its parts outside the box kept).
     #[test]
@@ -500,18 +541,34 @@ pub fn apply_check_ops(d: &mut DesignRoutes, tech: &Tech, net: usize, name: &str
 
 /// The connectivity check over every modified net (in net order), each phase applied to the
 /// design over all of them before the next; the modified set cleared. `check(net, shapes)` runs
-/// the check on one net's shapes; an error stops the run.
-pub fn connectivity_check(d: &mut DesignRoutes, tech: &Tech, name: &dyn Fn(usize) -> String, check: &mut dyn FnMut(usize, &mut NetShapes) -> Result<CheckLog, String>) -> Result<(), String> {
+/// the check on one net's shapes; an error stops the run (the first in net order).
+///
+/// The per-net checks run in parallel when the thread pool has more than one thread, as the
+/// reference's checker runs its per-net init and search under `omp parallel for`: each reads
+/// only its own net's shapes and the fixed shapes, and returns a log. The logs are applied
+/// serially in net order, as the reference's merge and write-back loops are, so the design does
+/// not depend on the thread count.
+pub fn connectivity_check(d: &mut DesignRoutes, tech: &Tech, name: &dyn Fn(usize) -> String, check: &(dyn Fn(usize, &mut NetShapes) -> Result<CheckLog, String> + Sync)) -> Result<(), String> {
     let s = crate::debug::stage("FlexDR::checkConnectivity/netShapes");
     let mut per = net_shapes(d);
     drop(s);
-    let nets: Vec<usize> = std::mem::take(&mut d.modified).into_iter().collect();
-    let mut logs: Vec<(usize, CheckLog)> = Vec::new();
+    let nets = std::mem::take(&mut d.modified);
     let s = crate::debug::stage("FlexDR::checkConnectivity/check");
-    for &n in &nets {
-        let Some((shapes, _)) = per.get_mut(&n) else { continue };
-        logs.push((n, check(n, shapes)?));
+    // The modified nets with shapes, in net order (`per` and `nets` are both ordered by net).
+    let mut work: Vec<(usize, &mut NetShapes)> = per.iter_mut().filter(|(n, _)| nets.contains(n)).map(|(&n, (shapes, _))| (n, shapes)).collect();
+    let results: Vec<Result<CheckLog, String>> = {
+        use rayon::prelude::*;
+        if rayon::current_num_threads() > 1 {
+            work.par_iter_mut().map(|(n, shapes)| check(*n, shapes)).collect()
+        } else {
+            work.iter_mut().map(|(n, shapes)| check(*n, shapes)).collect()
+        }
+    };
+    let mut logs: Vec<(usize, CheckLog)> = Vec::with_capacity(results.len());
+    for ((n, _), r) in work.iter().zip(results) {
+        logs.push((*n, r?));
     }
+    drop(work);
     drop(s);
     let _s = crate::debug::stage("FlexDR::checkConnectivity/apply");
     for phase in 0..3 {

@@ -179,6 +179,12 @@ pub fn stage(_name: &str) -> NoStage {
 #[cfg(not(feature = "odb"))]
 pub struct NoStage;
 
+/// A guard like the real stage's, so `drop(stage)` reads the same in either build.
+#[cfg(not(feature = "odb"))]
+impl Drop for NoStage {
+    fn drop(&mut self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1532,8 +1532,8 @@ fn check(cx: &DrCtx<'_>, routes: &mut DesignRoutes) -> Res<()> {
         })
     };
     let name = |n: usize| cx.d.design.nets[n].name.clone();
-    let mut check = |n: usize, shapes: &mut crate::dr::conn::NetShapes| crate::dr::conn::check_net(tech, shapes, &|pt, l| term_key(n, pt, l));
-    connectivity_check(routes, tech, &name, &mut check).map_err(|e| format!("connectivity check: {e}"))
+    let check = |n: usize, shapes: &mut crate::dr::conn::NetShapes| crate::dr::conn::check_net(tech, shapes, &|pt, l| term_key(n, pt, l));
+    connectivity_check(routes, tech, &name, &check).map_err(|e| format!("connectivity check: {e}"))
 }
 
 /// The write-out: the routes and the gcell grid into the database. The nets written.
