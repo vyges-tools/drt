@@ -502,13 +502,18 @@ pub fn apply_check_ops(d: &mut DesignRoutes, tech: &Tech, net: usize, name: &str
 /// design over all of them before the next; the modified set cleared. `check(net, shapes)` runs
 /// the check on one net's shapes; an error stops the run.
 pub fn connectivity_check(d: &mut DesignRoutes, tech: &Tech, name: &dyn Fn(usize) -> String, check: &mut dyn FnMut(usize, &mut NetShapes) -> Result<CheckLog, String>) -> Result<(), String> {
+    let s = crate::debug::stage("FlexDR::checkConnectivity/netShapes");
     let mut per = net_shapes(d);
+    drop(s);
     let nets: Vec<usize> = std::mem::take(&mut d.modified).into_iter().collect();
     let mut logs: Vec<(usize, CheckLog)> = Vec::new();
+    let s = crate::debug::stage("FlexDR::checkConnectivity/check");
     for &n in &nets {
         let Some((shapes, _)) = per.get_mut(&n) else { continue };
         logs.push((n, check(n, shapes)?));
     }
+    drop(s);
+    let _s = crate::debug::stage("FlexDR::checkConnectivity/apply");
     for phase in 0..3 {
         for (n, log) in &logs {
             let ops = match phase {
