@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 use crate::dr::guides::GCellGrid;
 use crate::dr::rules::{EolTable, LayerTables, NdrRule};
 use crate::polygon90::Rect;
-use crate::rtree::PackedRTree;
+use crate::rtree::{DynRTree, PackedRTree};
 use crate::tech::{LayerKind, Tech, TrackPattern};
 
 type P = (i32, i32);
@@ -187,42 +187,35 @@ enum Con {
 
 type CostBox = (Rect, Owner, Con);
 
-/// Entries that each lie on one track (a line, or a point), kept per track coordinate across the
-/// panel's direction; a query visits only the tracks it spans. Order within is irrelevant here
-/// (costs are summed, pins collected into ordered sets).
-#[derive(Debug, Clone, Default)]
-struct TrackIndex<T> {
-    horizontal: bool,
-    by: std::collections::BTreeMap<i32, Vec<(Rect, T)>>,
+/// A layer's region query (`FlexTAWorkerRegionQuery`'s per-layer `RTree`: `shapes`, `route_costs`,
+/// `via_costs`): the reference's quadratic R-tree, filled by single inserts and removed from by
+/// value, queried for boxes that touch. Its results come in that tree's order; the callers sum
+/// costs or collect pins into ordered sets, so the order does not move a result.
+///
+/// A per-track list scanned on each query cost a scan of every entry on the tracks a query spans,
+/// and a panel runs the length of the die; the tree visits only the nodes that touch the query.
+struct LayerTree<T> {
+    tree: DynRTree<T>,
 }
 
-impl<T: Copy + PartialEq> TrackIndex<T> {
-    fn new(horizontal: bool) -> TrackIndex<T> {
-        TrackIndex { horizontal, by: std::collections::BTreeMap::new() }
+impl<T: Copy + PartialEq> LayerTree<T> {
+    fn new() -> LayerTree<T> {
+        LayerTree { tree: DynRTree::new(Vec::new()) }
     }
-    fn key(&self, r: &Rect) -> i32 {
-        debug_assert!(if self.horizontal { r.yl == r.yh } else { r.xl == r.xh }, "an entry off a track");
-        if self.horizontal {
-            r.yl
-        } else {
-            r.xl
-        }
-    }
+    /// `insert(std::make_pair(box, value))`.
     fn push(&mut self, r: Rect, v: T) {
-        let k = self.key(&r);
-        self.by.entry(k).or_default().push((r, v));
+        self.tree.insert(r, v);
     }
+    /// `remove(std::make_pair(box, value))`: the first equal value in the tree's order.
     fn remove_one(&mut self, r: Rect, v: T) {
-        let k = self.key(&r);
-        if let Some(b) = self.by.get_mut(&k) {
-            if let Some(i) = b.iter().position(|e| e.0 == r && e.1 == v) {
-                b.swap_remove(i);
-            }
+        let id = self.tree.query(&r).into_iter().find(|(_, e)| e.0 == r && e.1 == v).map(|(i, _)| i);
+        if let Some(i) = id {
+            self.tree.remove(i);
         }
     }
-    fn query<'a>(&'a self, q: &'a Rect) -> impl Iterator<Item = &'a (Rect, T)> + 'a {
-        let (lo, hi) = if self.horizontal { (q.yl, q.yh) } else { (q.xl, q.xh) };
-        self.by.range(lo..=hi).flat_map(|(_, b)| b.iter()).filter(move |e| touches(&e.0, q))
+    /// `query(bgi::intersects(box), ...)`.
+    fn query<'a>(&'a self, q: &Rect) -> impl Iterator<Item = &'a (Rect, T)> + 'a {
+        self.tree.query(q).into_iter().map(|(_, e)| e)
     }
 }
 
@@ -306,9 +299,9 @@ pub struct Worker<'s, 'a> {
     iroutes: Vec<Iroute>,
     /// Ids of the iroutes the panel assigns (the rest are fixed context).
     own: Vec<usize>,
-    shapes: Vec<TrackIndex<(usize, usize)>>,
-    route_costs: Vec<TrackIndex<(Owner, Con)>>,
-    via_costs: Vec<TrackIndex<(Owner, Con)>>,
+    shapes: Vec<LayerTree<(usize, usize)>>,
+    route_costs: Vec<LayerTree<(Owner, Con)>>,
+    via_costs: Vec<LayerTree<(Owner, Con)>>,
     reassign: BTreeSet<(std::cmp::Reverse<u32>, usize)>,
     /// Iroutes assigned (each pop that is assigned, re-assignments too): the log's wire count.
     num_assigned: usize,
@@ -1406,10 +1399,9 @@ impl<'s, 'a> Worker<'s, 'a> {
 
     pub fn init(&mut self) {
         let n = self.tech().layers.len();
-        let h = self.horizontal;
-        self.shapes = (0..n).map(|_| TrackIndex::new(h)).collect();
-        self.route_costs = (0..n).map(|_| TrackIndex::new(h)).collect();
-        self.via_costs = (0..n).map(|_| TrackIndex::new(h)).collect();
+        self.shapes = (0..n).map(|_| LayerTree::new()).collect();
+        self.route_costs = (0..n).map(|_| LayerTree::new()).collect();
+        self.via_costs = (0..n).map(|_| LayerTree::new()).collect();
         self.init_tracks();
         self.init_fixed_objs();
         self.init_iroutes();
@@ -1567,6 +1559,47 @@ pub fn track_assignment(st: &mut TaState<'_>, trace: &mut Option<Vec<TaEvent>>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`FlexTAWorkerRegionQuery`: per-layer R-trees, insert / remove-by-value / intersects
+    /// query): the layer tree returns, as a multiset, exactly the live entries that touch the
+    /// query, and a removal by value takes ONE of several equal entries.
+    #[test]
+    fn the_layer_tree_answers_as_a_scan_of_its_live_entries() {
+        let mut t: LayerTree<(u32, u32)> = LayerTree::new();
+        let mut naive: Vec<(Rect, (u32, u32))> = Vec::new();
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m) as i32
+        };
+        for step in 0..3000 {
+            let op = next(10);
+            if op < 6 || naive.is_empty() {
+                // On a track (horizontal lines, some points), with repeated values.
+                let (y, a, len) = (next(20) * 100, next(5000), next(4) * next(400));
+                let e = (Rect { xl: a, yl: y, xh: a + len, yh: y }, ((next(3)) as u32, (next(2)) as u32));
+                t.push(e.0, e.1);
+                naive.push(e);
+            } else if op < 8 {
+                let e = naive[next(naive.len() as u64) as usize];
+                t.remove_one(e.0, e.1);
+                let k = naive.iter().position(|v| *v == e).unwrap();
+                naive.remove(k);
+            } else {
+                let (y, a) = (next(20) * 100, next(5000));
+                let q = Rect { xl: a, yl: y - next(300), xh: a + next(800), yh: y + next(300) };
+                let mut got: Vec<(Rect, (u32, u32))> = t.query(&q).copied().collect();
+                let mut want: Vec<(Rect, (u32, u32))> = naive.iter().filter(|e| touches(&e.0, &q)).copied().collect();
+                let key = |e: &(Rect, (u32, u32))| (e.0.xl, e.0.yl, e.0.xh, e.0.yh, e.1);
+                got.sort_by_key(key);
+                want.sort_by_key(key);
+                assert_eq!(got, want, "step {step}");
+            }
+        }
+        assert!(!naive.is_empty());
+    }
     use crate::tech::{Dir, Layer, SpacingTable, ViaDef};
 
     fn r(xl: i32, yl: i32, xh: i32, yh: i32) -> Rect {
@@ -1616,9 +1649,9 @@ mod tests {
         let rb = st.input.grid.die;
         let mut w = Worker { st, route_box: rb, ext_box: rb, horizontal: true, iter, hard: false, track_locs: Vec::new(), iroutes: Vec::new(), own: Vec::new(), shapes: Vec::new(), route_costs: Vec::new(), via_costs: Vec::new(), reassign: BTreeSet::new(), num_assigned: 0, trace: None };
         let n = st.input.tech.layers.len();
-        w.shapes = (0..n).map(|_| TrackIndex::new(true)).collect();
-        w.route_costs = (0..n).map(|_| TrackIndex::new(true)).collect();
-        w.via_costs = (0..n).map(|_| TrackIndex::new(true)).collect();
+        w.shapes = (0..n).map(|_| LayerTree::new()).collect();
+        w.route_costs = (0..n).map(|_| LayerTree::new()).collect();
+        w.via_costs = (0..n).map(|_| LayerTree::new()).collect();
         w.init_tracks();
         w
     }
