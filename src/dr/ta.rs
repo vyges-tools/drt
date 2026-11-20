@@ -1414,6 +1414,11 @@ impl<'s, 'a> Worker<'s, 'a> {
         self.init_fixed_objs();
         self.init_iroutes();
         self.init_costs();
+        // The trace events only: built when tracing (`own.contains` is linear in the worker's
+        // iroutes, so building them for every iroute untraced was quadratic per worker).
+        if self.trace.is_none() {
+            return;
+        }
         for (l, t) in self.track_locs.clone().iter().enumerate() {
             if !t.is_empty() {
                 self.emit(TaEvent::Tracks { layer: l, count: t.len(), first: t[0], last: *t.last().expect("a track") });
