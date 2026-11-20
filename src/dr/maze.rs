@@ -182,6 +182,12 @@ pub struct MazeState {
     pub guide: Vec<bool>,
     z_heights: Vec<i32>,
     pub die: crate::polygon90::Rect,
+    /// Nodes whose source/destination flag was written since the last `reset_status`, and nodes
+    /// whose previous direction was written since the last `reset_prev_dirs`: a reset clears only
+    /// those (the whole grid once most of it was touched). The reference clears its packed bit
+    /// vectors whole (`resetStatus`, `resetPrevNodeDir`); the state after a reset is the same.
+    touched_sd: Vec<usize>,
+    touched_prev: Vec<usize>,
 }
 
 impl MazeState {
@@ -196,7 +202,7 @@ impl MazeState {
                 h
             })
             .collect();
-        MazeState { src: vec![false; n], dst: vec![false; n], prev_dir: vec![0; n], guide: vec![false; n], z_heights, die }
+        MazeState { src: vec![false; n], dst: vec![false; n], prev_dir: vec![0; n], guide: vec![false; n], z_heights, die, touched_sd: Vec::new(), touched_prev: Vec::new() }
     }
 
     /// Not following guides: every node counts as inside a guide (the per-net guide marking
@@ -205,21 +211,44 @@ impl MazeState {
         self.guide.iter_mut().for_each(|g| *g = true);
     }
     pub fn reset_status(&mut self) {
-        self.src.iter_mut().for_each(|v| *v = false);
-        self.dst.iter_mut().for_each(|v| *v = false);
+        if self.touched_sd.len() > self.src.len() / 4 {
+            self.src.iter_mut().for_each(|v| *v = false);
+            self.dst.iter_mut().for_each(|v| *v = false);
+        } else {
+            for &k in &self.touched_sd {
+                self.src[k] = false;
+                self.dst[k] = false;
+            }
+        }
+        self.touched_sd.clear();
         self.reset_prev_dirs();
     }
     pub fn reset_prev_dirs(&mut self) {
-        self.prev_dir.iter_mut().for_each(|v| *v = 0);
+        if self.touched_prev.len() > self.prev_dir.len() / 4 {
+            self.prev_dir.iter_mut().for_each(|v| *v = 0);
+        } else {
+            for &k in &self.touched_prev {
+                self.prev_dir[k] = 0;
+            }
+        }
+        self.touched_prev.clear();
+    }
+    fn write_src(&mut self, k: usize, on: bool) {
+        self.src[k] = on;
+        self.touched_sd.push(k);
+    }
+    fn write_dst(&mut self, k: usize, on: bool) {
+        self.dst[k] = on;
+        self.touched_sd.push(k);
     }
     pub fn z_height(&self, z: i32) -> i32 {
         self.z_heights[z as usize]
     }
     pub fn set_src_i(&mut self, g: &GridGraph, i: Idx, on: bool) {
-        self.src[g.idx(i.0 as usize, i.1 as usize, i.2 as usize)] = on;
+        self.write_src(g.idx(i.0 as usize, i.1 as usize, i.2 as usize), on);
     }
     pub fn set_dst_i(&mut self, g: &GridGraph, i: Idx, on: bool) {
-        self.dst[g.idx(i.0 as usize, i.1 as usize, i.2 as usize)] = on;
+        self.write_dst(g.idx(i.0 as usize, i.1 as usize, i.2 as usize), on);
     }
     /// Whether the edge leaving `i` in `d` exists.
     pub fn has_edge(&self, g: &GridGraph, i: Idx, d: Dir6) -> bool {
@@ -312,11 +341,11 @@ impl Maze<'_, '_, '_> {
     }
     pub fn set_src(&mut self, i: Idx, on: bool) {
         let k = self.k(i);
-        self.st.src[k] = on;
+        self.st.write_src(k, on);
     }
     pub fn set_dst(&mut self, i: Idx, on: bool) {
         let k = self.k(i);
-        self.st.dst[k] = on;
+        self.st.write_dst(k, on);
     }
     fn prev_dir_at(&self, i: Idx) -> Option<Dir6> {
         dir_of(self.st.prev_dir[self.k(i)])
@@ -324,6 +353,7 @@ impl Maze<'_, '_, '_> {
     fn set_prev_dir(&mut self, i: Idx, d: Dir6) {
         let k = self.k(i);
         self.st.prev_dir[k] = code(Some(d));
+        self.st.touched_prev.push(k);
     }
 
     /// The edge leaving `i` in `d`, as stored: west, south and down are the neighbour's.
@@ -758,6 +788,34 @@ impl Maze<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`FlexGridGraph::resetStatus` / `resetPrevNodeDir`): after a reset the source,
+    /// destination and previous-direction state is all clear, as a fresh state's, whether few
+    /// nodes were written (only those cleared) or most of the grid was (the whole grid cleared).
+    #[test]
+    fn a_reset_leaves_the_maze_state_as_a_fresh_one() {
+        use crate::dr::drw::{GridGraph, Node};
+        use crate::tech::{Dir, Layer, LayerKind};
+        let routing = |dir| Layer { kind: LayerKind::Routing, dir, width: 100, pitch: 100, ..Default::default() };
+        let tech = Tech { layers: vec![Layer::default(), Layer::default(), routing(Dir::Horizontal), Layer { kind: LayerKind::Cut, ..Default::default() }, routing(Dir::Vertical)], ..Default::default() };
+        let g = GridGraph { xs: (0..10).map(|i| i * 100).collect(), ys: (0..10).map(|i| i * 100).collect(), zs: vec![2, 4], nodes: vec![Node::default(); 200] };
+        let die = crate::polygon90::Rect::new(0, 0, 900, 900);
+        let fresh = MazeState::new(&tech, &g, die);
+        for writes in [3usize, 150] {
+            let mut st = MazeState::new(&tech, &g, die);
+            for w in 0..writes {
+                let k = (w * 37) % 200;
+                st.write_src(k, true);
+                st.write_dst((k + 11) % 200, true);
+                st.prev_dir[k] = code(Some(Dir6::N));
+                st.touched_prev.push(k);
+            }
+            assert!(st.src.iter().any(|&v| v) && st.prev_dir.iter().any(|&v| v != 0));
+            st.reset_status();
+            assert_eq!((&st.src, &st.dst, &st.prev_dir), (&fresh.src, &fresh.dst, &fresh.prev_dir), "{writes} writes");
+            assert!(st.touched_sd.is_empty() && st.touched_prev.is_empty());
+        }
+    }
 
     fn wg(cost: u32, dist: i32, z: i32, path_cost: u32, x: i32) -> WGrid {
         WGrid { x, y: 0, z, path_cost, cost, vlen_x: 0, vlen_y: 0, dist, prev_via_up: false, tlen: 0, buf: 0, src_taper: None }
