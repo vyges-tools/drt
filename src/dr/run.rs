@@ -1229,6 +1229,9 @@ fn route_worker(cx: &DrCtx<'_>, pv: &PaView, routes: &DesignRoutes, iter: usize,
     };
     let mut nets = built;
     if nets.is_empty() {
+        // `FlexDRWorker::init`: no nets in ALL or INCR mode sets `skipRouting_` (nothing written back).
+        let mut wm = wm;
+        wm.skip_routing = crate::dr::flow::skips_routing(true, args.ripup);
         return Ok((*w, Vec::new(), Vec::new(), wm, false));
     }
     // NEARDRC (`initRipUpNetsFromMarkers`, in initNets before any cost): the nets near a starting

@@ -293,6 +293,10 @@ pub struct WorkerMarkers {
     pub need_recheck: bool,
     /// The count it starts from.
     pub init_num: usize,
+    /// The worker has no nets while ripping up everything (or the nets without routing):
+    /// `FlexDRWorker::init` sets `skipRouting_` when `initNets` leaves `nets_` empty in ALL or
+    /// INCR mode, and `end()` then writes nothing back, so the design keeps its markers in the box.
+    pub skip_routing: bool,
 }
 
 /// The worker's markers from the design's in its check box (`iter`: 0-based).
@@ -300,7 +304,7 @@ pub fn worker_markers(in_drc: Vec<Marker>, iter: usize) -> WorkerMarkers {
     let need_recheck = in_drc.iter().any(|m| m.rule == Rule::Recheck);
     let markers: Vec<Marker> = in_drc.into_iter().filter(|m| m.rule != Rule::Recheck).map(|m| m.copied()).collect();
     let init_num = if iter <= 1 && markers.is_empty() { 1 } else { markers.len() };
-    WorkerMarkers { markers, need_recheck, init_num }
+    WorkerMarkers { markers, need_recheck, init_num, skip_routing: false }
 }
 
 impl WorkerMarkers {
@@ -315,8 +319,18 @@ pub fn in_check_box(markers: &[Marker], drc: &Rect) -> Vec<Marker> {
     markers.iter().filter(|m| m.bbox.xh >= drc.xl && m.bbox.xl <= drc.xh && m.bbox.yh >= drc.yl && m.bbox.yl <= drc.yh).cloned().collect()
 }
 
+/// `FlexDRWorker::init`'s `skipRouting_` after `initNets`: no nets while ripping up everything or
+/// routing the nets without routing (ALL, INCR). In DRC, NEARDRC and VIASWAP mode the worker goes on.
+pub fn skips_routing(no_nets: bool, ripup: RipUp) -> bool {
+    no_nets && matches!(ripup, RipUp::All | RipUp::Incr)
+}
+
 /// Whether a worker's result is written back (`best`: its markers in the check box at its end).
 pub fn written_back(iter: usize, ripup: RipUp, wm: &WorkerMarkers, best: usize) -> bool {
+    // `FlexDRWorker::end`'s first test: a worker that skipped routing writes nothing back.
+    if wm.skip_routing {
+        return false;
+    }
     if iter > 0 && wm.init_num == 0 && !wm.need_recheck {
         return false;
     }
@@ -805,6 +819,20 @@ mod tests {
         assert!(written_back(0, RipUp::All, &worker_markers(Vec::new(), 0), 99));
         // Incremental: neither cap — written back however many markers it ends with.
         assert!(written_back(2, RipUp::Incr, &wm, 99));
+    }
+
+    /// Rule (`FlexDRWorker::init` then `end`): a worker left with no nets by `initNets` in ALL or
+    /// INCR mode sets `skipRouting_` and `end()` returns at once, writing nothing back (the design
+    /// keeps its markers in the box), whatever its marker counts; in the other modes it goes on.
+    #[test]
+    fn a_worker_with_no_nets_skips_routing_and_writes_nothing_back() {
+        assert!(skips_routing(true, RipUp::All) && skips_routing(true, RipUp::Incr));
+        assert!(!skips_routing(true, RipUp::Drc) && !skips_routing(true, RipUp::NearDrc) && !skips_routing(true, RipUp::ViaSwap));
+        assert!(!skips_routing(false, RipUp::All) && !skips_routing(false, RipUp::Incr));
+        let mut wm = worker_markers(Vec::new(), 0);
+        assert!(written_back(0, RipUp::All, &wm, 0), "routed: written back");
+        wm.skip_routing = true;
+        assert!(!written_back(0, RipUp::All, &wm, 0) && !written_back(0, RipUp::Incr, &wm, 0));
     }
 
     /// Rule (`FlexDRWorker::end`): a via-swap worker (`RipUpMode::VIASWAP`, the max-spacing
