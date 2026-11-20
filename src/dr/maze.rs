@@ -119,9 +119,12 @@ impl WGrid {
     }
 }
 
-/// A DIAGNOSTIC (`VYGD_ROUTECL`, dr::route): while set, each search prints every wavefront pop to
-/// stderr as `pop|x|y|z|cost|dist|path cost|last dir code`.
-pub(crate) static POP_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// A DIAGNOSTIC (`VYGD_ROUTECL`, dr::route): while set on this thread, each search prints
+    /// every wavefront pop to stderr as `pop|x|y|z|cost|dist|path cost|last dir code`. Per thread,
+    /// so the other workers of a parallel batch stay silent.
+    pub(crate) static POP_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 impl Ord for WGrid {
     /// Greater pops first.
@@ -729,7 +732,7 @@ impl Maze<'_, '_, '_> {
             let src_taper = if self.ndr.is_some() { self.taper_at.get(&i).copied() } else { None };
             heap.push(WGrid { x: i.0, y: i.1, z: i.2, path_cost: 0, cost: self.est_cost(i, d1, d2, None), vlen_x: MAX, vlen_y: MAX, dist, prev_via_up: true, tlen: MAX, buf: 0, src_taper });
         }
-        let pop_trace = POP_TRACE.load(std::sync::atomic::Ordering::Relaxed);
+        let pop_trace = POP_TRACE.with(|c| c.get());
         while let Some(g) = heap.pop() {
             let i = (g.x, g.y, g.z);
             if pop_trace {

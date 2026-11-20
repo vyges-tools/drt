@@ -79,7 +79,17 @@ const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
 const PIN_TOKEN: &str = "@OPENROAD_PIN@";
 
 fn describe() -> String {
-    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN).replace("@THREADS@", vyges_loom::threads::DESCRIBE_THREADS)
+    let text = DESCRIBE.replace(PIN_TOKEN, CRATE_PIN).replace("@THREADS@", vyges_loom::threads::DESCRIBE_THREADS);
+    // The debug groups (VYGES_DEBUG) and stage times, from the one table the engine reads.
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(mut d) => {
+            d["debug"] = vyges_events::debug::describe_debug_groups(vyges_drt::debug::TOOL, &vyges_drt::debug::debug_groups());
+            d["debug"]["stage_times_env"] = serde_json::json!("VYGES_STAGE_TIMES");
+            d["debug"]["box_env"] = serde_json::json!("VYGES_DRT_DEBUG_BOX");
+            serde_json::to_string_pretty(&d).unwrap_or(text)
+        }
+        Err(_) => text,
+    }
 }
 
 /// ⚠️ **Two commands, one descriptor.** `invocation` is `detailed_route` — what a caller that
@@ -507,6 +517,7 @@ pub fn main() -> ExitCode {
         eprintln!("vyges-drt: thread pool: {e}");
         return ExitCode::from(2);
     }
+    vyges_drt::debug::init();
     match args.first().map(String::as_str) {
         Some("--version") => {
             println!("vyges-drt {} ({})\nCopyright (c) Vyges. Apache-2.0.", env!("CARGO_PKG_VERSION"), env!("VYGES_GIT_SHA"));

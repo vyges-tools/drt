@@ -18,9 +18,11 @@ categories = ["science", "command-line-utilities"]
 suite = ["odb"]
 # The design database reader. OFF by default: the geometry and the access-point rules build and
 # test with no C++ dependency.
-odb = ["dep:vyges-opendb", "dep:vyges-events", "dep:vyges-loom", "dep:mimalloc", "dep:libmimalloc-sys"]
+odb = ["dep:vyges-opendb", "dep:vyges-events", "dep:vyges-loom", "dep:mimalloc", "dep:libmimalloc-sys", "dep:serde_json"]
 
 [dependencies]
+# `--describe` adds the debug-group table to the descriptor.
+serde_json = { version = "1", optional = true }
 # The search-and-repair batches: each batch's workers routed in parallel (they only read the
 # design), written back in batch order, as FlexDR::processWorkersBatch / endWorkersBatch do.
 rayon = "1"

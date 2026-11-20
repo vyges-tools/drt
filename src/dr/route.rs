@@ -357,7 +357,7 @@ pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCf
     if reroutes == 0 && mcfg.ripup_all {
         init_maze_cost_via_helper(w, net, false, ndr, cx.is_macro_term);
     }
-    route_cost_list(w, net.id, reroutes);
+    route_cost_list(w, net.id, reroutes, &cx.route_box);
     maze_net_init(w, st, net, cx);
     edge_watch(w, "after-maze-net-init");
     let (searches, figs, ok) = route_net_search(w, st, mcfg, net, cx);
@@ -372,12 +372,15 @@ pub fn reroute_net(w: &mut CostWorker<'_, '_>, st: &mut MazeState, mcfg: &MazeCf
     (searches, figs)
 }
 
-/// A DIAGNOSTIC, inert unless `VYGD_EDGEWATCH=z,x,y,d`: that one edge's costs, to stderr as
+/// Debug group `drt:vy_edgewatch` (old name `VYGD_EDGEWATCH=z,x,y,d`, which names the edge): that one edge's costs, to stderr as
 /// `ew|<tag>|blocked|fixed|route|marker` (d: 0 east, 1 north, 2 up).
 pub fn edge_watch(w: &CostWorker<'_, '_>, tag: &str) {
     static WATCH: std::sync::OnceLock<Option<(usize, usize, usize, usize)>> = std::sync::OnceLock::new();
     let Some((z, x, y, d)) = *WATCH.get_or_init(|| {
-        let v: Vec<usize> = std::env::var("VYGD_EDGEWATCH").ok()?.split(',').filter_map(|s| s.parse().ok()).collect();
+        if !crate::debug::on(crate::debug::Group::EdgeWatch) {
+            return None;
+        }
+        let v: Vec<usize> = crate::debug::value(crate::debug::Group::EdgeWatch)?.split(',').filter_map(|s| s.parse().ok()).collect();
         (v.len() == 4).then(|| (v[0], v[1], v[2], v[3]))
     }) else {
         return;
@@ -387,26 +390,35 @@ pub fn edge_watch(w: &CostWorker<'_, '_>, tag: &str) {
     eprintln!("ew|{tag}|{}|{}|{}|{}", u32::from(g.is_blocked(x, y, z, dir)), g.fixed_cost_adj(x, y, z, dir), g.route_cost_adj(x, y, z, dir), g.marker_cost_adj(x, y, z, dir));
 }
 
-/// A DIAGNOSTIC, inert unless `VYGD_ROUTECL=<worker net id>,<reroutes>[,<nth match>]`: before
-/// that net's route (its old route ripped up, `mazeNetInit` not yet run, where the reference's
+/// Debug group `drt:vy_route_cost` (old name `VYGD_ROUTECL=<worker net id>,<reroutes>[,<nth match>]`,
+/// which picks the net; without it, every net), in the boxed worker (`VYGD_ROUTECL_BOX` or
+/// `VYGES_DRT_DEBUG_BOX`): before that net's route (its old route ripped up, `mazeNetInit` not yet run, where the reference's
 /// trace writes its `route` record), every edge with a block or a cost, to stderr as
 /// `rcl|z|x|y|d|blocked|fixed|route|marker` (d: 0 east, 1 north, 2 up). With an nth match (from
 /// 1; 0 for every match), only that match is listed, and its searches print their wavefront pops
 /// (maze::POP_TRACE).
-fn route_cost_list(w: &CostWorker<'_, '_>, net_id: usize, reroutes: u32) {
+fn route_cost_list(w: &CostWorker<'_, '_>, net_id: usize, reroutes: u32, route_box: &Rect) {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    static WANT: std::sync::OnceLock<Option<(String, Option<usize>)>> = std::sync::OnceLock::new();
+    static WANT: std::sync::OnceLock<Option<(Option<String>, Option<usize>)>> = std::sync::OnceLock::new();
     static SEEN: AtomicUsize = AtomicUsize::new(0);
-    crate::dr::maze::POP_TRACE.store(false, Ordering::Relaxed);
+    crate::dr::maze::POP_TRACE.with(|c| c.set(false));
     edge_watch(w, &format!("{net_id}|{reroutes}"));
     let Some((want, nth)) = WANT.get_or_init(|| {
-        let v = std::env::var("VYGD_ROUTECL").ok()?;
+        if !crate::debug::on(crate::debug::Group::RouteCost) {
+            return None;
+        }
+        let Some(v) = crate::debug::value(crate::debug::Group::RouteCost) else {
+            return Some((None, None));
+        };
         let f: Vec<&str> = v.split(',').collect();
-        Some((f[..f.len().min(2)].join(","), f.get(2).and_then(|n| n.parse().ok())))
+        Some((Some(f[..f.len().min(2)].join(",")), f.get(2).and_then(|n| n.parse().ok())))
     }) else {
         return;
     };
-    if *want != format!("{net_id},{reroutes}") {
+    if want.as_ref().is_some_and(|wn| *wn != format!("{net_id},{reroutes}")) {
+        return;
+    }
+    if !crate::debug::box_wanted(crate::debug::Group::RouteCost, route_box) {
         return;
     }
     let seen = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -414,9 +426,9 @@ fn route_cost_list(w: &CostWorker<'_, '_>, net_id: usize, reroutes: u32) {
     if nth.is_some_and(|n| n != 0 && n != seen) {
         return;
     }
-    crate::dr::maze::POP_TRACE.store(nth.is_some(), Ordering::Relaxed);
+    crate::dr::maze::POP_TRACE.with(|c| c.set(nth.is_some()));
     let g = &w.g;
-    eprintln!("rcl-begin|{net_id}|{reroutes}|{seen}");
+    eprintln!("rcl-begin|{net_id}|{reroutes}|{}", CUR_NET.with(|c| c.borrow().clone()));
     for z in 0..g.zs.len() {
         for x in 0..g.xs.len() {
             for y in 0..g.ys.len() {
@@ -433,6 +445,69 @@ fn route_cost_list(w: &CostWorker<'_, '_>, net_id: usize, reroutes: u32) {
             }
         }
     }
+}
+
+thread_local! {
+    /// DIAGNOSTIC: the name of the net this thread is routing (for the trace lines).
+    pub(crate) static CUR_NET: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// DIAGNOSTIC: set while this thread runs the worker `drt:vy_stage_cost` traces.
+    pub(crate) static STAGE_CL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Debug group `drt:vy_queue` (old name `VYGD_QUEUE_BOX=<xl>,<yl>`): whether this route box's
+/// queue is traced. One line per route (`q|R|<net>|<reroutes>|<markers after its check>|<shapes,
+/// sorted>`) and per check (`q|C|<owner>|<markers>`), in queue order; after each, its markers
+/// (`q|M`, `q|X` with the rule and side boxes) and the entries it pushed (`q|P`).
+pub fn queue_trace_wanted(route_box: &Rect) -> bool {
+    crate::debug::box_wanted(crate::debug::Group::Queue, route_box)
+}
+
+/// DIAGNOSTIC: one route shape as the worker traces print it (`s|layer|lower|upper|width`,
+/// `v|via|origin`, `p|layer|box`).
+pub fn fig_str(tech: &crate::tech::Tech, g: &DrFig) -> String {
+    match *g {
+        DrFig::Seg { layer, begin, end, width, .. } => {
+            let (a, b) = if begin <= end { (begin, end) } else { (end, begin) };
+            format!("s|{}|{},{}|{},{}|{width}", tech.layers[layer].name, a.0, a.1, b.0, b.1)
+        }
+        DrFig::Via { via, origin, .. } => format!("v|{}|{},{}", tech.via_defs[via].name, origin.0, origin.1),
+        DrFig::Patch { layer, origin, offset } => format!("p|{}|{},{},{},{}", tech.layers[layer].name, origin.0 + offset.xl, origin.1 + offset.yl, origin.0 + offset.xh, origin.1 + offset.yh),
+    }
+}
+
+/// Debug group `drt:vy_stage_cost` (old name `VYGD_STAGECL_BOX=<xl>,<yl>`): whether this route
+/// box's cost stages are traced.
+pub fn stage_cl_wanted(route_box: &Rect) -> bool {
+    crate::debug::box_wanted(crate::debug::Group::StageCost, route_box)
+}
+
+/// DIAGNOSTIC: with [`STAGE_CL`] on, every edge with a block or a cost, to stderr as
+/// `scl|<stage>|z|x|y|d|blocked|fixed|route|marker`, the stage's lines bracketed by `scl-begin|<stage>`.
+pub fn stage_cost_list(w: &CostWorker<'_, '_>, stage: &str) {
+    if !STAGE_CL.with(|c| c.get()) {
+        return;
+    }
+    use std::io::Write;
+    let g = &w.g;
+    let mut o = String::new();
+    o += &format!("scl-begin|{stage}\n");
+    for z in 0..g.zs.len() {
+        for x in 0..g.xs.len() {
+            for y in 0..g.ys.len() {
+                let nd = g.nodes[g.idx(x, y, z)];
+                for (d, (has, dir)) in [(nd.east, Dir6::E), (nd.north, Dir6::N), (nd.up, Dir6::U)].into_iter().enumerate() {
+                    if !has {
+                        continue;
+                    }
+                    let (b, f, r, m) = (u32::from(g.is_blocked(x, y, z, dir)), g.fixed_cost_adj(x, y, z, dir), g.route_cost_adj(x, y, z, dir), g.marker_cost_adj(x, y, z, dir));
+                    if b + f + r + m > 0 {
+                        o += &format!("scl|{stage}|{z}|{x}|{y}|{d}|{b}|{f}|{r}|{m}\n");
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::io::stderr().lock().write_all(o.as_bytes());
 }
 
 /// A net's end: its pins' costs back (vias kept), its guides off, its access points costed for

@@ -100,19 +100,30 @@ pub fn detailed_route(db: &mut Db, tech: &Tech, opts: &Options) -> Res<Summary> 
 
 /// [`detailed_route`], each stage writing its log lines to `log` as it runs.
 pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink) -> Res<Summary> {
+    // Stage lines (VYGES_STAGE_TIMES) carry the reference's function names.
+    let s = crate::debug::stage("io::Parser::readDb");
     let r = init_design_io(db, tech, opts, log)?;
+    drop(s);
     // TritonRoute::main stops here, between initDesign and pin access, when no net could be
     // routed: DRT-0040, nothing run and nothing written back.
     if !has_routable_nets(db) {
         log(Line::Warn(40, NO_ROUTABLE_NET.into()));
         return Ok(Summary::no_routable_net(r.skipped_rules, r.lef58_not_checked));
     }
+    let s = crate::debug::stage("FlexPA::main");
     let d = pa_main(db, r, log)?;
+    drop(s);
+    let s = crate::debug::stage("GuideProcessor::process");
     let g = init_guide(db, &d, log)?;
     let p = prep(&d);
+    drop(s);
+    let s = crate::debug::stage("FlexTA::main");
     let t = ta(&d, &g, &p, log);
+    drop(s);
     let end = opts.end_iteration.unwrap_or(crate::dr::flow::END_ITERATION);
+    let s = crate::debug::stage("FlexDR::main");
     let (routes, markers_by_iteration, flow_by_iteration, area_patches_dropped_no_owner) = dr(&d, &g, &p, &t, end, opts.max_spacing_trace, log)?;
+    drop(s);
     if area_patches_dropped_no_owner > 0 {
         log(Line::OwnWarnCode("DRT-PATCH-DROPPED", area_patches_dropped_warning(area_patches_dropped_no_owner)));
     }
@@ -120,7 +131,9 @@ pub fn detailed_route_logged(db: &mut Db, tech: &Tech, opts: &Options, log: Sink
     let markers = routes.markers().count();
     // The writer's (`fillConnFigs`).
     log(Line::Info(180, "Post processing.".into()));
+    let s = crate::debug::stage("io::Writer::updateDb");
     let nets_written = end_fr(db, &d, &g, &p, &routes)?;
+    drop(s);
     let routed_before = d.initial.iter().filter(|r| r.is_some()).count();
     Ok(Summary { iterations, markers, markers_by_iteration, flow_by_iteration, nets_written, routed_before, rerouted: routes.rerouted.len(), skipped_rules: d.skipped_rules.clone(), lef58_not_checked: d.lef58_not_checked.clone(), area_patches_dropped_no_owner, no_routable_net: false })
 }
@@ -789,7 +802,9 @@ impl DrCtx<'_> {
 /// The routes, the markers standing after each iteration run, and each iteration's flow.
 pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, max_spacing_trace: bool, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>, usize)> {
     log(Line::Info(187, "Start routing data preparation.".into()));
+    let s = crate::debug::stage("FlexDR::init");
     let mut cx = dr_init(d, g, p, t);
+    drop(s);
     let mut pa_reruns_seen = 0;
     log(Line::Info(194, "Start detail routing.".into()));
     let incremental = d.initial.iter().any(Option::is_some);
@@ -820,7 +835,9 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
         // flow that resets and sets it), read at the start of every row that does not rip up all.
         args.size = clip.size(&row, increase_clip);
         args.ripup = crate::dr::flow::effective_ripup(args.ripup, incremental, iter);
+        let s = crate::debug::stage(&format!("FlexDR::searchRepair/{iter}"));
         search_repair(&cx, &mut routes, &mut flow, iter, &args, &mut increase_clip, &mut max_spacing, &mut *log)?;
+        drop(s);
         // The pass re-ran pin access: every later worker reads it (`updateDirtyPAData` writes it
         // into the database).
         if max_spacing.pa_reruns != pa_reruns_seen {
@@ -990,9 +1007,12 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
     if flow == Flow::Optimization {
         *increase_clip = false;
     }
-    for group in batches {
+    for (b, group) in batches.into_iter().enumerate() {
         let jobs: Vec<(WorkerBoxes, crate::dr::flow::IterArgs)> = group.into_iter().map(|w| (w, *args)).collect();
+        let s = crate::debug::stage(&format!("FlexDR::processWorkersBatch/{iter}/{b}"));
         let results = route_batch(cx, routes, iter, ripup_all, &jobs);
+        drop(s);
+        let s = crate::debug::stage(&format!("FlexDR::endWorkersBatch/{iter}/{b}"));
         cx.log_skipped(&mut *log);
         let results = results?;
         if flow == Flow::Optimization && results.iter().any(|r| r.4) {
@@ -1002,14 +1022,17 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
         for (w, routed, markers, wm, _) in &results {
             let best = in_check_box(markers, &w.drc).len();
             let wb = written_back(iter, args.ripup, wm, best);
-            vygw_worker(cx, iter, w, routed.len(), wm.init_num, wb, &in_check_box(markers, &w.drc));
+            vygw_worker(cx, iter, w, routed, wm.init_num, wb, &in_check_box(markers, &w.drc));
             if !wb {
                 continue;
             }
             changed |= best != wm.init_num;
             end_worker(cx, routes, w, routed, markers, iter);
         }
-        vygw_line(&format!("VYGW|b|{iter}|{}", routes.markers().count()));
+        drop(s);
+        if crate::debug::on(crate::debug::Group::WorkerRecord) {
+            vygw_line(&format!("VYGW|b|{iter}|{}", routes.markers().count()));
+        }
     }
     if flow == Flow::Guides {
         flow_state.last_effective = changed;
@@ -1017,7 +1040,7 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
     check_then_fix_max_spacing(cx, routes, flow_state, max_spacing, log)
 }
 
-// Debug option, write-only (outputs identical with it on and off): with VYGW_OUT set, one record per
+// Debug group `drt:vy_worker_record` (old name VYGW_OUT), write-only (outputs identical with it on and off): one record per
 // worker at its batch's write-back, in batch order, and the design's marker count after each batch:
 //   VYGW|w|<iter>|<route box xl,yl,xh,yh>|<routed nets>|<starting markers>|<best markers>|<written>|<name@layer=n;...>
 //   VYGW|b|<iter>|<design markers>
@@ -1026,14 +1049,19 @@ fn search_repair(cx: &DrCtx<'_>, routes: &mut DesignRoutes, flow_state: &mut Flo
 fn vygw_line(l: &str) {
     use std::io::Write;
     static OUT: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
-    let o = OUT.get_or_init(|| std::env::var_os("VYGW_OUT").map(|f| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f).expect("VYGW_OUT"))));
-    if let Some(m) = o {
-        writeln!(m.lock().expect("vygw"), "{l}").expect("vygw write");
+    if !crate::debug::on(crate::debug::Group::WorkerRecord) {
+        return;
+    }
+    let o = OUT.get_or_init(|| crate::debug::worker_record_path().map(|f| std::sync::Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(f).expect("worker record file"))));
+    match o {
+        Some(m) => writeln!(m.lock().expect("vygw"), "{l}").expect("vygw write"),
+        None => eprintln!("{l}"),
     }
 }
 
-fn vygw_worker(cx: &DrCtx<'_>, iter: usize, w: &WorkerBoxes, nets: usize, init: usize, written: bool, best: &[Marker]) {
-    if std::env::var_os("VYGW_OUT").is_none() {
+fn vygw_worker(cx: &DrCtx<'_>, iter: usize, w: &WorkerBoxes, routed: &[(usize, Vec<DrFig>)], init: usize, written: bool, best: &[Marker]) {
+    let nets = routed.len();
+    if !crate::debug::on(crate::debug::Group::WorkerRecord) {
         return;
     }
     let mut h: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -1043,6 +1071,33 @@ fn vygw_worker(cx: &DrCtx<'_>, iter: usize, w: &WorkerBoxes, nets: usize, init: 
     let hs: Vec<String> = h.iter().map(|((n, l), c)| format!("{n}@{l}={c}")).collect();
     let r = &w.route;
     vygw_line(&format!("VYGW|w|{iter}|{},{},{},{}|{nets}|{init}|{}|{}|{}", r.xl, r.yl, r.xh, r.yh, best.len(), written as u8, hs.join(";")));
+    // `drt:vy_worker_detail` (old name VYGW_BOX=<xl>,<yl>): the boxed worker's detail, after its
+    // record: per routed net (its order here) its shapes, sorted (s|layer|lower point|upper
+    // point|width, v|via|origin, p|layer|box), and its best markers, sorted (name|layer|box).
+    if !crate::debug::box_wanted(crate::debug::Group::WorkerDetail, r) {
+        return;
+    }
+    let tech = &cx.p.tech;
+    for (k, (n, figs)) in routed.iter().enumerate() {
+        let mut f: Vec<String> = figs
+            .iter()
+            .map(|g| match *g {
+                DrFig::Seg { layer, begin, end, width, .. } => {
+                    let (a, b) = if begin <= end { (begin, end) } else { (end, begin) };
+                    format!("s|{}|{},{}|{},{}|{width}", tech.layers[layer].name, a.0, a.1, b.0, b.1)
+                }
+                DrFig::Via { via, origin, .. } => format!("v|{}|{},{}", tech.via_defs[via].name, origin.0, origin.1),
+                DrFig::Patch { layer, origin, offset } => format!("p|{}|{},{},{},{}", tech.layers[layer].name, origin.0 + offset.xl, origin.1 + offset.yl, origin.0 + offset.xh, origin.1 + offset.yh),
+            })
+            .collect();
+        f.sort();
+        vygw_line(&format!("VYGW|dn|{k}|{}|{}|{}", cx.d.design.nets[*n].name, figs.len(), f.join(";")));
+    }
+    let mut ms: Vec<String> = best.iter().map(|m| format!("{}|{}|{},{},{},{}", crate::dr::log::viol_name(m.rule), tech.layers[m.layer].name, m.bbox.xl, m.bbox.yl, m.bbox.xh, m.bbox.yh)).collect();
+    ms.sort();
+    for m in ms {
+        vygw_line(&format!("VYGW|dm|{m}"));
+    }
 }
 
 /// The end of `searchRepair` after its flow: the connectivity check, the max-spacing flag
@@ -1289,6 +1344,7 @@ fn route_worker(cx: &DrCtx<'_>, pv: &PaView, routes: &DesignRoutes, iter: usize,
         inst_term_aps: &inst_term_aps,
     };
     let mut cw = CostWorker { cx: &ccx, g: &mut g, ap_svia: Default::default() };
+    crate::dr::route::STAGE_CL.with(|c| c.set(crate::dr::route::stage_cl_wanted(&w.route)));
     init_maze_cost(&mut cw, &nets, &w.ext, &rule_of).map_err(|e| e.0)?;
     let (routed, markers) = run_queue(cx, pv, &mut cw, &nets, &wm, iter, args, ripup_all, &near_ripped, w, swap);
     // identifyCongestionLevel, at the worker's end, iterations 7 to 30.
@@ -1382,6 +1438,7 @@ fn run_queue(cx: &DrCtx<'_>, pv: &PaView, cw: &mut CostWorker<'_, '_>, nets: &[D
     let touches_drc = |m: &Marker| m.bbox.xh >= w.drc.xl && m.bbox.xl <= w.drc.xh && m.bbox.yh >= w.drc.yl && m.bbox.yl <= w.drc.yh;
     let worker_markers: Vec<Marker> = if wm.need_recheck { recheck_markers(&q, nets).into_iter().filter(touches_drc).map(|m| m.copied()).collect() } else { wm.markers.clone() };
     let hist = initial_marker_cost(cw, &q, nets, &worker_markers);
+    crate::dr::route::stage_cost_list(cw, "markerCost");
     let abs = |n: &DrNet| abs_priority(st_nets[n.net].is_clock, st_nets[n.net].ndr.is_some());
     let net_name = |n: &DrNet| st_nets[n.net].name.as_str();
     let ndr_of = |n: &DrNet| -> Option<crate::dr::cost::Ndr<'_>> { nets.iter().position(|x| std::ptr::eq(x, n)).and_then(|i| ndr_eol[i]) };
@@ -1397,6 +1454,8 @@ fn run_queue(cx: &DrCtx<'_>, pv: &PaView, cw: &mut CostWorker<'_, '_>, nets: &[D
         }
     };
     let order = if ripup_all || near { init_queue(cw, nets, &abs, &net_name, &ndr_of, &|k| t.macro_term[k], &ripped, &|i| prio[i]) } else { Vec::new() };
+    crate::dr::route::stage_cost_list(cw, "initQueue");
+    crate::dr::route::STAGE_CL.with(|c| c.set(false));
     let mut mst = MazeState::new(tech, cw.g, d.die);
     if !args.follow_guide {
         mst.all_guided();
@@ -1457,6 +1516,7 @@ fn end_worker(cx: &DrCtx<'_>, routes: &mut DesignRoutes, w: &WorkerBoxes, routed
 
 /// The connectivity check between iterations: over the modified nets, applied to the design.
 fn check(cx: &DrCtx<'_>, routes: &mut DesignRoutes) -> Res<()> {
+    let _s = crate::debug::stage("FlexDR::checkConnectivity");
     let tech = &cx.p.tech;
     let term_key = |net: usize, pt: (i32, i32), l: usize| -> Vec<(u8, usize)> {
         let q = Rect { xl: pt.0, yl: pt.1, xh: pt.0, yh: pt.1 };

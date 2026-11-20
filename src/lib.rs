@@ -14,6 +14,7 @@
 // library too, and its `vyges_drt::…` paths resolve here.
 extern crate self as vyges_drt;
 
+pub mod debug;
 pub mod dr;
 pub mod gc;
 pub mod order;

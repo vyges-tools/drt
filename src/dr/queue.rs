@@ -59,7 +59,7 @@ pub enum Event {
     /// net of the patch's design net meets the patch; divergence D4, OpenROAD issue #12191). Never
     /// zero.
     AreaPatchesDropped(usize),
-    /// The check's view of an owner (`VYGD_GC`): `gcinit` / `gcupd` and its maximal rectangles.
+    /// The check's view of an owner (`drt:vy_gc`, old name `VYGD_GC`): `gcinit` / `gcupd` and its maximal rectangles.
     Gc(String),
     /// An entry pushed onto the queue (after its batch was sorted).
     Push { block: Block, num_reroute: i32, do_route: bool, checking: Option<Owner> },
@@ -340,7 +340,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
     // next check).
     let mut swap_orig: HashMap<(usize, (i32, i32), usize), usize> = HashMap::new();
     let mut pending: Vec<usize> = Vec::new();
-    let gc_dump = std::env::var("VYGD_GC").is_ok();
+    let gc_dump = crate::debug::on(crate::debug::Group::Gc);
     let mut gw = check_init(q, nets, &state, if gc_dump { Some(&mut events) } else { None });
     let mut gc_version = 1i64;
     // Per owner checked (or net routed): the version it was checked at and its marker count; the
@@ -394,6 +394,7 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let old = std::mem::take(&mut state[i].figs);
                 rq.remove_net(i);
                 let siblings = sibling_metal(q.mcfg.tech, &state, &|j| (q.name)(j), i);
+                crate::dr::route::CUR_NET.with(|c| *c.borrow_mut() = (q.name)(i));
                 let (searches, figs) = reroute_net(w, st, q.mcfg, &nets[i], ndr, &cx, state[i].reroutes, &old, &siblings);
                 rq.add_net(q.mcfg.tech, i, &figs);
                 maze_net_end(w, st, &nets[i], &cx);
@@ -449,8 +450,43 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 (m, owner)
             }
         };
+        if crate::dr::route::queue_trace_wanted(&q.route_box) {
+            let tag = match &checking_obj {
+                Owner::Net(n) => format!("N:{n}"),
+                Owner::InstTerm(i, t) => format!("T:{i}/{t}"),
+                Owner::BlockTerm(n) => format!("B:{n}"),
+                o => format!("O:{}", owner_tag(o)),
+            };
+            if did_route {
+                if let Block::Net(i) = &e.block {
+                    let tech = q.mcfg.tech;
+                    let mut f: Vec<String> = state[*i].figs.iter().map(|g| crate::dr::route::fig_str(tech, g)).collect();
+                    f.sort();
+                    eprintln!("q|R|{}|{}|{}|{}", (q.name)(*i), e.num_reroute, markers.len(), f.join(";"));
+                }
+            } else {
+                eprintln!("q|C|{tag}|{}", markers.len());
+            }
+            for m in &markers {
+                let mut srcs: Vec<String> = m.owners.iter().map(qtag).collect();
+                srcs.sort();
+                let agg = m.aggressor.as_ref().map_or("-".to_string(), |a| qtag(&a.0));
+                eprintln!("q|M|{}|{},{},{},{}|A:{}|S:{}", q.mcfg.tech.layers[m.layer].name, m.bbox.xl, m.bbox.yl, m.bbox.xh, m.bbox.yh, agg, srcs.join(","));
+                let side = |s: &Option<crate::gc::Side>| s.as_ref().map_or("-".to_string(), |v| format!("{}@{}:{},{},{},{}", qtag(&v.0), q.mcfg.tech.layers[v.1].name, v.2.xl, v.2.yl, v.2.xh, v.2.yh));
+                eprintln!("q|X|{:?}|reach={}|A:{}|V:{}|V2:{}", m.rule, marker_reaches_route_box(m, &q.route_box), side(&m.aggressor), side(&m.victim), side(&m.second_victim));
+            }
+        }
         let before = queue.len();
         update_queue(q, nets, &mut state, &by_name, &markers, &mut queue, Some(checking_obj));
+        if crate::dr::route::queue_trace_wanted(&q.route_box) {
+            for e in queue.iter().skip(before) {
+                let t = match &e.block {
+                    Block::Net(i) => format!("W:{}", (q.name)(*i)),
+                    Block::Owner(o) => qtag(o),
+                };
+                eprintln!("q|P|{}|{}|{}", u8::from(e.do_route), e.num_reroute, t);
+            }
+        }
         for e in queue.iter().skip(before) {
             events.push(Event::Push { block: e.block.clone(), num_reroute: e.num_reroute, do_route: e.do_route, checking: e.checking.clone() });
         }
@@ -1049,6 +1085,17 @@ fn owner_route(q: &QueueCtx<'_>, _nets: &[DrNet], state: &[NetState], owner: &Ow
 /// The worker's check as the reference builds it: the design's shapes in the extended box
 /// (their owners created in the query's order), every worker net's committed shapes, packed;
 /// then each owner (by net) updated once — the maze-cost pass's check update.
+/// Queue-trace tag, as the reference's trace names an owner.
+fn qtag(o: &Owner) -> String {
+    match o {
+        Owner::Net(n) => format!("N:{n}"),
+        Owner::InstTerm(i, t) => format!("T:{i}/{t}"),
+        Owner::BlockTerm(n) => format!("B:{n}"),
+        Owner::Inst(n) => format!("I:{n}"),
+        o => format!("O:{}", owner_tag(o).split(':').next().unwrap_or("")),
+    }
+}
+
 fn owner_tag(o: &Owner) -> String {
     match o {
         Owner::Net(n) => format!("0:{n}"),

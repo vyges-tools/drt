@@ -74,11 +74,10 @@ pub enum ModCost {
     ResetBlocked,
 }
 
-/// A DIAGNOSTIC, inert unless `VYGC_C2C` is set: the block-pin corner cost prints each call
+/// Debug group `drt:vy_c2c` (old name `VYGC_C2C`): the block-pin corner cost prints each call
 /// (`c2t` / `c2m` / `c2c` lines, as the reference's instrument `c2c-trace.py` prints them).
 fn c2c_trace() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VYGC_C2C").is_some())
+    crate::debug::on(crate::debug::Group::C2c)
 }
 
 /// The reference's `ModCostType` value for a kind, as the trace prints it.
@@ -1101,9 +1100,13 @@ pub struct Unmodelled(pub String);
 /// The costs before routing: fixed shapes, access points, block pins' planar access.
 pub fn init_maze_cost<'n>(w: &mut CostWorker<'_, '_>, nets: &[DrNet], ext_box: &Rect, ndr_of: &dyn Fn(&DrNet) -> Option<Ndr<'n>>) -> Result<(), Unmodelled> {
     init_maze_cost_fixed_obj(w, ext_box)?;
+    crate::dr::route::stage_cost_list(w, "fixedObj");
     init_maze_cost_ap(w, nets);
+    crate::dr::route::stage_cost_list(w, "ap");
     init_maze_cost_conn_fig(w, nets, ext_box, ndr_of);
+    crate::dr::route::stage_cost_list(w, "connFig");
     init_maze_cost_planar_term(w, ext_box);
+    crate::dr::route::stage_cost_list(w, "planarTerm");
     Ok(())
 }
 
