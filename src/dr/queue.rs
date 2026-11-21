@@ -1083,8 +1083,10 @@ fn owner_route(q: &QueueCtx<'_>, _nets: &[DrNet], state: &[NetState], owner: &Ow
 }
 
 /// The worker's check as the reference builds it: the design's shapes in the extended box
-/// (their owners created in the query's order), every worker net's committed shapes, packed;
-/// then each owner (by net) updated once — the maze-cost pass's check update.
+/// (their owners created in the query's order), every worker net's committed shapes, packed.
+/// ⛔ Nothing after: at the f11b4276 pin (OpenROAD #12116) the maze-cost pass
+/// (`initMazeCost_connFig`) no longer re-inserts each worker net into the check, so the check's
+/// region query keeps the order `init` built it in.
 /// Queue-trace tag, as the reference's trace names an owner.
 fn qtag(o: &Owner) -> String {
     match o {
@@ -1109,7 +1111,7 @@ fn owner_tag(o: &Owner) -> String {
     }
 }
 
-fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], mut dump: Option<&mut Vec<Event>>) -> Worker<'t> {
+fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], dump: Option<&mut Vec<Event>>) -> Worker<'t> {
     let tech = q.mcfg.tech;
     let mut gw = Worker::new(tech);
     gw.drc_box = Some(q.drc_box);
@@ -1143,22 +1145,9 @@ fn check_init<'t>(q: &QueueCtx<'t>, nets: &[DrNet], state: &[NetState], mut dump
         }
     }
     gw.init();
-    if let Some(ev) = dump.as_deref_mut() {
+    if let Some(ev) = dump {
         for o in gw.owners() {
             ev.push(Event::Gc(format!("gcinit|{}", owner_tag(&o)) + &gw.dump(&o)));
-        }
-    }
-    // Per net (by id), ONE update per worker net of it: a net split into k worker nets is removed
-    // from the check's region query and re-inserted k times, and every re-insert reshapes the
-    // tree — which decides the order a later query finds its rectangles in.
-    owners.sort_by_key(|(id, _)| *id);
-    for (net, owner) in &owners {
-        let (route, taper) = owner_route(q, nets, state, owner);
-        for _ in nets.iter().filter(|n| n.net == *net) {
-            gw.replace_route(owner, &route, &taper);
-            if let Some(ev) = dump.as_deref_mut() {
-                ev.push(Event::Gc(format!("gcupd|{}", owner_tag(owner)) + &gw.dump(owner)));
-            }
         }
     }
     gw
@@ -1406,6 +1395,38 @@ pub fn order_map(order: &[usize]) -> BTreeMap<usize, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`initMazeCost_connFig` at the f11b4276 pin, OpenROAD #12116): the worker's check is
+    /// built once — design shapes, then every worker net's — and NOT updated per worker net
+    /// afterwards (the reference no longer calls `updateDRNet` / `updateGCWorker` there), so its
+    /// region query keeps the order `init` built. Witnessed by the check's view dump: `gcinit`
+    /// views only, no `gcupd`, even for a net split into two worker nets.
+    #[test]
+    fn the_check_is_built_once_without_a_per_net_update() {
+        use crate::dr::rules::RuleTables;
+        let tech = crate::gc::tests::tech();
+        let rules = RuleTables::default();
+        let mcfg = MazeCfg { tech: &tech, rules: &rules, drc_cost: 8, marker_cost: 50, fixed_cost: 0, iter: 0, bottom_routing_layer: 2, top_routing_layer: 4, ripup_all: false };
+        let names = ["a", "a", "b"];
+        let name = |i: usize| names[i].to_string();
+        let no_ctx = |_: usize| -> NetCtx<'_> { unreachable!("routing reads it, not the check's build") };
+        let no_ndr = |_: usize| None;
+        let zero = |_: usize| 0;
+        let no = |_: &str| false;
+        let idx = |_: &str| 0;
+        let no_sp = |_: usize| None;
+        let unpinned = |_: usize| false;
+        let r = Rect::new(0, 0, 2000, 2000);
+        let q = QueueCtx { mcfg: &mcfg, route_box: r, drc_box: r, name: &name, net_ctx: &no_ctx, ndr: &no_ndr, max_ripup_avoids: &zero, is_supply: &no, inst_index: &idx, fixed: &[], ndr_spacing: &no_sp, max_ndr_spacing: &[], marker_decay: 0.0, maze_end_iter: 1, markers_drive: true, pinned: &unpinned };
+        let seg = |y: i32| DrFig::Seg { layer: 2, begin: (100, y), end: (900, y), width: 140, begin_ext: 70, end_ext: 70, bi: (0, 0, 0), ei: (0, 0, 0), tapered: false, begin_trunc: false, end_trunc: false };
+        let net = |id: usize, n: usize, y: i32| DrNet { id, net: n, pins: vec![], num_pins_in: 0, pin_box: r, ext: vec![], route: vec![seg(y)] };
+        let nets = vec![net(0, 0, 200), net(1, 0, 600), net(2, 1, 1000)];
+        let state: Vec<NetState> = nets.iter().map(|n| NetState { reroutes: 0, ripup_avoids: 0, figs: n.route.clone(), ext: n.ext.clone() }).collect();
+        let mut events = Vec::new();
+        check_init(&q, &nets, &state, Some(&mut events));
+        let tags: Vec<String> = events.iter().filter_map(|e| if let Event::Gc(s) = e { s.split('|').next().map(String::from) } else { None }).collect();
+        assert!(!tags.is_empty() && tags.iter().all(|t| t == "gcinit"), "views at init only, no update: {tags:?}");
+    }
 
     /// ⛔ Divergence D4 (register; OpenROAD issue #12191). Upstream rule
     /// (`checkMetalShape_patchOwner_helper`, as `checkMetalShape_addPatch` calls it for a design
