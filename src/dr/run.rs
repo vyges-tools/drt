@@ -353,6 +353,18 @@ pub fn init_design_io(db: &Db, tech: &Tech, opts: &Options, log: Sink) -> Res<De
     Ok(DesignRead { tech: tech.clone(), tracks, cfg, bottom_layer, masters, insts, ports, design, shapes, db_markers, skipped_rules, lef58_not_checked, block_vias })
 }
 
+/// `genAllAccessPoints`' and `prepPattern`'s counts over the unique classes' representatives
+/// (class, terminal count): every class's terminals are pins — since OpenROAD #11772 no class is
+/// skipped for its master type — and only a standard-cell class makes patterns.
+pub fn pin_access_counts(reps: impl Iterator<Item = (MasterClass, usize)>) -> (usize, usize) {
+    let (mut pins, mut patterns) = (0, 0);
+    for (class, terms) in reps {
+        pins += terms;
+        patterns += usize::from(class == MasterClass::StdCell);
+    }
+    (pins, patterns)
+}
+
 /// `FlexPA::main` on the design read, then the reads the router needs after it (non-default
 /// rules, the routing already in the database, auto-taper and jumpers); those log nothing.
 pub fn pa_main(db: &Db, r: DesignRead, log: Sink) -> Res<DesignIn> {
@@ -362,11 +374,7 @@ pub fn pa_main(db: &Db, r: DesignRead, log: Sink) -> Res<DesignIn> {
     let pa = pin_access_with(tech, &tracks, &cfg, &masters, &insts, &ports, Some(&shapes)).map_err(|e| format!("pin access: {e:?}"))?;
     {
         let reps = pa.classes.iter().enumerate().map(|(c, cl)| (&insts[pa.reps[c]], &masters[&cl.key.master]));
-        let (mut pins, mut patterns) = (0, 0);
-        for (rep, m) in reps {
-            pins += if rep.class == MasterClass::Other { 0 } else { m.terms.len() };
-            patterns += usize::from(rep.class == MasterClass::StdCell);
-        }
+        let (pins, patterns) = pin_access_counts(reps.map(|(rep, m)| (rep.class, m.terms.len())));
         crate::dr::log::pin_access(pins, patterns, pa.rows).into_iter().for_each(&mut *log);
     }
     let ndrs = read_ndrs(db, tech)?;
@@ -1573,6 +1581,15 @@ pub fn end_fr(db: &mut Db, d: &DesignIn, g: &GuidesIn, p: &Prep, routes: &Design
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`genAllAccessPoints` at the f11b4276 pin, OpenROAD #11772): every unique class's
+    /// terminals count as pins, whatever its master type (no class is skipped any more); only a
+    /// standard-cell class makes patterns.
+    #[test]
+    fn every_class_counts_its_pins_only_standard_cells_their_patterns() {
+        let reps = [(MasterClass::StdCell, 3), (MasterClass::Macro, 5), (MasterClass::Other, 2)];
+        assert_eq!(pin_access_counts(reps.into_iter()), (10, 1));
+    }
     use crate::pa::unique::UniqueInst;
     use crate::tech::{MasterPin, MasterTerm, Transform};
 

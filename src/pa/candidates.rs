@@ -56,6 +56,10 @@ pub enum TermKind {
     Macro,
     /// A top-level port — treated as a macro terminal.
     Io,
+    /// A terminal of an instance that is neither a standard cell (CORE) nor a macro (BLOCK, PAD,
+    /// RING) — a cover or end cap, say. Since OpenROAD #11772 pin access serves these too, their
+    /// planar and via access set by the routable layers around the pin.
+    Other,
 }
 
 /// One candidate: its point, layer and the round's two cost classes.
@@ -177,7 +181,9 @@ pub fn round_candidates(cx: &Context<'_>, pin: &mut [Polygon90Set], kind: TermKi
         if set.is_empty() || cx.tech.layers[layer].kind != LayerKind::Routing {
             continue;
         }
-        let is_macro = kind != TermKind::StdCell;
+        // `isMacroCellTerm || isIOTerm`: a terminal of any other instance is generated as a standard
+        // cell's is.
+        let is_macro = matches!(kind, TermKind::Macro | TermKind::Io);
         for rect in set.max_rectangles() {
             let (xs, ys) = coords_from_rect(cx, rect, layer, lower, upper, is_macro);
             create_multiple(cx, &mut out, apset, rect, layer, &xs, &ys, lower, upper);
@@ -458,6 +464,23 @@ mod tests {
         assert_eq!(layers(TermKind::StdCell), BTreeSet::from([2]));
         assert_eq!(layers(TermKind::Macro), BTreeSet::from([2]));
         assert_eq!(layers(TermKind::Io), BTreeSet::from([2, 6]));
+    }
+
+    /// Rule (`genAPsFromLayerShapes`: `isMacroCellTerm || isIOTerm`): a terminal of an instance
+    /// that is neither a standard cell nor a macro (served since OpenROAD #11772) makes the
+    /// candidates a standard cell's would — a thin right-way rectangle takes no macro centre line.
+    #[test]
+    fn an_other_instance_pin_makes_standard_cell_candidates() {
+        let t = tech(vec![]);
+        let cx = Context::new(&t, &[]);
+        let shapes = [(4, Rect::new(0, 0, 1000, 200))];
+        let cands = |kind| {
+            let mut sets = merge_pin_shapes(&t, &shapes);
+            round_candidates(&cx, &mut sets, kind, 4, ApType::Center, ApType::Center, &mut BTreeSet::new())
+        };
+        assert!(cands(TermKind::Macro).is_empty() && !cands(TermKind::StdCell).is_empty());
+        assert_ne!(cands(TermKind::Macro), cands(TermKind::StdCell));
+        assert_eq!(cands(TermKind::Other), cands(TermKind::StdCell));
     }
 
     /// Rule (nearby-track rounds): the point recorded as made is the path's first bend when the

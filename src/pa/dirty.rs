@@ -213,9 +213,8 @@ fn gen_dirty_class_access(inp: &DirtyIn<'_>, pa: &mut PinAccess, c: usize, trace
     }
     let inst = &inp.insts[rep];
     let master = &inp.masters[&pa.classes[c].key.master];
-    if inst.class == MasterClass::Other {
-        return Err(DirtyError::Unsupported(format!("lef58_max_spacing: pin access re-run on {} ({}), neither a standard cell nor a block", inst.name, pa.classes[c].key.master)));
-    }
+    // Any master type: the re-run calls `genInstAccessPoints` on every dirty class (since OpenROAD
+    // #11772 a class that is neither a standard cell nor a block has access points too).
     if (0..n).any(|t| pa.classes[c].routes[t] && inst.no_taper[t]) {
         return Err(DirtyError::Unsupported(format!("lef58_max_spacing: pin access re-run on {}: a terminal on a non-default-rule net without auto-taper (its via trials read the design mid-routing)", inst.name)));
     }
@@ -451,7 +450,7 @@ mod tests {
     }
 
     fn cfg() -> Config {
-        Config { via_access_layer: 2, via_in_pin: None, top_routing_layer: 4, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks: true }
+        Config { bottom_routing_layer: 2, via_access_layer: 2, via_in_pin: None, top_routing_layer: 4, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks: true }
     }
 
     fn rerun(bar: bool, stubborn: &[(usize, usize)]) -> (PinAccess, Result<(), DirtyError>) {

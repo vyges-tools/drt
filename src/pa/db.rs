@@ -169,13 +169,17 @@ pub fn stacked_vias(db: &Db, tech: &Tech, tracks: &[TrackPattern], top: usize) -
 }
 
 /// The router's defaults; the top routing layer is the block's maximum routing layer when set,
-/// else the topmost routing layer.
+/// else the topmost routing layer; the bottom one the block's minimum, else the first.
 pub fn config(db: &Db, tech: &Tech) -> Config {
+    let min_level = db.block_get_min_routing_layer();
+    let bottom = (0..tech.layers.len())
+        .find(|&l| min_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == min_level)
+        .unwrap_or(2);
     let max_level = db.block_get_max_routing_layer();
     let top = (0..tech.layers.len())
         .find(|&l| max_level > 0 && tech.layers[l].kind == LayerKind::Routing && db.layer_get_routing_level(&tech.layers[l].name) == max_level)
         .unwrap_or_else(|| tech.top_routing_layer());
-    Config { via_access_layer: 2, via_in_pin: None, top_routing_layer: top, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks: true }
+    Config { bottom_routing_layer: bottom, via_access_layer: 2, via_in_pin: None, top_routing_layer: top, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks: true }
 }
 
 /// Write the results into the database: [`write_plan`], executed.

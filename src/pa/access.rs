@@ -49,7 +49,7 @@ use crate::gc::{Marker, Owner};
 use crate::pa::candidates::{merge_pin_shapes, round_candidates, ApType, Context, TermKind};
 use crate::pa::verdict::{planar_markers, via_markers, TargetShape};
 use crate::polygon90::{Polygon90Set, Rect};
-use crate::tech::{Dir, ViaDef};
+use crate::tech::{Dir, LayerKind, ViaDef};
 
 /// An access direction. `index` is the position in [`AccessPoint::access`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +68,8 @@ pub const PLANAR: [Access; 4] = [Access::S, Access::W, Access::E, Access::N];
 /// The router settings pin access reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// `BOTTOM_ROUTING_LAYER` — the lowest layer a route may use.
+    pub bottom_routing_layer: usize,
     pub via_access_layer: usize,
     /// The via-in-pin layer range, if set.
     pub via_in_pin: Option<(usize, usize)>,
@@ -253,13 +255,45 @@ fn in_via_in_pin(cfg: &Config, layer: usize) -> bool {
     cfg.via_in_pin.is_some_and(|(lo, hi)| layer >= lo && layer <= hi)
 }
 
+/// `isRoutableLayer` (OpenROAD #11772): a routing layer between the bottom and top routing layers.
+pub fn is_routable_layer(pin: &Pin<'_>, layer: usize) -> bool {
+    layer >= pin.cfg.bottom_routing_layer && layer <= pin.cfg.top_routing_layer && pin.cx.tech.layers.get(layer).is_some_and(|l| l.kind == LayerKind::Routing)
+}
+
+/// `hasRoutableLayerAbove`: some routable layer above `layer`, up to the top routing layer.
+pub fn has_routable_layer_above(pin: &Pin<'_>, layer: usize) -> bool {
+    (layer + 2..=pin.cfg.top_routing_layer).step_by(2).any(|l| is_routable_layer(pin, l))
+}
+
+/// `hasRoutableLayerBelow`: some routable layer below `layer`, down to the bottom routing layer.
+pub fn has_routable_layer_below(pin: &Pin<'_>, layer: usize) -> bool {
+    let mut l = layer as i64 - 2;
+    while l >= pin.cfg.bottom_routing_layer as i64 {
+        if is_routable_layer(pin, l as usize) {
+            return true;
+        }
+        l -= 2;
+    }
+    false
+}
+
 /// A candidate's allowed accesses: every planar direction unless planar access is barred on the
 /// layer, wrong-way ones only with non-preferred tracks and never on a unidirectional (rect-only)
-/// layer; vias always tried.
+/// layer.
+///
+/// ⛔ `createMultipleAccessPoints` at the f11b4276 pin (OpenROAD #11772): a standard cell's
+/// terminal has no planar access on the via-in-pin layers or at or below the via-access layer,
+/// and always via access; a macro's or a port's, both. Any OTHER instance's terminal has planar
+/// access on a routable layer ([`is_routable_layer`]) and via access when a routable layer lies
+/// above or below its own.
 pub fn create_access_point(pin: &Pin<'_>, point: (i32, i32), layer: usize, lower: ApType, upper: ApType) -> AccessPoint {
     let cfg = pin.cfg;
-    let allow_planar = !(pin.kind == TermKind::StdCell && (in_via_in_pin(cfg, layer) || layer <= cfg.via_access_layer));
-    let mut ap = AccessPoint { point, layer, lower, upper, access: [false; 6], allow_via: true, vias: Vec::new() };
+    let (allow_planar, allow_via) = match pin.kind {
+        TermKind::StdCell => (!(in_via_in_pin(cfg, layer) || layer <= cfg.via_access_layer), true),
+        TermKind::Macro | TermKind::Io => (true, true),
+        TermKind::Other => (is_routable_layer(pin, layer), has_routable_layer_above(pin, layer) || has_routable_layer_below(pin, layer)),
+    };
+    let mut ap = AccessPoint { point, layer, lower, upper, access: [false; 6], allow_via, vias: Vec::new() };
     for d in PLANAR {
         ap.set(d, allow_planar);
     }
@@ -410,10 +444,14 @@ fn filter_via_access(pin: &Pin<'_>, sh: &Shapes, ap: &mut AccessPoint, try_all: 
         || (ap.upper == ApType::EncOpt && ap.lower != ApType::NearbyGrid);
     let max_vias: i64 = if try_all { i64::from(i32::MAX) } else { 2 };
     let mut via_defs: Vec<usize> = Vec::new();
-    if layer < cfg.top_routing_layer {
+    // ⛔ OpenROAD #11772: up vias when a routable layer lies above; down vias for a terminal that is
+    // neither a standard cell's nor a macro's (a port's, or another instance's) when one lies below.
+    let allow_up = has_routable_layer_above(pin, layer);
+    let allow_down = !matches!(pin.kind, TermKind::StdCell | TermKind::Macro) && has_routable_layer_below(pin, layer);
+    if allow_up {
         via_defs.extend(get_priority_via_defs(pin, layer + 1, max_vias));
     }
-    if pin.kind == TermKind::Io && layer > pin.cx.tech.bottom_layer_num() && layer - 1 <= cfg.top_routing_layer {
+    if allow_down {
         let remaining = max_vias - via_defs.len() as i64;
         via_defs.extend(get_priority_via_defs(pin, layer - 1, remaining));
     }
@@ -523,13 +561,14 @@ fn slices(pieces: &[Rect], vertical: bool) -> Vec<Rect> {
     set.rectangles().iter().map(t).collect()
 }
 
-/// A top-level port needs one point; any other pin enough SPARSE points: one per point that has no
-/// later same-layer point within half the layer's width of it.
+/// A standard cell's or a macro's pin needs enough SPARSE points: one per point that has no later
+/// same-layer point within half the layer's width of it; any other (a port's, or since OpenROAD
+/// #11772 another instance's) one point.
 fn enough_access_points(pin: &Pin<'_>, aps: &[AccessPoint]) -> bool {
-    if pin.kind == TermKind::Io {
-        return !aps.is_empty();
+    if matches!(pin.kind, TermKind::StdCell | TermKind::Macro) {
+        return enough_sparse_points(pin, aps);
     }
-    enough_sparse_points(pin, aps)
+    !aps.is_empty()
 }
 
 fn enough_sparse_points(pin: &Pin<'_>, aps: &[AccessPoint]) -> bool {
@@ -544,7 +583,7 @@ fn enough_sparse_points(pin: &Pin<'_>, aps: &[AccessPoint]) -> bool {
     match pin.kind {
         TermKind::StdCell => n >= pin.cfg.min_std_cell_points,
         TermKind::Macro => n >= pin.cfg.min_macro_points,
-        TermKind::Io => false,
+        TermKind::Io | TermKind::Other => false,
     }
 }
 
@@ -563,7 +602,7 @@ mod tests {
     }
 
     fn cfg(use_nonpref_tracks: bool) -> Config {
-        Config { via_access_layer: 2, via_in_pin: None, top_routing_layer: 4, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks }
+        Config { bottom_routing_layer: 2, via_access_layer: 2, via_in_pin: None, top_routing_layer: 4, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks }
     }
 
     fn shapes(t: &crate::tech::Tech, rects: &[(usize, Rect)]) -> Shapes {
@@ -652,6 +691,74 @@ mod tests {
         let all = BTreeSet::from([0, 1, 2]);
         let none_left = Pin { avoid: Some(&all), ..stubborn };
         assert!(get_priority_via_defs(&none_left, 3, 2).is_empty());
+    }
+
+    /// Rule (OpenROAD #11772, `createMultipleAccessPoints`): a standard cell's terminal has no
+    /// planar access at or below the via-access layer and always via access; a macro's or a
+    /// port's has both. A terminal of any OTHER instance has planar access only on a routable
+    /// layer (a routing layer between the bottom and top routing layers) and via access only when
+    /// a routable layer lies above or below its own.
+    #[test]
+    fn an_other_instance_terminal_takes_access_from_the_routable_layers() {
+        let t = tech();
+        let cx = Context::new(&t, &[]);
+        let owner = Owner::Net("n".into());
+        let flags = |kind, c: &Config, layer| {
+            let pin = Pin { cx: &cx, cfg: c, kind, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
+            let a = create_access_point(&pin, (0, 0), layer, ApType::OnGrid, ApType::OnGrid);
+            (a.has_planar(), a.allow_via)
+        };
+        let full = cfg(true);
+        let only_l2 = Config { top_routing_layer: 2, ..cfg(true) };
+        let only_l4 = Config { bottom_routing_layer: 4, ..cfg(true) };
+        assert_eq!(flags(TermKind::Other, &full, 2), (true, true), "l4 above");
+        assert_eq!(flags(TermKind::Other, &full, 4), (true, true), "l2 below");
+        assert_eq!(flags(TermKind::Other, &only_l2, 2), (true, false), "nothing above or below");
+        assert_eq!(flags(TermKind::Other, &only_l2, 4), (false, true), "l4 above the top; l2 below");
+        assert_eq!(flags(TermKind::Other, &only_l4, 2), (false, true), "l2 below the bottom; l4 above");
+        assert_eq!(flags(TermKind::StdCell, &only_l2, 2), (false, true));
+        assert_eq!(flags(TermKind::StdCell, &full, 4), (true, true));
+        assert_eq!(flags(TermKind::Macro, &only_l2, 4), (true, true));
+        assert_eq!(flags(TermKind::Io, &only_l2, 4), (true, true));
+    }
+
+    /// Rule (OpenROAD #11772, `filterViaAccess`): up vias when a ROUTABLE layer lies above the
+    /// point's (not merely when the next layer is within the top routing layer); down vias only
+    /// for a terminal that is neither a standard cell's nor a macro's — a port's or another
+    /// instance's — and only onto a routable layer below (here l4 down to l2 through c3).
+    #[test]
+    fn up_and_down_vias_follow_the_routable_layers() {
+        let t = tech();
+        let cx = Context::new(&t, &[]);
+        let owner = Owner::Net("n".into());
+        let sh = shapes(&t, &[(2, Rect::new(-2000, -2000, 2000, 2000)), (4, Rect::new(-2000, -2000, 2000, 2000))]);
+        let listed = |kind, c: &Config, layer| {
+            let pin = Pin { cx: &cx, cfg: c, kind, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None };
+            let mut trace = Some(Vec::new());
+            filter_via_access(&pin, &sh, &mut ap((0, 0), layer), false, &mut trace);
+            trace.unwrap().iter().find_map(|e| if let Event::VList { vias, .. } = e { Some(vias.len()) } else { None }).unwrap()
+        };
+        let full = cfg(true);
+        assert_eq!(listed(TermKind::StdCell, &full, 2), 1, "up to l4");
+        assert_eq!(listed(TermKind::StdCell, &Config { top_routing_layer: 3, ..cfg(true) }, 2), 0, "c3 within the top, but no routable layer above");
+        assert_eq!(listed(TermKind::Io, &full, 4), 1, "a port: down to l2");
+        assert_eq!(listed(TermKind::Other, &full, 4), 1, "another instance: down to l2");
+        assert_eq!(listed(TermKind::Macro, &full, 4), 0, "a macro: never down");
+        assert_eq!(listed(TermKind::StdCell, &full, 4), 0, "a standard cell: never down");
+        assert_eq!(listed(TermKind::Io, &Config { bottom_routing_layer: 4, ..cfg(true) }, 4), 0, "l2 below the bottom routing layer");
+    }
+
+    /// Rule (OpenROAD #11772, `EnoughAccessPoints`): a standard cell's or a macro's pin needs
+    /// enough sparse points; any other — a port's or another instance's — one.
+    #[test]
+    fn an_other_instance_pin_needs_one_point() {
+        let t = tech();
+        let cx = Context::new(&t, &[]);
+        let (c, owner) = (cfg(true), Owner::Net("n".into()));
+        let one = [ap((0, 0), 2)];
+        let enough = |kind| enough_access_points(&Pin { cx: &cx, cfg: &c, kind, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None }, &one);
+        assert_eq!([enough(TermKind::StdCell), enough(TermKind::Macro), enough(TermKind::Io), enough(TermKind::Other)], [false, false, true, true]);
+        assert!(!enough_access_points(&Pin { cx: &cx, cfg: &c, kind: TermKind::Other, is_block: false, boundary: None, target: &[], owner: &owner, via_target: None, avoid: None }, &[]));
     }
 
     /// Retrying tries EVERY via, but still keeps at most two.

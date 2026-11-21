@@ -126,7 +126,11 @@ pub enum FlowError {
 #[allow(clippy::too_many_arguments)]
 pub fn gen_inst_access_points(cx: &Context<'_>, cfg: &Config, master: &Master, rep: &DesignInst, routes: &[bool], design: Option<&[TargetShape]>, stubborn: &dyn Fn(usize) -> bool, avoid: Option<&BTreeSet<usize>>, counted: &mut dyn FnMut(usize, usize), fell_back: &mut dyn FnMut(usize)) -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
     let mut per_term: Vec<Vec<Vec<AccessPoint>>> = master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect();
-    let kind = if rep.class == MasterClass::StdCell { TermKind::StdCell } else { TermKind::Macro };
+    let kind = match rep.class {
+        MasterClass::StdCell => TermKind::StdCell,
+        MasterClass::Macro => TermKind::Macro,
+        MasterClass::Other => TermKind::Other,
+    };
     for (t, term) in master.terms.iter().enumerate() {
         if !routes[t] {
             continue;
@@ -204,9 +208,8 @@ pub fn pin_access_with(tech: &Tech, tracks: &[TrackPattern], cfg: &Config, maste
     let class_aps: Vec<Vec<Vec<Vec<AccessPoint>>>> = par_map(&classes, |class| -> Result<Vec<Vec<Vec<AccessPoint>>>, FlowError> {
         let rep = &insts[class.insts[0]];
         let master = &masters[&class.key.master];
-        if rep.class == MasterClass::Other {
-            return Ok(master.terms.iter().map(|t| vec![Vec::new(); t.pins.len()]).collect());
-        }
+        // ⛔ Every class, whatever its master type: since OpenROAD #11772 `genAllAccessPoints` no
+        // longer skips instances that are neither standard cells nor macros.
         gen_inst_access_points(&cx, cfg, master, rep, &class.routes, design, &none, None, &mut |_, _| {}, &mut |_| {})
     })
     .into_iter()
@@ -478,6 +481,27 @@ mod tests {
             rows: 1,
         };
         (masters, insts, pa)
+    }
+
+    /// Rule (`genAllAccessPoints`, OpenROAD #11772): a unique class that is neither a standard
+    /// cell nor a macro is no longer skipped — its routed terminal gets access points — but only a
+    /// standard-cell class gets patterns.
+    #[test]
+    fn an_other_class_gets_access_points_but_no_patterns() {
+        let (masters, mut insts, _) = fixture();
+        for i in &mut insts {
+            i.class = MasterClass::Other;
+        }
+        let mut t = crate::gc::tests::tech();
+        let sq = |h: i32| Rect::new(-h, -h, h, h);
+        t.via_defs.push(crate::tech::ViaDef { name: "v".into(), is_default: true, layer1: 2, cut: 3, layer2: 4, layer1_figs: vec![sq(85)], cut_figs: vec![sq(85)], layer2_figs: vec![sq(70)], cut_class: None });
+        let mut m = masters.clone();
+        let big = MasterPin { shapes: vec![(2, Rect::new(0, 0, 1000, 1000))] };
+        m.get_mut("m").unwrap().terms[1].pins = vec![big];
+        let cfg = Config { bottom_routing_layer: 2, via_access_layer: 2, via_in_pin: None, top_routing_layer: 4, min_std_cell_points: 3, min_macro_points: 3, use_nonpref_tracks: true };
+        let pa = pin_access_with(&t, &[], &cfg, &m, &insts, &[], None).unwrap();
+        assert!(!pa.class_aps[0][1][0].is_empty());
+        assert!(pa.patterns.iter().all(|p| p.is_empty()));
     }
 
     /// A pattern's entries run over the ROUTED terminals' pins only: the signal after an unrouted

@@ -510,7 +510,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "vyges-events",
- "vyges-loom",
+ "vyges-loom 0.1.56 (git+https://github.com/vyges-tools/loom?branch=repin-f11b4276)",
  "vyges-opendb",
 ]
 
@@ -541,7 +541,16 @@ dependencies = [
 [[package]]
 name = "vyges-loom"
 version = "0.1.56"
-source = "git+https://github.com/vyges-tools/loom?branch=main#743d6adf0af62b080b897587be286e28bcc7de6a"
+source = "git+https://github.com/vyges-tools/loom.git?branch=main#743d6adf0af62b080b897587be286e28bcc7de6a"
+dependencies = [
+ "miniz_oxide",
+ "regex",
+]
+
+[[package]]
+name = "vyges-loom"
+version = "0.1.56"
+source = "git+https://github.com/vyges-tools/loom?branch=repin-f11b4276#afc429fcfd7c126f62f4175acc6a1e844a6ad8ff"
 dependencies = [
  "miniz_oxide",
  "regex",
@@ -557,7 +566,7 @@ dependencies = [
  "serde_json",
  "vyges-events",
  "vyges-layout",
- "vyges-loom",
+ "vyges-loom 0.1.56 (git+https://github.com/vyges-tools/loom.git?branch=main)",
  "vyges-opendb-lib",
  "yaml-rust2",
 ]
