@@ -832,6 +832,17 @@ impl DrCtx<'_> {
 
 /// The main loop: the strategy's rows in order until no marker stands, each row one
 /// search-and-repair iteration and the connectivity check after it, none past `end_iteration`.
+/// `FlexDR::main`'s count of nets with guides but no routing (OpenROAD #12136): the routed nets
+/// (special nets are not among them) without an initial routing whose guides are not empty.
+fn unrouted_nets(d: &DesignIn, g: &GuidesIn) -> usize {
+    count_unrouted(d.design.nets.iter().zip(&d.initial).map(|(n, init)| (init.is_some(), g.by_net.get(&n.name).is_some_and(|(guides, _)| !guides.is_empty()))))
+}
+
+/// Per net (has an initial routing, has guides): those with guides and no routing.
+pub fn count_unrouted(nets: impl Iterator<Item = (bool, bool)>) -> usize {
+    nets.filter(|&(routed, guided)| !routed && guided).count()
+}
+
 /// The routes, the markers standing after each iteration run, and each iteration's flow.
 pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize, max_spacing_trace: bool, log: Sink) -> Res<(DesignRoutes, Vec<usize>, Vec<&'static str>, usize)> {
     log(Line::Info(187, "Start routing data preparation.".into()));
@@ -854,9 +865,10 @@ pub fn dr(d: &DesignIn, g: &GuidesIn, p: &Prep, t: &TaOut, end_iteration: usize,
     for m in &d.db_markers {
         routes.add_marker(m.clone());
     }
-    let start = start_iteration(d.db_markers.len(), end_iteration);
-    if !d.db_markers.is_empty() {
-        log(Line::Info(627, format!("Found {} DRC marker(s) in the database; resuming detailed routing from iteration {start}.", d.db_markers.len())));
+    let unrouted = if d.db_markers.is_empty() { 0 } else { unrouted_nets(d, g) };
+    let start = start_iteration(d.db_markers.len(), unrouted, end_iteration);
+    if let Some((id, line)) = crate::dr::flow::resume_line(d.db_markers.len(), unrouted, start) {
+        log(Line::Info(id, line));
     }
     // The strategy rows are indexed by the iteration, so a resumed run takes its own rows.
     for (iter, row) in strategy(ROUTE_SHAPE_COST, MARKER_COST).into_iter().enumerate().skip(start) {
@@ -1585,6 +1597,13 @@ mod tests {
     /// Rule (`genAllAccessPoints` at the f11b4276 pin, OpenROAD #11772): every unique class's
     /// terminals count as pins, whatever its master type (no class is skipped any more); only a
     /// standard-cell class makes patterns.
+    #[test]
+    fn a_net_counts_as_unrouted_with_guides_and_no_routing() {
+        // Rule (OpenROAD #12136, `FlexDR::main`): `!hasInitialRouting() && !getGuides().empty()`.
+        let nets = [(true, true), (false, true), (false, false), (true, false), (false, true)];
+        assert_eq!(count_unrouted(nets.into_iter()), 2);
+    }
+
     #[test]
     fn every_class_counts_its_pins_only_standard_cells_their_patterns() {
         let reps = [(MasterClass::StdCell, 3), (MasterClass::Macro, 5), (MasterClass::Other, 2)];

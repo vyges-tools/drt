@@ -93,11 +93,26 @@ pub const DRC_MARKER_CATEGORY: &str = "DRC";
 
 /// The first iteration (`FlexDR::main`): 0, or with markers read from the database the resume
 /// iteration, never past the end iteration (so at least one repair iteration still runs).
-pub fn start_iteration(db_markers: usize, end_iteration: usize) -> usize {
-    if db_markers == 0 {
+/// ⛔ OpenROAD #12136: only the first iterations route a net that has guides but no routing (one
+/// an ECO ripped up after the run that made the markers), so with any such net (`unrouted_nets`)
+/// the run does not resume: it starts at 0.
+pub fn start_iteration(db_markers: usize, unrouted_nets: usize, end_iteration: usize) -> usize {
+    if db_markers == 0 || unrouted_nets > 0 {
         0
     } else {
         REROUTE_VIOLATIONS_START_ITER.min(end_iteration)
+    }
+}
+
+/// The resume decision's log line (`FlexDR::main`, verbose): DRT-629 when unrouted nets keep the
+/// run at iteration 0, else DRT-627 naming the iteration resumed from; none without markers.
+pub fn resume_line(db_markers: usize, unrouted_nets: usize, start: usize) -> Option<(u16, String)> {
+    if db_markers == 0 {
+        None
+    } else if unrouted_nets > 0 {
+        Some((629, format!("Found {db_markers} DRC marker(s) in the database and {unrouted_nets} net(s) without routing; routing from iteration 0.")))
+    } else {
+        Some((627, format!("Found {db_markers} DRC marker(s) in the database; resuming detailed routing from iteration {start}.")))
     }
 }
 
@@ -743,12 +758,24 @@ mod tests {
     /// from the database the run starts at iteration 3, clamped to the end iteration; without, 0.
     #[test]
     fn a_run_with_database_markers_resumes_at_iteration_three_never_past_the_end() {
-        assert_eq!(start_iteration(0, END_ITERATION), 0);
-        assert_eq!(start_iteration(0, 1), 0);
-        assert_eq!(start_iteration(5, END_ITERATION), 3);
-        assert_eq!(start_iteration(1, 3), 3);
-        assert_eq!(start_iteration(1, 2), 2);
-        assert_eq!(start_iteration(1, 0), 0);
+        assert_eq!(start_iteration(0, 0, END_ITERATION), 0);
+        assert_eq!(start_iteration(0, 0, 1), 0);
+        assert_eq!(start_iteration(5, 0, END_ITERATION), 3);
+        assert_eq!(start_iteration(1, 0, 3), 3);
+        assert_eq!(start_iteration(1, 0, 2), 2);
+        assert_eq!(start_iteration(1, 0, 0), 0);
+    }
+
+    /// Rule (OpenROAD #12136, `FlexDR::main`): markers in the database do NOT resume the run when
+    /// some net has guides but no routing — it routes from iteration 0, logging DRT-629 (the count
+    /// of both) instead of DRT-627.
+    #[test]
+    fn a_net_without_routing_keeps_a_marked_run_at_iteration_zero() {
+        assert_eq!(start_iteration(5, 1, END_ITERATION), 0);
+        assert_eq!(start_iteration(0, 2, END_ITERATION), 0);
+        assert_eq!(resume_line(5, 1, 0), Some((629, "Found 5 DRC marker(s) in the database and 1 net(s) without routing; routing from iteration 0.".into())));
+        assert_eq!(resume_line(5, 0, 3), Some((627, "Found 5 DRC marker(s) in the database; resuming detailed routing from iteration 3.".into())));
+        assert_eq!(resume_line(0, 4, 0), None);
     }
 
     /// Rule (upstream fb9008b3e6): a database marker on a routing layer is a recheck, on a cut
