@@ -3187,7 +3187,8 @@ impl<'a> Worker<'a> {
 
     /// `checkLef58Enclosure_main(rect)`: a routed cut of a class with LEF58 enclosure rules below
     /// and/or above: the same-owner metal rectangle there holding the cut (the widest, the first of
-    /// equals) must overhang it as one of the rules for its width allows.
+    /// equals) picks the rules for its width; since OpenROAD #12103 ANY same-owner rectangle
+    /// holding the cut may supply the overhangs one of those rules allows.
     fn lef58_enclosure(&mut self, layer: usize, k: usize) {
         let v = self.shapes[layer][k];
         if v.fixed || self.tech.layers[layer].cut_enclosures.is_empty() {
@@ -3198,46 +3199,52 @@ impl<'a> Worker<'a> {
             self.tech.layers[layer].cut_enclosures.iter().copied().filter(|e| !e.eol && e.class == c && if above { !e.below_only } else { !e.above_only }).collect()
         };
         let (below, above) = (rules(false), rules(true));
-        let enclosing = |l: usize| -> Option<Shape> {
+        let enclosing = |l: usize| -> Option<(Shape, Vec<Shape>)> {
             let mut best: Option<Shape> = None;
+            let mut candidates = Vec::new();
             for o in self.query(l, &v.rect) {
                 let s = self.shapes[l][o];
                 if s.net != v.net || !(s.rect.xl <= v.rect.xl && s.rect.yl <= v.rect.yl && v.rect.xh <= s.rect.xh && v.rect.yh <= s.rect.yh) {
                     continue;
                 }
+                candidates.push(s);
                 if best.is_none_or(|b| width(&s.rect) > width(&b.rect)) {
                     best = Some(s);
                 }
             }
-            best
+            best.map(|b| (b, candidates))
         };
         // (Both looked up first: a check only adds markers, the queries read shapes.)
         let below_enc = if below.is_empty() { None } else { enclosing(layer - 1) };
         let above_enc = if above.is_empty() { None } else { enclosing(layer + 1) };
-        if let Some(e) = below_enc {
-            self.lef58_enclosure_main(layer, &v, layer - 1, &e, &below);
+        if let Some((e, cands)) = below_enc {
+            self.lef58_enclosure_main(layer, &v, layer - 1, &e, &cands, &below);
         }
-        if let Some(e) = above_enc {
-            self.lef58_enclosure_main(layer, &v, layer + 1, &e, &above);
+        if let Some((e, cands)) = above_enc {
+            self.lef58_enclosure_main(layer, &v, layer + 1, &e, &cands, &above);
         }
     }
 
-    /// `checkLef58Enclosure_main(via, enc)`: the cut's overhangs inside the metal (end along the
-    /// cut's longer side), against the rules of the widest WIDTH not above the metal's width, in
-    /// order; none satisfied gives a marker on the metal's layer, the cut's box, the cut its
-    /// victim and the metal its aggressor. A cut with no enclosing metal, or no rule for the
-    /// width, is skipped (the source reads a null there).
-    fn lef58_enclosure_main(&mut self, layer: usize, v: &Shape, el: usize, e: &Shape, rules: &[crate::tech::CutEnclosure]) {
+    /// `checkLef58Enclosure_main(via, enc, candidates)`: the rules of the widest WIDTH not above
+    /// the widest metal's (`enc`) width — none, nothing checked; then per candidate metal holding
+    /// the cut (OpenROAD #12103: every one, not only `enc`), the cut's overhangs inside it (end
+    /// along the cut's longer side) against those rules in order. None satisfied by any candidate
+    /// gives a marker on the metal's layer, the cut's box, the cut its victim and `enc` its
+    /// aggressor. A cut with no enclosing metal is skipped (the source reads a null there).
+    fn lef58_enclosure_main(&mut self, layer: usize, v: &Shape, el: usize, e: &Shape, candidates: &[Shape], rules: &[crate::tech::CutEnclosure]) {
         let (vr, er) = (v.rect, e.rect);
-        let mut side = (er.xh - vr.xh).min(vr.xl - er.xl);
-        let mut end = (er.yh - vr.yh).min(vr.yl - er.yl);
-        if vr.dx() > vr.dy() {
-            std::mem::swap(&mut side, &mut end);
-        }
         let w = width(&er);
         let Some(key) = rules.iter().map(|r| r.min_width).filter(|&mw| mw <= w).max() else { return };
-        if rules.iter().filter(|r| r.min_width == key).any(|r| r.valid(end, side)) {
-            return;
+        for c in candidates {
+            let cr = c.rect;
+            let mut side = (cr.xh - vr.xh).min(vr.xl - cr.xl);
+            let mut end = (cr.yh - vr.yh).min(vr.yl - cr.yl);
+            if vr.dx() > vr.dy() {
+                std::mem::swap(&mut side, &mut end);
+            }
+            if rules.iter().filter(|r| r.min_width == key).any(|r| r.valid(end, side)) {
+                return;
+            }
         }
         let owners = vec![self.owner(v.net).clone()];
         if self.seen.insert((vr, el, Rule::Lef58Enclosure, owners.clone())) {
@@ -4686,6 +4693,30 @@ mod enclosure_range_tests {
         assert_eq!(m.len(), 1, "{m:?}");
         assert_eq!(m[0].victim.as_ref().map(|v| (v.1, v.2)), Some((3, cut)));
         assert_eq!(m[0].aggressor.as_ref().map(|g| (g.1, g.2)), Some((4, metal)));
+    }
+
+    /// Rule (OpenROAD #12103, `checkLef58Enclosure_main`): the widest same-net metal holding the
+    /// cut picks the rules (by its width), but ANY same-net metal holding the cut may supply the
+    /// overhangs. Here the widest (a 300-wide plate, cut 10 from its left edge) fails a 30/30 rule
+    /// that a narrower 110-wide bar around the cut (30 each side, 30 each end) meets — no marker;
+    /// without the bar, one. Cut 100..150 square on layer 3, metal on 4.
+    #[test]
+    fn any_enclosing_metal_may_supply_the_overhangs() {
+        let cut = Rect::new(100, 100, 150, 150);
+        let run = |metals: &[Rect]| {
+            let mut t = tests::tech();
+            t.layers[3].cut_enclosures = vec![CutEnclosure { class: 0, above_only: true, below_only: false, eol: false, endside: false, first: 30, second: 30, min_width: 0 }];
+            let mut w = Worker::new(&t);
+            w.add(&Owner::Net("a".into()), 3, cut, false);
+            for m in metals {
+                w.add(&Owner::Net("a".into()), 4, *m, false);
+            }
+            w.init();
+            w.run().iter().filter(|m| m.rule == Rule::Lef58Enclosure).count()
+        };
+        let (plate, bar) = (Rect::new(90, 0, 390, 300), Rect::new(70, 70, 180, 180));
+        assert_eq!(run(&[plate]), 1);
+        assert_eq!(run(&[plate, bar]), 0);
     }
 
     // Rule (`checkMetalSpacing_prl_getReqSpcVal`): between two owners, a SPACING … RANGE rule
