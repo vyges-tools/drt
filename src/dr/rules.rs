@@ -106,10 +106,11 @@ pub struct RuleConfig {
 
 /// Each layer's default via (cut layers only), in layer order; generated vias are APPENDED to
 /// `tech.via_defs`. A cut layer's default is its least single-cut via ([`default_via`]; above the
-/// top routing layer, the least of the fewest-cut vias when none has one cut). Between the
-/// bottom and top routing layers (by layer number), a default whose shape on a routing layer is
-/// not square and runs across that layer's direction is replaced by a GENERATED via named after
-/// the cut layer + `_FR`: the same shapes, each misaligned one turned a quarter.
+/// top routing layer, the least of the fewest-cut vias when none has one cut). Up to the top
+/// routing layer (by layer number; since OpenROAD #12108 below the bottom routing layer too), a
+/// default whose shape on a routing layer is not square and runs across that layer's direction
+/// is replaced by a GENERATED via named after the cut layer + `_FR`: the same shapes, each
+/// misaligned one turned a quarter.
 pub fn default_vias(tech: &mut Tech, cfg: &RuleConfig) -> Vec<Option<usize>> {
     let mut out = Vec::with_capacity(tech.layers.len());
     for l in 0..tech.layers.len() {
@@ -119,7 +120,9 @@ pub fn default_vias(tech: &mut Tech, cfg: &RuleConfig) -> Vec<Option<usize>> {
         }
         let Some(v) = default_via(tech, l, cfg.top_routing_layer) else { continue };
         out[l] = Some(v);
-        if !(cfg.enable_via_gen && l >= cfg.bottom_routing_layer && l <= cfg.top_routing_layer) {
+        // `initDefaultVias` at the f11b4276 pin: ENABLE_VIA_GEN, at or below the top routing layer,
+        // with a default via (no bottom-routing-layer floor any more, OpenROAD #12108).
+        if !(cfg.enable_via_gen && l <= cfg.top_routing_layer) {
             continue;
         }
         let vd = &tech.via_defs[v];
@@ -757,8 +760,10 @@ mod tests {
         assert_eq!(merge_shrunk(&[(3, 4), (10, 20)]), vec![(4, 3), (11, 19)]);
     }
 
-    // A default via whose lower shape runs ACROSS its horizontal layer is replaced, within the
-    // routing layers, by a generated via turned a quarter; outside them it is kept.
+    // A default via whose lower shape runs ACROSS its horizontal layer is replaced, up to the top
+    // routing layer, by a generated via turned a quarter; above it, it is kept. Rule (OpenROAD
+    // #12108, `initDefaultVias`): BELOW the bottom routing layer it is generated too (the old
+    // floor `layerNum >= BOTTOM_ROUTING_LAYER` is gone).
     #[test]
     fn a_misaligned_default_via_is_generated_turned() {
         let v = via("v", r(-50, -100, 50, 100), r(-50, -100, 50, 100));
@@ -769,9 +774,9 @@ mod tests {
         assert_eq!(t.via_defs[1].layer1_figs, vec![r(-100, -50, 100, 50)]);
         assert_eq!(t.via_defs[1].layer2_figs, vec![r(-50, -100, 50, 100)]);
         let mut t = tech(vec![v.clone()]);
-        assert_eq!(default_vias(&mut t, &cfg(4, 4))[3], Some(0));
-        assert_eq!(t.via_defs.len(), 1);
-        // Above the top routing layer too.
+        assert_eq!(default_vias(&mut t, &cfg(4, 4))[3], Some(1), "below the routing floor: generated");
+        assert_eq!(t.via_defs.len(), 2);
+        // Above the top routing layer: kept.
         let mut t = tech(vec![v]);
         assert_eq!(default_vias(&mut t, &cfg(2, 2))[3], Some(0));
         assert_eq!(t.via_defs.len(), 1);
