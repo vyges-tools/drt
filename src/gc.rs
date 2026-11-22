@@ -4964,6 +4964,40 @@ mod eol_tests {
     const BLOCK: Rect = Rect { xl: 1150, yl: -500, xh: 1500, yh: 500 };
     const GAP: Rect = Rect { xl: 1000, yl: 0, xh: 1150, yh: 140 };
 
+    // Rule (`checkMetalEndOfLine_eol_hasEol_getQueryBox` / `_check` / `_endToEndHelper` /
+    // `_helper`; register D8, foundry confirmation): WITHIN is the end-of-line rule's
+    // APPLICABILITY WINDOW, never a geometric widening of the line end. It decides only WHICH
+    // facing edges the rule applies to — those running past the line end, sideways, by less than
+    // WITHIN (a strict overlap: `gtl::intersects(..., false)`, and a positive run in the
+    // end-to-end helper). It never extends the shape: the distance held to SPACING is measured
+    // from the line end itself, straight out (no corner-to-corner distance from a widened end),
+    // and the marker is the gap between the two real edges. Here WIRE's east end (y 0..140,
+    // WITHIN 30) has its window at y -30..170, and a facing edge 150 out (space 200) starts at
+    // y = top.
+    #[test]
+    fn within_is_the_lateral_window_of_the_line_end_never_a_widening_of_it() {
+        let facing = |top: i32| Rect::new(1150, top, 1500, 600);
+        for (name, run) in [
+            ("LEF 5.4 end-of-line", Box::new(|b: Rect| eol(&tech_with(rule()), &[("a", WIRE, false), ("b", b, true)], false)) as Box<dyn Fn(Rect) -> Vec<Rect>>),
+            ("LEF58 end-of-line", Box::new(|b: Rect| lef58(rule(), &[("a", WIRE, false), ("b", b, true)]))),
+        ] {
+            // Inside the window by 1: the rule applies; the marker is the gap from the line end's
+            // corner (y 140) to the facing edge, not stretched to the window (y 170).
+            assert_eq!(run(facing(169)), vec![Rect::new(1000, 140, 1150, 169)], "{name}: inside the window");
+            // On the window's edge and past it: no marker. A widened end (the end grown by WITHIN
+            // to y 170) would put these 150 from the edge, inside 200; the window does not.
+            assert!(run(facing(170)).is_empty(), "{name}: on the window's edge");
+            assert!(run(facing(171)).is_empty(), "{name}: past the window, though 150 from a widened end");
+            // An edge facing the whole end: the marker is exactly the line end's extent (y 0..140),
+            // not the window's (y -30..170).
+            assert_eq!(run(BLOCK), vec![GAP], "{name}: the marker spans the line end, not the window");
+        }
+        // A wider WITHIN only widens the window: the edge past 30 is now inside 60, and the
+        // marker still starts at the line end's corner.
+        let wide = EolRule { within: 60, ..rule() };
+        assert_eq!(lef58(wide, &[("a", WIRE, false), ("b", facing(171), true)]), vec![Rect::new(1000, 140, 1150, 171)]);
+    }
+
     /// The base case: one marker, spanning the gap between the line end and the facing edge.
     #[test]
     fn a_line_end_facing_an_edge_within_space() {
