@@ -127,6 +127,114 @@ pub struct Layer {
     /// (`frLef58SpacingWrongDirConstraint`, one per rule), in the technology's order, see
     /// [`read::lef58_wrong_dir_spacing_rules`].
     pub lef58_wrong_dir_spacing: Vec<WrongDirSpacing>,
+    /// A routing layer's LEF58_FORBIDDENSPACING rules io keeps (`frLef58ForbiddenSpcConstraint`,
+    /// one per rule), in the technology's order, see [`read::lef58_forbidden_spacing_rules`].
+    pub lef58_forbidden_spacing: Vec<ForbiddenSpacing>,
+}
+
+/// A LEF58_FORBIDDENSPACING rule as io keeps it and the check reads it
+/// (`frLef58ForbiddenSpcConstraint`): a maximal rectangle narrower than `width`, longer than
+/// `prl`, with other metal within `two_edges` of it on both sides, breaks it when a parallel
+/// rectangle lies `min_spc..=max_spc` away across it, with a third shape between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForbiddenSpacing {
+    pub min_spc: i32,
+    pub max_spc: i32,
+    pub width: i32,
+    pub prl: i32,
+    pub two_edges: i32,
+}
+
+impl ForbiddenSpacing {
+    /// `isWidthValid`: strictly narrower than WIDTH.
+    pub fn width_valid(&self, width: i32) -> bool {
+        width < self.width
+    }
+    /// `isPrlValid`: strictly longer than PRL.
+    pub fn prl_valid(&self, prl: i32) -> bool {
+        prl > self.prl
+    }
+    /// `isForbiddenSpc`: within the band, both ends included.
+    pub fn forbidden(&self, spc: i32) -> bool {
+        spc >= self.min_spc && spc <= self.max_spc
+    }
+}
+
+/// One LEF58_FORBIDDENSPACING statement as written:
+/// `FORBIDDENSPACING min max [SAMEMASK] WIDTH w [WITHIN d] [PRL p] [TWOEDGES t] ;`, distances in
+/// database units. A clause not written reads 0, as the database stores it (its `has…` is "not 0").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForbiddenSpacingStatement {
+    pub min_spc: i32,
+    pub max_spc: i32,
+    pub same_mask: bool,
+    pub width: i32,
+    pub within: i32,
+    pub prl: i32,
+    pub two_edges: i32,
+}
+
+/// The statements of a LEF58_FORBIDDENSPACING property text, in order: split at `;`, each trimmed
+/// and the empty ones dropped (`processRules`); each read by the database reader's grammar
+/// (`lefTechLayerForbiddenSpacingRuleParser`: the pair, then WIDTH, then WITHIN, PRL, TWOEDGES in
+/// that order, each optional; a statement without WIDTH does not parse there either) with one
+/// addition: SAMEMASK after the pair. The reference's grammar has no SAMEMASK and drops such a
+/// statement with ODB-0438; a router has no masks, so the statement is kept and checked on every
+/// pair whatever its masks (stricter than SAMEMASK), as this router checks LEF58 end-of-line
+/// SAMEMASK. Distances convert as the reader converts them (`dbdist`: rounded to the nearest
+/// database unit, halves away from zero). `Err` names a statement that does not parse.
+pub fn parse_forbidden_spacing(text: &str, dbu: i32) -> Vec<Result<ForbiddenSpacingStatement, String>> {
+    text.split(';').map(str::trim).filter(|s| !s.is_empty()).map(|s| parse_forbidden_spacing_statement(s, dbu).ok_or_else(|| s.to_string())).collect()
+}
+
+fn parse_forbidden_spacing_statement(s: &str, dbu: i32) -> Option<ForbiddenSpacingStatement> {
+    let mut t = s.split_whitespace().peekable();
+    let num = |t: &mut std::iter::Peekable<std::str::SplitWhitespace<'_>>| -> Option<i32> {
+        let v: f64 = t.next()?.parse().ok()?;
+        v.is_finite().then(|| (v * f64::from(dbu)).round() as i32)
+    };
+    if t.next()? != "FORBIDDENSPACING" {
+        return None;
+    }
+    let mut st = ForbiddenSpacingStatement { min_spc: num(&mut t)?, max_spc: num(&mut t)?, ..Default::default() };
+    if t.peek() == Some(&"SAMEMASK") {
+        t.next();
+        st.same_mask = true;
+    }
+    if t.next()? != "WIDTH" {
+        return None;
+    }
+    st.width = num(&mut t)?;
+    if t.peek() == Some(&"WITHIN") {
+        t.next();
+        st.within = num(&mut t)?;
+    }
+    if t.peek() == Some(&"PRL") {
+        t.next();
+        st.prl = num(&mut t)?;
+    }
+    if t.peek() == Some(&"TWOEDGES") {
+        t.next();
+        st.two_edges = num(&mut t)?;
+    }
+    t.next().is_none().then_some(st)
+}
+
+/// io's reading of one statement (`io::Parser::setRoutingLayerProperties`): skipped, with the
+/// clause that skips it, without TWOEDGES (DRT-619), PRL (DRT-620) or WIDTH (DRT-621), or with
+/// WITHIN (DRT-622), tested in that order; else one constraint.
+pub fn forbidden_spacing_kept(st: &ForbiddenSpacingStatement) -> Result<ForbiddenSpacing, &'static str> {
+    if st.two_edges == 0 {
+        Err("no TWOEDGES")
+    } else if st.prl == 0 {
+        Err("no PRL")
+    } else if st.width == 0 {
+        Err("no WIDTH")
+    } else if st.within != 0 {
+        Err("WITHIN")
+    } else {
+        Ok(ForbiddenSpacing { min_spc: st.min_spc, max_spc: st.max_spc, width: st.width, prl: st.prl, two_edges: st.two_edges })
+    }
 }
 
 /// A LEF58_SPACING `SPACING s WRONGDIRECTION [NONEOL w] [PRL p]` rule as the check reads it: two
@@ -1576,7 +1684,8 @@ pub mod read {
                     let lef58_min_step = lef58_min_step_rules(db, &name);
                     let width_tbl_orth = width_tbl_orth(db, &name, dir == Dir::Horizontal);
                     let lef58_wrong_dir_spacing = lef58_wrong_dir_spacing_rules(db, &name);
-                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth, lef58_wrong_dir_spacing });
+                    let lef58_forbidden_spacing = lef58_forbidden_spacing_rules(db, &name);
+                    layers.push(Layer { name, kind: LayerKind::Routing, dir, width, min_width, pitch, wrong_way_width, spacing, cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol, lef58_eol, eol_keepout, corner_spacing, min_area, min_enclosed_areas, rect_only, right_way_on_grid_only, num_masks, min_cuts, mt_safe_dist: 0, min_step, lef58_min_step, spacing_ranges, lef58_area, orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth, lef58_wrong_dir_spacing, lef58_forbidden_spacing });
                 }
                 // `addCutLayer`: a MIM capacitor cut is not read; the first layer read being a cut
                 // layer, the masterslice placeholder goes below it and the cut layer itself is
@@ -1798,6 +1907,25 @@ pub mod read {
     /// skips, in the rules' order.
     pub fn lef58_wrong_dir_spacing_skip_warnings(db: &Db, layer: &str) -> Vec<(u16, String)> {
         (0..db.num_layer_get_tech_layer_wrong_dir_spacing_rules(layer)).filter_map(|k| lef58_wrong_dir_spacing_skip(db, layer, k)).collect()
+    }
+
+    /// The LEF58_FORBIDDENSPACING statements of layer `layer`, read from the property text the
+    /// database keeps on the layer ([`super::parse_forbidden_spacing`]: the database reader's
+    /// grammar, plus SAMEMASK), in the text's order. Read from the text, not the database's rule
+    /// objects, because the reference's reader drops a SAMEMASK statement (ODB-0438) and a
+    /// database written by it holds no rule for one.
+    pub fn lef58_forbidden_spacing_statements(db: &Db, layer: &str) -> Vec<Result<ForbiddenSpacingStatement, String>> {
+        let dbu = db.tech_get_db_units_per_micron();
+        db.layer_string_properties(layer).into_iter().filter(|(k, _)| k == "LEF58_FORBIDDENSPACING").flat_map(|(_, v)| super::parse_forbidden_spacing(&v, dbu)).collect()
+    }
+
+    /// The LEF58_FORBIDDENSPACING rules of routing layer `layer` io keeps, in the technology's
+    /// order (`setRoutingLayerProperties`, after LEF58_TWOWIRESFORBIDDENSPACING): each statement
+    /// [`super::forbidden_spacing_kept`] keeps. Read by the check alone (`checkForbiddenSpc_main`,
+    /// per maximal rectangle after its metal spacing); the router has no cost for it and meets it
+    /// by rip-up and reroute, as the reference does.
+    pub fn lef58_forbidden_spacing_rules(db: &Db, layer: &str) -> Vec<ForbiddenSpacing> {
+        lef58_forbidden_spacing_statements(db, layer).iter().filter_map(|s| s.as_ref().ok()).filter_map(|s| super::forbidden_spacing_kept(s).ok()).collect()
     }
 
     /// The LEF58_MINSTEP rules of routing layer `layer` io keeps, in the technology's order
@@ -2161,6 +2289,39 @@ pub mod read {
     /// orientation is applied about (they differ for every flipped or rotated instance).
     pub fn location(db: &Db, inst: &str) -> (i32, i32) {
         (db.inst_get_location_x(inst), db.inst_get_location_y(inst))
+    }
+}
+
+#[cfg(test)]
+mod forbidden_spacing_read_tests {
+    use super::*;
+
+    // Rule (`lefTechLayerForbiddenSpacingRuleParser`): the pair, then WIDTH, WITHIN, PRL, TWOEDGES
+    // in that order; a statement without WIDTH does not parse; statements split at `;`, empty
+    // ones dropped; distances rounded to the nearest unit (`dbdist`). Ours adds SAMEMASK after
+    // the pair, which the reference's grammar rejects (ODB-0438).
+    #[test]
+    fn statements_parse_with_and_without_samemask() {
+        let t = "\n  FORBIDDENSPACING 1.11 1.53 SAMEMASK WIDTH 0.55 PRL 0.91 TWOEDGES 0.57 ;\n FORBIDDENSPACING 1.11 1.53 WIDTH 0.55 WITHIN 0.0004 ; ;";
+        let got = parse_forbidden_spacing(t, 2000);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Ok(ForbiddenSpacingStatement { min_spc: 2220, max_spc: 3060, same_mask: true, width: 1100, within: 0, prl: 1820, two_edges: 1140 }));
+        assert_eq!(got[1].as_ref().map(|s| (s.same_mask, s.within)), Ok((false, 1)), "0.0004 x 2000 rounds to 1");
+        assert!(parse_forbidden_spacing("FORBIDDENSPACING 1.11 1.53 ;", 2000)[0].is_err(), "no WIDTH");
+        assert!(parse_forbidden_spacing("FORBIDDENSPACING 1.11 1.53 WIDTH 0.55 TWOEDGES 0.57 PRL 0.91 ;", 2000)[0].is_err(), "out of order");
+        assert!(parse_forbidden_spacing("FORBIDDENSPACING 1.11 1.53 WIDTH 0.55 SAMEMASK ;", 2000)[0].is_err(), "SAMEMASK only after the pair");
+    }
+
+    // Rule (io `setRoutingLayerProperties`): skipped without TWOEDGES (DRT-619), PRL (DRT-620) or
+    // WIDTH (DRT-621), or with WITHIN (DRT-622), tested in that order.
+    #[test]
+    fn io_keeps_only_twoedges_prl_width_without_within() {
+        let full = ForbiddenSpacingStatement { min_spc: 2220, max_spc: 3060, same_mask: true, width: 1100, within: 0, prl: 1820, two_edges: 1140 };
+        assert_eq!(forbidden_spacing_kept(&full), Ok(ForbiddenSpacing { min_spc: 2220, max_spc: 3060, width: 1100, prl: 1820, two_edges: 1140 }));
+        assert_eq!(forbidden_spacing_kept(&ForbiddenSpacingStatement { two_edges: 0, prl: 0, ..full }), Err("no TWOEDGES"));
+        assert_eq!(forbidden_spacing_kept(&ForbiddenSpacingStatement { prl: 0, within: 7, ..full }), Err("no PRL"));
+        assert_eq!(forbidden_spacing_kept(&ForbiddenSpacingStatement { width: 0, within: 7, ..full }), Err("no WIDTH"));
+        assert_eq!(forbidden_spacing_kept(&ForbiddenSpacingStatement { within: 7, ..full }), Err("WITHIN"));
     }
 }
 

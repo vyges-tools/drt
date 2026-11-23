@@ -28,7 +28,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::polygon90::{Polygon90Set, Rect};
 use crate::rtree::DynRTree;
-use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech, WidthTblOrth, WrongDirSpacing};
+use crate::tech::{AdjacentCuts, CornerSpacing, CutCorner, CutSpacingTable, EolKeepOut, EolRule, ForbiddenSpacing, LayerKind, Lef58CutSpacing, MinSpacing, ParallelEdge, Tech, WidthTblOrth, WrongDirSpacing};
 
 /// Who a shape belongs to. Two shapes are the same net exactly when their owners are equal.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -156,6 +156,11 @@ pub enum Rule {
     /// rule's place among the layer's kept rules (the reference keeps a marker once per
     /// constraint).
     Lef58SpacingWrongDir(u16),
+    /// A narrow rectangle with metal close on both sides and a parallel rectangle in a
+    /// LEF58_FORBIDDENSPACING band across it, a third shape between the two
+    /// (`checkForbiddenSpc_main`); the rule's place among the layer's kept rules (the reference
+    /// keeps a marker once per constraint).
+    Lef58ForbiddenSpacing(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -173,6 +178,9 @@ pub struct Marker {
     /// A second victim, for a check that names two (`checkCutSpacingTableOrthogonal_helper`:
     /// the pair; the third cut is the aggressor).
     pub second_victim: Option<Side>,
+    /// A second aggressor, for a check that names two (`checkForbiddenSpc_main`: the facing
+    /// rectangle and the shape between; the reference keeps its aggressors in the order added).
+    pub second_aggressor: Option<Side>,
 }
 
 /// The markers' final order: each run of consecutive markers alike in layer, rule, x extent and
@@ -293,7 +301,7 @@ pub type Side = (Owner, usize, Rect, bool);
 impl Marker {
     /// A copy as the design and a worker's starting list hold it: its sources, not its sides.
     pub fn copied(&self) -> Marker {
-        Marker { victim: None, aggressor: None, second_victim: None, ..self.clone() }
+        Marker { victim: None, aggressor: None, second_victim: None, second_aggressor: None, ..self.clone() }
     }
 }
 
@@ -837,6 +845,19 @@ fn wrong_dir_prl(a: &Seg, b: &Seg) -> i32 {
 }
 
 /// `gtl::euclidean_distance` of two rectangles, stored in an frCoord (truncated).
+/// `checkForbiddenSpc_queryBox`: the rectangle's extent along its run, and across it the band
+/// `min..=max` beyond its high side (`right`) or its low side.
+fn forbidden_spacing_query_box(r: &Rect, min: i32, max: i32, is_h: bool, right: bool) -> Rect {
+    let mut q = *r;
+    match (is_h, right) {
+        (true, true) => (q.yl, q.yh) = (r.yh + min, r.yh + max),
+        (true, false) => (q.yl, q.yh) = (r.yl - max, r.yl - min),
+        (false, true) => (q.xl, q.xh) = (r.xh + min, r.xh + max),
+        (false, false) => (q.xl, q.xh) = (r.xl - max, r.xl - min),
+    }
+    q
+}
+
 fn rect_distance(a: &Rect, b: &Rect) -> i32 {
     let gap = |al: i32, ah: i32, bl: i32, bh: i32| i64::from((bl - ah).max(al - bh).max(0));
     let (gx, gy) = (gap(a.xl, a.xh, b.xl, b.xh), gap(a.yl, a.yh, b.yl, b.yh));
@@ -1378,7 +1399,7 @@ impl<'a> Worker<'a> {
             if self.seen.insert((b, layer, Rule::MinimumCut, owners.clone())) {
                 let victim = (self.owner(r.net).clone(), layer, r.rect, r.fixed);
                 let aggressor = (self.owner(via.net).clone(), vl, via.rect, via.fixed);
-                self.markers.push(Marker { rule: Rule::MinimumCut, layer, bbox: b, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
+                self.markers.push(Marker { rule: Rule::MinimumCut, layer, bbox: b, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None, second_aggressor: None });
             }
         }
     }
@@ -1443,7 +1464,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, layer, rule, owners.clone())) {
             let victim = (self.owner(v.0).clone(), layer, v.1, v.2);
             let aggressor = (self.owner(g.0).clone(), layer, g.1, g.2);
-            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
+            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None, second_aggressor: None });
         }
     }
 
@@ -1456,7 +1477,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, v.1, rule, owners.clone())) {
             let victim = (self.owner(v.0).clone(), v.1, v.2, v.3);
             let aggressor = (self.owner(g.0).clone(), g.1, g.2, g.3);
-            self.markers.push(Marker { rule, layer: v.1, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
+            self.markers.push(Marker { rule, layer: v.1, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None, second_aggressor: None });
         }
     }
 
@@ -2449,6 +2470,10 @@ impl<'a> Worker<'a> {
                 for k in mine {
                     let s = self.shapes[layer][k];
                     self.metal_spacing_of(layer, s, false);
+                    // The rectangle's LEF58_FORBIDDENSPACING rules, after its metal spacing.
+                    for i in 0..self.tech.layers[layer].lef58_forbidden_spacing.len() {
+                        self.check_forbidden_spacing(layer, k, i);
+                    }
                 }
                 // The owner's special spacing rectangles (on any layer; markers are kept once).
                 if self.check_ndrs {
@@ -2504,6 +2529,98 @@ impl<'a> Worker<'a> {
                 continue;
             }
             self.add_marker_of(rule, layer, generalized_intersect(&r1, &r2), (edge.net, r1, edge.fixed), (other.net, r2, other.fixed));
+        }
+    }
+
+    /// `checkForbiddenSpc_main(rect, con)` for the layer's kept rule `i` on maximal rectangle `k`:
+    /// a rectangle narrower than WIDTH and longer than PRL, across from its long side (the layer's
+    /// direction for a square), with metal within TWOEDGES on both sides
+    /// ([`Self::forbidden_spacing_two_edges`]); then every rectangle touching the band beyond one
+    /// side, then the other ([`forbidden_spacing_query_box`]; one list, in the tree's order per
+    /// query), other than `k` and, unless square, running the same way:
+    /// [`Self::forbidden_spacing_pair`].
+    fn check_forbidden_spacing(&mut self, layer: usize, k: usize, i: usize) {
+        let con = self.tech.layers[layer].lef58_forbidden_spacing[i];
+        let r = self.shapes[layer][k].rect;
+        let (w, len) = (r.dx().min(r.dy()), r.dx().max(r.dy()));
+        if !con.width_valid(w) || !con.prl_valid(len) {
+            return;
+        }
+        let mut is_h = self.tech.layers[layer].dir == crate::tech::Dir::Horizontal;
+        if w != len {
+            is_h = r.dx() > r.dy();
+        }
+        if !self.forbidden_spacing_two_edges(layer, k, con.two_edges, is_h) {
+            return;
+        }
+        let mut result = self.query(layer, &forbidden_spacing_query_box(&r, con.min_spc, con.max_spc, is_h, true));
+        result.extend(self.query(layer, &forbidden_spacing_query_box(&r, con.min_spc, con.max_spc, is_h, false)));
+        let rule = Rule::Lef58ForbiddenSpacing(u16::try_from(i).unwrap_or(u16::MAX));
+        for o in result {
+            if o == k {
+                continue;
+            }
+            let p = self.shapes[layer][o].rect;
+            if p.dx() != p.dy() && (p.dx() > p.dy()) != is_h {
+                continue;
+            }
+            self.forbidden_spacing_pair(layer, (k, o), &con, is_h, rule);
+        }
+    }
+
+    /// `checkForbiddenSpc_twoedges`: some rectangle other than `k` touches the box TWOEDGES deep
+    /// beyond each of its two long sides.
+    fn forbidden_spacing_two_edges(&self, layer: usize, k: usize, within: i32, is_h: bool) -> bool {
+        let r = self.shapes[layer][k].rect;
+        [true, false].into_iter().all(|right| self.query(layer, &forbidden_spacing_query_box(&r, 0, within, is_h, right)).into_iter().any(|o| o != k))
+    }
+
+    /// `checkForbiddenSpc_main(rect1, rect2, con, isH)`: apart (not touching), running parallel
+    /// longer than PRL along the rule's axis, and spaced within the band across it; then every
+    /// rectangle touching the box between them (tree order), not `k1` or `k2`, touching neither,
+    /// overlapping the box with an area, not all three fixed, and with a route shape near the box
+    /// on one of the three ([`Self::has_route`]): a marker on the box, `k1` the victim, `k2` then
+    /// the third the aggressors.
+    fn forbidden_spacing_pair(&mut self, layer: usize, (k1, k2): (usize, usize), con: &ForbiddenSpacing, is_h: bool, rule: Rule) {
+        let (s1, s2) = (self.shapes[layer][k1], self.shapes[layer][k2]);
+        let marker = generalized_intersect(&s1.rect, &s2.rect);
+        let (mut prl_x, mut prl_y) = (marker.dx(), marker.dy());
+        let dist_x = gap((s1.rect.xl, s1.rect.xh), (s2.rect.xl, s2.rect.xh));
+        let dist_y = gap((s1.rect.yl, s1.rect.yh), (s2.rect.yl, s2.rect.yh));
+        if dist_x == 0 && dist_y == 0 {
+            return;
+        }
+        if dist_x != 0 {
+            prl_x = -prl_x;
+        }
+        if dist_y != 0 {
+            prl_y = -prl_y;
+        }
+        if !con.prl_valid(if is_h { prl_x } else { prl_y }) || !con.forbidden(if is_h { dist_y } else { dist_x }) {
+            return;
+        }
+        for o in self.query(layer, &marker) {
+            if o == k1 || o == k2 {
+                continue;
+            }
+            let s3 = self.shapes[layer][o];
+            if touches(&s3.rect, &s1.rect) || touches(&s3.rect, &s2.rect) || overlap(&marker, &s3.rect).is_none() {
+                continue;
+            }
+            if s1.fixed && s2.fixed && s3.fixed {
+                continue;
+            }
+            if !self.has_route(layer, &s1, &marker) && !self.has_route(layer, &s2, &marker) && !self.has_route(layer, &s3, &marker) {
+                continue;
+            }
+            let mut owners = vec![self.owner(s1.net).clone(), self.owner(s2.net).clone(), self.owner(s3.net).clone()];
+            owners.sort();
+            owners.dedup();
+            if self.seen.insert((marker, layer, rule, owners.clone())) {
+                let side = |s: &Shape| (self.owner(s.net).clone(), layer, s.rect, s.fixed);
+                let (victim, aggressor, second_aggressor) = (side(&s1), side(&s2), side(&s3));
+                self.markers.push(Marker { rule, layer, bbox: marker, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None, second_aggressor: Some(second_aggressor) });
+            }
         }
     }
 
@@ -2961,7 +3078,7 @@ impl<'a> Worker<'a> {
                 let side = |s: &Shape| (self.owner(s.net).clone(), layer, s.rect, s.fixed);
                 let (victim, second_victim) = (side(&s1), side(&s2));
                 let aggressor = (self.owner(s3.net).clone(), layer, s3.rect, s3.fixed);
-                self.markers.push(Marker { rule: Rule::SpacingTableOrth, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: Some(second_victim) });
+                self.markers.push(Marker { rule: Rule::SpacingTableOrth, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: Some(second_victim), second_aggressor: None });
             }
         }
     }
@@ -3180,7 +3297,7 @@ impl<'a> Worker<'a> {
         if self.seen.insert((bbox, layer, rule, owners.clone())) {
             let victim = (self.owner(cut.net).clone(), layer, cut.rect, cut.fixed);
             let aggressor = (self.owner(metal.net).clone(), sl, Rect::new(c.x, c.y, c.x, c.y), c.fixed);
-            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
+            self.markers.push(Marker { rule, layer, bbox, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None, second_aggressor: None });
         }
     }
 
@@ -3252,7 +3369,7 @@ impl<'a> Worker<'a> {
             // formerly divergence D5, internal patch 0011, both retired at this repin).
             let victim = (self.owner(v.net).clone(), layer, vr, v.fixed);
             let aggressor = (self.owner(e.net).clone(), el, er, e.fixed);
-            self.markers.push(Marker { rule: Rule::Lef58Enclosure, layer: el, bbox: vr, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None });
+            self.markers.push(Marker { rule: Rule::Lef58Enclosure, layer: el, bbox: vr, owners, victim: Some(victim), aggressor: Some(aggressor), second_victim: None, second_aggressor: None });
         }
     }
 
@@ -3507,7 +3624,7 @@ pub(crate) mod tests {
     fn marker_at(yl: i32, yh: i32, xh: i32) -> Marker {
         let o = Owner::Net("a".into());
         let r = Rect { xl: 0, yl, xh, yh };
-        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o, 4, r, false)), second_victim: None }
+        Marker { rule: Rule::Short, layer: 4, bbox: r, owners: vec![o.clone()], victim: Some((o.clone(), 4, r, false)), aggressor: Some((o, 4, r, false)), second_victim: None, second_aggressor: None }
     }
 
     /// Rule: a run of consecutive markers alike in layer, rule, x extent and owners is re-sorted by
@@ -3530,9 +3647,9 @@ pub(crate) mod tests {
             layers: vec![
                 Layer::default(),
                 Layer::default(),
-                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None, lef58_wrong_dir_spacing: vec![] },
+                Layer { name: "l2".into(), kind: LayerKind::Routing, dir: Dir::Vertical, width: 170, min_width: 170, pitch: 480, wrong_way_width: 170, spacing: Some(table(vec![(0, 170)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None, lef58_wrong_dir_spacing: vec![], lef58_forbidden_spacing: vec![] },
                 Layer { name: "c3".into(), kind: LayerKind::Cut, width: 170, cut_spacing: Some(190), ..Layer::default() },
-                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None, lef58_wrong_dir_spacing: vec![] },
+                Layer { name: "l4".into(), kind: LayerKind::Routing, dir: Dir::Horizontal, width: 140, min_width: 140, pitch: 370, wrong_way_width: 140, spacing: Some(table(vec![(0, 140), (3000, 280)]).into()), cut_spacing: None, cut_classes: vec![], cut_table: None, cut_table_same_net: None, cut_table_inter: None, cut_enclosures: vec![], lef58_cut_spacing: vec![], eol: vec![], lef58_eol: vec![], eol_keepout: vec![], corner_spacing: vec![], min_area: 0, min_enclosed_areas: vec![], rect_only: false, right_way_on_grid_only: false, num_masks: 1, min_cuts: vec![], mt_safe_dist: 0, min_step: None, lef58_min_step: vec![], spacing_ranges: vec![], lef58_area: Default::default(), orth_spacing: vec![], lef58_max_spacing: vec![], width_tbl_orth: None, lef58_wrong_dir_spacing: vec![], lef58_forbidden_spacing: vec![] },
             ],
             obs_own_width: false,
             manufacturing_grid: 5,
@@ -4778,7 +4895,7 @@ mod patch_tests {
     #[test]
     fn a_patch_stretches_the_markers_it_touches_to_its_origin() {
         let p = PatchWire { layer: 4, origin: (100, 50), offset: Rect::new(0, -10, 40, 10), owner: Owner::Net("a".into()) };
-        let m = |owner: &str, layer: usize, b: Rect| Marker { rule: Rule::CornerSpacing, layer, bbox: b, owners: vec![Owner::Net(owner.into())], victim: None, aggressor: None, second_victim: None };
+        let m = |owner: &str, layer: usize, b: Rect| Marker { rule: Rule::CornerSpacing, layer, bbox: b, owners: vec![Owner::Net(owner.into())], victim: None, aggressor: None, second_victim: None, second_aggressor: None };
         let mut ms = vec![m("a", 4, Rect::new(130, 40, 160, 60)), m("b", 4, Rect::new(130, 40, 160, 60)), m("a", 6, Rect::new(130, 40, 160, 60)), m("a", 4, Rect::new(90, 40, 160, 60)), m("a", 4, Rect::new(141, 40, 160, 60))];
         modify_markers(&mut ms, &[p]);
         let boxes: Vec<Rect> = ms.iter().map(|m| m.bbox).collect();
@@ -5857,5 +5974,108 @@ mod wrong_dir_spacing_tests {
         let m = run(4, rules.clone(), &pair(50));
         assert_eq!(m.iter().map(|m| (m.rule, m.bbox)).collect::<BTreeSet<_>>(), BTreeSet::from([(Rule::Lef58SpacingWrongDir(0), Rect::new(40, 0, 90, 240)), (Rule::Lef58SpacingWrongDir(1), Rect::new(40, 0, 90, 240))]));
         assert_eq!(run(4, rules, &pair(60)).iter().map(|m| m.rule).collect::<Vec<_>>(), [Rule::Lef58SpacingWrongDir(1)]);
+    }
+}
+
+#[cfg(test)]
+mod forbidden_spacing_tests {
+    //! LEF58_FORBIDDENSPACING on constructed geometry, layer 4 of `tests::tech()` (horizontal).
+    //! Wire `a` (470 wide, 4100 long) has `n0` 330 below and the wide `n1` (640, never checked
+    //! itself) 330 above; the facing wire `b` is `d` above `a`, `n1` between them.
+    use super::*;
+
+    const K: ForbiddenSpacing = ForbiddenSpacing { min_spc: 1110, max_spc: 1530, width: 550, prl: 910, two_edges: 570 };
+
+    fn run(rule: ForbiddenSpacing, shapes: &[(&str, Rect, bool)]) -> Vec<Marker> {
+        let mut t = tests::tech();
+        t.layers[4].lef58_forbidden_spacing = vec![rule];
+        let mut w = Worker::new(&t);
+        for (net, r, fixed) in shapes {
+            w.add(&Owner::Net((*net).into()), 4, *r, *fixed);
+        }
+        w.init();
+        w.run().iter().filter(|m| matches!(m.rule, Rule::Lef58ForbiddenSpacing(_))).cloned().collect()
+    }
+
+    fn a() -> (&'static str, Rect, bool) {
+        ("a", Rect::new(0, 0, 4100, 470), false)
+    }
+    fn n0() -> (&'static str, Rect, bool) {
+        ("n0", Rect::new(0, -800, 4100, -330), false)
+    }
+    fn n1() -> (&'static str, Rect, bool) {
+        ("n1", Rect::new(0, 800, 4100, 1440), false)
+    }
+    fn b(d: i32) -> (&'static str, Rect, bool) {
+        ("b", Rect::new(0, 470 + d, 4100, 940 + d), false)
+    }
+    fn case(d: i32) -> Vec<(&'static str, Rect, bool)> {
+        vec![a(), n0(), n1(), b(d)]
+    }
+
+    // Rule (`checkForbiddenSpc_main(rect1, rect2)`): the spacing across the run is forbidden from
+    // the band's low end to its high end, both included; the marker is the box between the two,
+    // the checked wire the victim, the facing wire then the shape between the aggressors.
+    #[test]
+    fn a_facing_wire_inside_the_band_with_a_shape_between_is_marked_ends_included() {
+        let m = run(K, &case(1300));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].bbox, Rect::new(0, 470, 4100, 1770));
+        assert_eq!(m[0].rule, Rule::Lef58ForbiddenSpacing(0));
+        let name = |s: &Option<Side>| match s.as_ref().map(|s| &s.0) {
+            Some(Owner::Net(n)) => n.clone(),
+            _ => String::new(),
+        };
+        assert_eq!((name(&m[0].victim), name(&m[0].aggressor), name(&m[0].second_aggressor)), ("a".into(), "b".into(), "n1".into()));
+        assert_eq!(m[0].owners, vec![Owner::Net("a".into()), Owner::Net("b".into()), Owner::Net("n1".into())]);
+        assert_eq!(run(K, &case(1110)).len(), 1, "low end included");
+        assert_eq!(run(K, &case(1530)).len(), 1, "high end included");
+        assert!(run(K, &case(1109)).is_empty(), "below the band");
+        assert!(run(K, &case(1531)).is_empty(), "above the band");
+    }
+
+    // Rule (`checkForbiddenSpc_main(rect, con)`): only a rectangle strictly narrower than WIDTH
+    // and strictly longer than PRL is checked; (`(rect1, rect2)`) the two must run parallel
+    // strictly longer than PRL.
+    #[test]
+    fn width_and_parallel_run_are_strict() {
+        assert!(run(ForbiddenSpacing { width: 470, ..K }, &case(1300)).is_empty(), "470 is not narrower than 470");
+        assert_eq!(run(ForbiddenSpacing { width: 471, ..K }, &case(1300)).len(), 1);
+        assert!(run(ForbiddenSpacing { prl: 4100, ..K }, &case(1300)).is_empty(), "4100 is not longer than 4100");
+        let short_b = ("b", Rect::new(0, 1770, 910, 2240), false);
+        assert!(run(K, &[a(), n0(), n1(), short_b]).is_empty(), "a parallel run of 910 is not longer than 910");
+        let longer_b = ("b", Rect::new(0, 1770, 911, 2240), false);
+        assert_eq!(run(K, &[a(), n0(), n1(), longer_b]).len(), 1);
+    }
+
+    // Rule (`checkForbiddenSpc_twoedges`): metal within TWOEDGES on BOTH sides (touching the box
+    // counts), any owner.
+    #[test]
+    fn metal_within_twoedges_is_needed_on_both_sides() {
+        assert!(run(K, &[a(), n1(), b(1300)]).is_empty(), "nothing below");
+        assert!(run(ForbiddenSpacing { two_edges: 329, ..K }, &case(1300)).is_empty(), "330 away is beyond 329");
+        assert_eq!(run(ForbiddenSpacing { two_edges: 330, ..K }, &case(1300)).len(), 1, "touching the box counts");
+    }
+
+    // Rule (`checkForbiddenSpc_main(rect1, rect2)`): the shape between must touch neither wire;
+    // all three fixed is no marker; a facing rectangle running the other way is not checked.
+    #[test]
+    fn the_shape_between_touches_neither_not_all_fixed_same_direction() {
+        let touching = ("n1", Rect::new(0, 800, 4100, 1770), false);
+        assert!(run(K, &[a(), n0(), touching, b(1300)]).is_empty(), "between shape touches b");
+        let fixed = |s: (&'static str, Rect, bool)| (s.0, s.1, true);
+        assert!(run(K, &[fixed(a()), n0(), fixed(n1()), fixed(b(1300))]).is_empty(), "all three fixed");
+        assert_eq!(run(K, &[a(), n0(), fixed(n1()), fixed(b(1300))]).len(), 1, "one route is enough");
+        let vertical_b = ("b", Rect::new(0, 1770, 1000, 4000), false);
+        assert!(run(K, &[a(), n0(), n1(), vertical_b]).is_empty(), "a vertical facing rectangle");
+    }
+
+    // Rule (`checkForbiddenSpc_main(rect, con)`): both sides are searched — the same case
+    // mirrored, the facing wire below.
+    #[test]
+    fn a_facing_wire_below_is_found_too() {
+        let flip = |s: (&'static str, Rect, bool)| (s.0, Rect::new(s.1.xl, -s.1.yh, s.1.xh, -s.1.yl), s.2);
+        let m = run(K, &case(1300).into_iter().map(flip).collect::<Vec<_>>());
+        assert_eq!(m.iter().map(|m| m.bbox).collect::<Vec<_>>(), [Rect::new(0, -1770, 4100, -470)]);
     }
 }

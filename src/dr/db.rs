@@ -165,6 +165,12 @@ pub fn unmodelled_rules(db: &Db, tech: &Tech) -> Vec<String> {
                 // pass (`checkMetalShape_addPatch`), its only consumers; the forms io skips are
                 // skipped with a warning (`skipped_rules`), and io keeps nothing else.
                 "lef58_area" => true,
+                // LEF58_FORBIDDENSPACING: read from the layer's property text, every statement the
+                // database's grammar takes plus SAMEMASK (`tech::read::lef58_forbidden_spacing_rules`);
+                // the check (`checkForbiddenSpc_main`) is its only consumer; a statement io skips
+                // is skipped with a warning (`skipped_rules`), one that does not parse is listed
+                // as not checked (`lef58_not_checked`).
+                "lef58_forbidden_spacing" => true,
                 _ => false,
             };
             if !modelled {
@@ -228,6 +234,10 @@ impl SkippedRule {
                 "layer {}: LEF58_SPACING WRONGDIRECTION rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
             ),
+            ("lef58_forbidden_spacing", clause) => format!(
+                "layer {}: LEF58_FORBIDDENSPACING rule {} has {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
+                self.layer, self.index
+            ),
             ("lef58_min_cut", clause) => format!(
                 "layer {}: LEF58_MINIMUMCUT rule {} uses {clause}, which neither the reference (it warns and skips the rule) nor this router supports; the rule is SKIPPED and NOT checked during routing, so sign-off DRC must cover it.",
                 self.layer, self.index
@@ -286,6 +296,12 @@ pub fn skipped_rules(db: &Db, tech: &Tech) -> Vec<SkippedRule> {
             if let Some((id, _)) = crate::tech::read::lef58_wrong_dir_spacing_skip(db, &l.name, k) {
                 let clause = if id == 333 { "LENGTH" } else { "a negative PRL" };
                 out.push(SkippedRule { layer: l.name.clone(), family: "lef58_wrong_dir_spacing", index: k, clause });
+            }
+        }
+        let statements = crate::tech::read::lef58_forbidden_spacing_statements(db, &l.name);
+        for (k, st) in statements.iter().filter_map(|s| s.as_ref().ok()).enumerate() {
+            if let Err(clause) = crate::tech::forbidden_spacing_kept(st) {
+                out.push(SkippedRule { layer: l.name.clone(), family: "lef58_forbidden_spacing", index: k, clause });
             }
         }
         for k in 0..db.num_layer_get_tech_layer_min_step_rules(&l.name) {
@@ -365,6 +381,15 @@ pub fn lef58_not_checked(db: &Db) -> Vec<UnparsedProperty> {
     for (layer, _) in layers {
         let kind = db.layer_get_type(&layer).unwrap_or_default();
         for (name, text) in db.layer_string_properties(&layer) {
+            if kind == "ROUTING" && name == "LEF58_FORBIDDENSPACING" {
+                // Read from this text by the router itself (the database's grammar plus SAMEMASK):
+                // only a statement that does not parse there goes unchecked.
+                let statements = crate::tech::parse_forbidden_spacing(&text, db.tech_get_db_units_per_micron()).iter().filter(|s| s.is_err()).count();
+                if statements > 0 {
+                    out.push(UnparsedProperty { layer: layer.clone(), kind: name, statements });
+                }
+                continue;
+            }
             if !name.starts_with("LEF58_") || odb_parses_layer_property(&kind, &name) {
                 continue;
             }
@@ -492,7 +517,7 @@ pub fn set_markers(db: &Db, tech: &Tech) -> Result<Vec<Marker>, String> {
         owners.sort();
         owners.dedup();
         let [xl, yl, xh, yh] = m.rect;
-        out.push(Marker { rule, layer, bbox: Rect { xl, yl, xh, yh }, owners, victim: None, aggressor: None, second_victim: None });
+        out.push(Marker { rule, layer, bbox: Rect { xl, yl, xh, yh }, owners, victim: None, aggressor: None, second_victim: None, second_aggressor: None });
     }
     Ok(out)
 }

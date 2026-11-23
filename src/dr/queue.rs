@@ -473,7 +473,10 @@ pub fn route_queue(w: &mut CostWorker<'_, '_>, st: &mut MazeState, q: &QueueCtx<
                 let agg = m.aggressor.as_ref().map_or("-".to_string(), |a| qtag(&a.0));
                 eprintln!("q|M|{}|{},{},{},{}|A:{}|S:{}", q.mcfg.tech.layers[m.layer].name, m.bbox.xl, m.bbox.yl, m.bbox.xh, m.bbox.yh, agg, srcs.join(","));
                 let side = |s: &Option<crate::gc::Side>| s.as_ref().map_or("-".to_string(), |v| format!("{}@{}:{},{},{},{}", qtag(&v.0), q.mcfg.tech.layers[v.1].name, v.2.xl, v.2.yl, v.2.xh, v.2.yh));
-                eprintln!("q|X|{:?}|reach={}|A:{}|V:{}|V2:{}", m.rule, marker_reaches_route_box(m, &q.route_box), side(&m.aggressor), side(&m.victim), side(&m.second_victim));
+                // A second aggressor is appended only when there is one: the line stays as it was for every
+                // other marker.
+                let a2 = m.second_aggressor.as_ref().map_or(String::new(), |_| format!("|A2:{}", side(&m.second_aggressor)));
+                eprintln!("q|X|{:?}|reach={}|A:{}|V:{}|V2:{}{a2}", m.rule, marker_reaches_route_box(m, &q.route_box), side(&m.aggressor), side(&m.victim), side(&m.second_victim));
             }
         }
         let before = queue.len();
@@ -1175,9 +1178,10 @@ fn update_queue(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], by_nam
 }
 
 /// `route_queue_update_from_marker`'s first test: a marker off the route box counts when a
-/// side's shape reaches it — the aggressor, then every victim (a copied marker has none).
+/// side's shape reaches it — every aggressor, then every victim (a copied marker has none).
 fn marker_reaches_route_box(m: &Marker, rb: &Rect) -> bool {
-    touches(&m.bbox, rb) || m.aggressor.as_ref().is_some_and(|a| touches(&a.2, rb)) || m.victim.as_ref().is_some_and(|v| touches(&v.2, rb)) || m.second_victim.as_ref().is_some_and(|v| touches(&v.2, rb))
+    let reach = |s: &Option<crate::gc::Side>| s.as_ref().is_some_and(|a| touches(&a.2, rb));
+    touches(&m.bbox, rb) || reach(&m.aggressor) || reach(&m.second_aggressor) || reach(&m.victim) || reach(&m.second_victim)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1194,12 +1198,17 @@ fn update_from_marker(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], 
     let mut victim_owners: Vec<Owner> = Vec::new();
     let mut aggressor_owners: Vec<Owner> = Vec::new();
     let mut movable_owners: BTreeSet<(i32, String, i64)> = BTreeSet::new();
-    // The aggressor (a copied marker has none: every source is then a candidate).
-    let agg: Option<&Owner> = m.aggressor.as_ref().map(|a| &a.0);
-    let agg_nets = agg.map_or(Vec::new(), dr_nets);
-    for &i in &agg_nets {
-        if can_ripup(q, state, i) {
-            movable_owners.insert(owner_key(q, agg.expect("an aggressor")));
+    // The aggressors, in the order added (a copied marker has none: every source is then a
+    // candidate). Their non-supply nets form an ordered set (`movableAggressorNets`), walked in
+    // its order below; an aggressor with a net that may be ripped up is movable.
+    let mut movable_nets: std::collections::BTreeMap<(i32, String, i64), &Owner> = std::collections::BTreeMap::new();
+    for agg in [&m.aggressor, &m.second_aggressor].into_iter().flatten().map(|a| &a.0) {
+        let agg_nets = dr_nets(agg);
+        if matches!(agg, Owner::Net(n) if !(q.is_supply)(n)) {
+            movable_nets.insert(owner_key(q, agg), agg);
+        }
+        if agg_nets.iter().any(|&i| can_ripup(q, state, i)) {
+            movable_owners.insert(owner_key(q, agg));
         }
     }
     let srcs: Vec<Owner> = {
@@ -1208,15 +1217,16 @@ fn update_from_marker(q: &QueueCtx<'_>, nets: &[DrNet], state: &mut [NetState], 
         v
     };
     let mut has_reroute = false;
-    for &i in &agg_nets {
-        if !can_ripup(q, state, i) {
-            continue;
+    for agg in movable_nets.into_values() {
+        for i in dr_nets(agg) {
+            if !can_ripup(q, state, i) {
+                continue;
+            }
+            if ua.insert(owner_key(q, agg)) {
+                aggressor_owners.push(agg.clone());
+            }
+            has_reroute = true;
         }
-        let agg = agg.expect("an aggressor");
-        if ua.insert(owner_key(q, agg)) {
-            aggressor_owners.push(agg.clone());
-        }
-        has_reroute = true;
     }
     if has_reroute {
         for s in &srcs {
@@ -1558,7 +1568,7 @@ mod tests {
         let rb = Rect::new(0, 0, 1000, 1000);
         let far = Rect::new(2000, 2000, 2040, 2040);
         let side = |r: Rect| Some((Owner::Net("a".into()), 3, r, false));
-        let base = Marker { bbox: far, layer: 3, rule: Rule::SpacingTableOrth, owners: vec![], aggressor: side(far), victim: side(far), second_victim: side(far) };
+        let base = Marker { bbox: far, layer: 3, rule: Rule::SpacingTableOrth, owners: vec![], aggressor: side(far), victim: side(far), second_victim: side(far), second_aggressor: None };
         assert!(!marker_reaches_route_box(&base, &rb), "every box off the route box");
         assert!(marker_reaches_route_box(&Marker { bbox: Rect::new(1000, 0, 1040, 40), ..base.clone() }, &rb), "the box touches it");
         assert!(marker_reaches_route_box(&Marker { aggressor: side(Rect::new(960, 960, 1000, 1000)), ..base.clone() }, &rb), "the aggressor");

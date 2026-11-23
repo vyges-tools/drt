@@ -212,7 +212,7 @@ pub fn add_lonely_via_marker(p: &PassIn<'_>, routes: &mut DesignRoutes, via: &Lo
     let layer = p.tech.via_defs[via.via].cut;
     let owner = Owner::Net((p.net_name)(via.net));
     let side = Some((owner.clone(), layer, via.bbox, false));
-    routes.add_marker(Marker { rule: Rule::Lef58MaxSpacing, layer, bbox: via.bbox, owners: vec![owner], victim: side.clone(), aggressor: side, second_victim: None });
+    routes.add_marker(Marker { rule: Rule::Lef58MaxSpacing, layer, bbox: via.bbox, owners: vec![owner], victim: side.clone(), aggressor: side, second_victim: None, second_aggressor: None });
 }
 
 /// The region a worker re-routes around a lonely via: three by three gcells centred on the gcell
